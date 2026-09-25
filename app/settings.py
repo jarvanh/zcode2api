@@ -51,6 +51,8 @@ HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
 # 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
 DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+# 网关访问密钥默认值（README 的 ZCODE_GATEWAY_KEY）：数据库 meta 表未设置时生效。
+GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
 # 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）

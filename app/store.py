@@ -152,7 +152,9 @@ class Store:
         return str(self.get_setting("admin_key", settings.DEFAULT_ADMIN_KEY) or "")
 
     def gateway_key(self) -> str:
-        return str(self.get_setting("gateway_key", "") or "")
+        # 库里未设置时回退 .env 的 ZCODE_GATEWAY_KEY（上游 README 声明了该变量
+        # 但代码未实现，此处补齐）；库里已设置（含后台改过）则以库为准。
+        return str(self.get_setting("gateway_key", "") or settings.GATEWAY_KEY or "")
 
     def quota_refresh_interval(self) -> int:
         try:
