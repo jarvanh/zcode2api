@@ -196,6 +196,14 @@ async def messages(request: Request):
 
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
+    if provider == "bigmodel" and not store.bigmodel_channel_enabled():
+        # 回退通道默认关闭（欠费时上游 429 原地重试会挂起约 2 分钟），
+        # 这里即时拒绝而非让调度去试一个必然失败的通道。
+        return JSONResponse(
+            {"error": {"message": "bigmodel Key 回退通道已关闭（管理后台「设置」可开启）",
+                       "type": "channel_disabled"}},
+            status_code=403,
+        )
     body = _normalize_body(body)
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
@@ -243,6 +251,14 @@ async def chat_completions(request: Request):
 
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
+    if provider == "bigmodel" and not store.bigmodel_channel_enabled():
+        # 回退通道默认关闭（欠费时上游 429 原地重试会挂起约 2 分钟），
+        # 这里即时拒绝而非让调度去试一个必然失败的通道。
+        return JSONResponse(
+            {"error": {"message": "bigmodel Key 回退通道已关闭（管理后台「设置」可开启）",
+                       "type": "channel_disabled"}},
+            status_code=403,
+        )
     body = _normalize_body(body)
     port = request.url.port or settings.PORT
 

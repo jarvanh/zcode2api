@@ -53,6 +53,10 @@ HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 # 网关访问密钥默认值（README 的 ZCODE_GATEWAY_KEY）：数据库 meta 表未设置时生效。
 GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
+# bigmodel Key 回退通道（bigmodel/ 前缀 / x-provider: bigmodel 头）默认关闭：
+# 该通道欠费时上游 429 且网关原地重试，请求会挂起约 2 分钟才报错，默认不暴露。
+# 可用环境变量 ZCODE_BIGMODEL_CHANNEL=1 或管理后台「设置」开启。
+BIGMODEL_CHANNEL_ENABLED = os.getenv("ZCODE_BIGMODEL_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
 # 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）

@@ -89,6 +89,8 @@ class Store:
             self._settings = {r["key"]: r["value"] for r in meta_rows}
             self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
             self._settings.setdefault("gateway_key", "")
+            self._settings.setdefault("bigmodel_channel_enabled",
+                                      "1" if settings.BIGMODEL_CHANNEL_ENABLED else "0")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
             self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
 
@@ -155,6 +157,11 @@ class Store:
         # 库里未设置时回退 .env 的 ZCODE_GATEWAY_KEY（上游 README 声明了该变量
         # 但代码未实现，此处补齐）；库里已设置（含后台改过）则以库为准。
         return str(self.get_setting("gateway_key", "") or settings.GATEWAY_KEY or "")
+
+    def bigmodel_channel_enabled(self) -> bool:
+        """bigmodel Key 回退通道开关（默认关闭，meta 表可覆盖）。"""
+        return str(self.get_setting("bigmodel_channel_enabled", "") or "").strip().lower() \
+            in ("1", "true", "yes", "on")
 
     def quota_refresh_interval(self) -> int:
         try:

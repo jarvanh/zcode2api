@@ -564,6 +564,7 @@ async def get_settings():
         "admin_key_is_default": bool(admin_key) and admin_key == app_settings.DEFAULT_ADMIN_KEY,
         "gateway_key_set": bool(gateway_key),
         "gateway_key_masked": _mask_secret(gateway_key),
+        "bigmodel_channel_enabled": store.bigmodel_channel_enabled(),
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
     }
@@ -585,6 +586,9 @@ async def update_settings(payload: dict = Body(...)):
             pass
         else:
             store.set_setting("gateway_key", key)
+    if "bigmodel_channel_enabled" in payload:
+        store.set_setting("bigmodel_channel_enabled",
+                          "1" if payload["bigmodel_channel_enabled"] else "0")
     if "quota_refresh_interval" in payload:
         try:
             interval = max(0, int(payload["quota_refresh_interval"]))

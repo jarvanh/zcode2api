@@ -41,6 +41,13 @@
       <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。设为 0 不限制。修改后即时生效。</div>
       <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="2">
     </div>
+    <div class="settings-row">
+      <label>bigmodel Key 回退通道</label>
+      <div class="hint">开启后 <code>bigmodel/模型名</code> 前缀与 <code>x-provider: bigmodel</code> 头才会路由到 API Key 通道（默认关闭：该通道欠费时上游 429 且网关原地重试，请求会挂起约 2 分钟）。关闭时请求即时返回 403。修改后即时生效。</div>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="bigmodel-channel"> 启用 bigmodel 回退通道
+      </label>
+    </div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
       <button onclick="saveSettings()" class="dialog-btn dialog-btn-primary">保存</button>
     </div>
@@ -76,6 +83,7 @@ async function load(){
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
     document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
     document.getElementById('account-concurrency').value=d.account_concurrency??2;
+    document.getElementById('bigmodel-channel').checked=!!d.bigmodel_channel_enabled;
     const hint=document.getElementById('admin-key-default-hint');
     if(hint) hint.style.display=d.admin_key_is_default?'block':'none';
   }catch(e){showToast('加载失败: '+e.message,'error');}
@@ -93,7 +101,8 @@ async function saveSettings(){
   if(!admin_key)return showToast('后台密码不能为空','error');
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
   if(isNaN(account_concurrency)||account_concurrency<0)return showToast('账号并发必须是非负整数（0 = 不限）','error');
-  const payload={quota_refresh_interval,account_concurrency};
+  const payload={quota_refresh_interval,account_concurrency,
+                 bigmodel_channel_enabled:document.getElementById('bigmodel-channel').checked};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;
   if(!_isSecretMask(gateway_key)) payload.gateway_key=gateway_key;
   try{
