@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
+import threading
 import time
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -27,6 +31,52 @@ from ..store import store
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
 router = APIRouter()
+
+# ── X-Probe 探测打标 ──────────────────────────────────────────────
+# 客户端在探测请求上带 X-Probe: 1（如模型能力测试、健康检查），网关把
+# 每请求用量明细落盘，供 quota-board 做「探测 / 真实」用量分流。
+# 用 ContextVar 传递标记：避免为打标而改动 _dispatch / _Upstream 等一整条
+# 调用链的签名，且天然隔离并发请求。
+_probe_flag: ContextVar[bool] = ContextVar("probe_flag", default=False)
+_usage_lock = threading.Lock()
+_BJ = timezone(timedelta(hours=8))
+
+
+def is_probe_request(headers) -> bool:
+    """判定探测请求：X-Probe 为 1/true/yes（大小写不敏感）即为探测。"""
+    v = ""
+    try:
+        v = headers.get("x-probe") or ""
+    except Exception:  # noqa: BLE001 - 头部解析失败按非探测处理
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes"}
+
+
+def record_usage(model: str, tin=None, tout=None, credit=None) -> None:
+    """落盘单条用量明细（best-effort：失败只记日志，绝不影响主流程）。
+
+    文件：data/usage-<北京日期>.jsonl
+    """
+    try:
+        day = datetime.now(_BJ).strftime("%Y-%m-%d")
+        path = os.path.join(settings.DATA_DIR, f"usage-{day}.jsonl")
+        row = {
+            "t": int(time.time()),
+            "model": str(model or "-"),
+            "probe": bool(_probe_flag.get()),
+            "in": tin,
+            "out": tout,
+            "credit": credit,
+        }
+        line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _usage_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as err:  # noqa: BLE001 - 记账失败不能影响调度
+        try:
+            logs.warn("usage", f"用量明细落盘失败（不影响请求）: {err}")
+        except Exception:
+            pass
 
 MAX_CAPTCHA_RETRIES = 3
 MAX_ACCOUNT_ATTEMPTS = 5
@@ -207,6 +257,8 @@ async def messages(request: Request):
     body = _normalize_body(body)
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
+    # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
+    _probe_flag.set(is_probe_request(request.headers))
 
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
@@ -261,6 +313,8 @@ async def chat_completions(request: Request):
         )
     body = _normalize_body(body)
     port = request.url.port or settings.PORT
+    # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
+    _probe_flag.set(is_probe_request(request.headers))
 
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
@@ -308,6 +362,7 @@ async def chat_completions(request: Request):
     usage = data.get("usage") or {}
     reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
                      input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+    record_usage(model, usage.get("input_tokens"), usage.get("output_tokens"))
     return JSONResponse(anthropic_to_openai(data, model))
 
 
@@ -333,6 +388,7 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                              input_tokens=conv.usage.get("prompt_tokens"),
                              output_tokens=conv.usage.get("completion_tokens"))
+            record_usage(model, conv.usage.get("prompt_tokens"), conv.usage.get("completion_tokens"))
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
             raise
@@ -505,6 +561,8 @@ class _Upstream:
                     yield chunk
                 logs.req_ok(req_id)
                 reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
+                # 直通路径无 usage 明细，仅记录模型与探测标记
+                record_usage(getattr(up, "model", "-"))
             except asyncio.CancelledError:
                 reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
                 raise
