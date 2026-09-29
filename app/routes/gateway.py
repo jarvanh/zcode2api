@@ -281,11 +281,43 @@ async def messages(request: Request):
     if isinstance(result, _Upstream):
         # dispatch 返回与流式生成器启动之间的取消窗口：兜底关闭释放并发槽位
         try:
-            return result.to_streaming(req_id)
+            return await _stream_or_biz_error(result, req_id)
         except asyncio.CancelledError:
             await result.close()
             raise
     return result
+
+
+async def _stream_or_biz_error(up: _Upstream, req_id: str):
+    """透传前先拦上游「HTTP 200 + 业务错误」，避免客户端把失败当成功。
+
+    同步响应（content-type: application/json）可安全读取后重建；流式
+    （text/event-stream）不预读，直接透传（流式首包才是内容，且预读会破坏
+    SSE 时序）。
+    """
+    ctype = (up.resp.headers.get("content-type") or "").lower()
+    if "text/event-stream" not in ctype:
+        try:
+            text = (await up.resp.aread()).decode("utf-8", "ignore")
+        except Exception:  # noqa: BLE001 - 读失败按原样透传兜底
+            text = ""
+        if text:
+            hit = _upstream_biz_error(text)
+            if hit:
+                status, etype, emsg = hit
+                detail = f"{emsg}（上游: {text[:160]}）"
+                logs.req_err(req_id, detail)
+                reqlog.finish_error(req_id, detail, status=status)
+                await up.close()
+                return JSONResponse(
+                    {"error": {"message": emsg, "type": etype, "upstream": text[:400]}},
+                    status_code=status,
+                )
+            # 非业务错误的已读响应：重建为等价响应，勿丢 body
+            from fastapi import Response as _Resp
+            await up.close()
+            return _Resp(content=text, status_code=up.resp.status_code, media_type=ctype or "application/json")
+    return up.to_streaming(req_id)
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
@@ -355,7 +387,18 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
     finally:
         await result.close()
-    data = _safe_json(raw.decode("utf-8", "ignore"))
+    raw_text = raw.decode("utf-8", "ignore")
+    hit = _upstream_biz_error(raw_text)
+    if hit:
+        status, etype, emsg = hit
+        detail = f"{emsg}（上游: {raw_text[:160]}）"
+        logs.req_err(req_id, detail)
+        reqlog.finish_error(req_id, detail, status=status, t_first=result.t_first)
+        return JSONResponse(
+            {"error": {"message": emsg, "type": etype, "upstream": raw_text[:400]}},
+            status_code=status,
+        )
+    data = _safe_json(raw_text)
     if not isinstance(data, dict) or data.get("type") != "message":
         reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
         return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
@@ -519,6 +562,51 @@ _inflight: dict[str, int] = {}
 def _limit() -> int:
     """当前并发上限（0 = 不限），实时读取设置（后台改后即生效）。"""
     return store.account_concurrency()
+
+
+# ── 上游业务错误（HTTP 200 内嵌 code/msg）────────────────────────────────────
+# 上游把业务失败包在 HTTP 200 里返回（如 {"code":1005,"msg":"exceed quota
+# limit"}）。原样透传会让客户端把失败当成功 —— Anthropic SDK 拿到没有 content
+# 块的响应体，要么报莫名其妙的解析错，要么静默当作空回复（2026-09-29：无额度
+# 时客户端一直收到「成功但空信息」）。这里把可识别的业务错误映射为真实 HTTP
+# 状态码 + 标准错误体，自检与客户端据此分诊。
+# 只认「无 content/choices 块 + 有非零 code」的形状，正常响应绝不误伤。
+_UPSTREAM_BIZ_CODES = {
+    1005: (429, "upstream_quota_exceeded", "上游额度已用完（套餐耗尽或到期）"),
+    1003: (409, "upstream_already_claimed", "上游拒绝：已领取过"),
+    1004: (403, "upstream_not_eligible", "上游拒绝：不符合条件"),
+    3001: (400, "invalid_request_error", "上游参数错误"),
+    3003: (503, "upstream_busy", "上游系统繁忙"),
+    3006: (400, "model_not_allowed", "模型不在套餐允许范围内"),
+    3012: (403, "upstream_risk_control", "上游风控拦截"),
+}
+
+
+def _upstream_biz_error(text: str) -> tuple[int, str, str] | None:
+    """从上游响应体识别业务错误，返回 (http_status, type, message)；正常返回 None。"""
+    if not text or len(text) > 4096:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("content") is not None or data.get("choices") is not None:
+        return None
+    try:
+        code = int(data.get("code"))
+    except (TypeError, ValueError):
+        return None
+    if code == 0:
+        return None
+    hit = _UPSTREAM_BIZ_CODES.get(code)
+    if hit:
+        return hit
+    msg = str(data.get("msg") or data.get("message") or "").strip()
+    if msg:
+        return (502, "upstream_error", f"上游业务错误 {code}：{msg[:200]}")
+    return None
 
 
 class _Upstream:
