@@ -19,7 +19,7 @@ zcode-hub 是一个**自托管服务**，同时承担两个角色：
 ┌──────────────┐    ┌───────────────▼────────────────────────────────┐
 │ 管理后台 Web │───▶│                FastAPI 核心进程                 │
 │ /admin/*     │    │  Store(SQLite) · Quota · Claim · OAuth         │
-└──────────────┘    │  CaptchaManager(jsdom) · Install · Fingerprint │
+└──────────────┘    │  CaptchaManager(happy-dom/Bun) · Install · Fingerprint │
                     └───┬──────────────┬─────────────────────────────┘
                         │              │
                  zcode.z.ai        api.z.ai /
@@ -35,7 +35,7 @@ zcode-hub 是一个**自托管服务**，同时承担两个角色：
 | Web | FastAPI + Uvicorn | 异步网关，SSE 流式透传 |
 | HTTP 客户端 | httpx | 连接池 + 流式 + 超时细粒度控制 |
 | 存储 | SQLite (WAL) | 账号池 / 设置 / 领取历史；单机自托管 |
-| 验证码 | Node + jsdom 子进程 | 复用 zcode2api 方案：无浏览器运行阿里云无痕 SDK |
+| 验证码 | Bun + happy-dom 子进程 | vendored 上游 captcha-happy（同 jarvanh/zcode-api），无 bun 回退 node 移植版 |
 | 前端 | 原生 JS + 轻量模板 | 继承 zcode2api 后台骨架，扩额度/领取面板 |
 | 测试 | pytest + pytest-asyncio + respx | 单元 + 契约；Mock 上游见测试文档 |
 | 部署 | Docker / docker-compose；裸机用 supervisor | tebi 容器无 systemd，用 supervisor 约定 |
@@ -63,7 +63,7 @@ zcode-hub/
 │   ├── oauth.py           # zai server-mediated CLI 流
 │   ├── auth_admin.py      # 后台 / 网关鉴权（后台失败节流）
 │   └── reqlog.py          # 内存环形请求日志
-├── captcha_node/          # Node + jsdom solver.js
+├── captcha_node/          # Bun 主路径 solver-bun.ts + vendored captcha-happy.ts；回退 node solver.js
 ├── frontend/              # 后台静态页（accounts / settings / login）
 ├── tests/
 │   ├── unit/

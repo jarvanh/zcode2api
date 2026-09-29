@@ -15,7 +15,7 @@
 | 协议兼容 | 完整复刻 Anthropic `/v1/messages` 请求/响应(含 SSE 流式) |
 | 高可用 | 多账号 round-robin;单账号失败/额度耗尽自动切换下一个 |
 | 可观测 | 后台周期刷新各账号额度,UI 实时展示状态与剩余额度 |
-| 无浏览器 | 用 Node + jsdom 在模拟浏览器环境跑阿里云无痕 SDK,**不启动真实浏览器** |
+| 无浏览器 | 用 Bun + happy-dom 在模拟浏览器环境跑阿里云无痕 SDK(vendored 上游求解器),**不启动真实浏览器** |
 | 凭证安全 | 账号/密钥仅落本地 SQLite;前端鉴权,token 脱敏展示 |
 | 轻量部署 | 单进程 FastAPI + 一个 Node 子进程;无外部数据库依赖 |
 
@@ -43,7 +43,7 @@ graph TD
         OAUTH["OAuth Flow<br/>Z.AI 登录入池"]
     end
 
-    SOLVER["Captcha Solver（Node 子进程）<br/>jsdom + 阿里云无痕 SDK"]
+    SOLVER["Captcha Solver（Bun 子进程）<br/>happy-dom + 阿里云无痕 SDK"]
     DB[("SQLite<br/>data/accounts.db (WAL)")]
 
     subgraph Upstream["上游"]
@@ -96,8 +96,8 @@ graph TD
 | Account Model | `app/models.py` | `Account` 数据类、`Status` 状态、可选中判定、脱敏视图 |
 | Request Builder | `app/agent.py` | 按凭证选上游端点、组装请求头(含 `X-Aliyun-Captcha-Verify-Param`) |
 | Quota Monitor | `app/quota.py` | 单账号额度查询 + 状态判定 + 后台周期刷新任务 |
-| Captcha Manager | `app/captcha.py` | 拉取验证码配置、调用 Node 求解器、缓存/并发去重/重试 |
-| Captcha Solver | `captcha_node/solver.js` | jsdom 模拟浏览器跑阿里云无痕 SDK,输出 `verifyParam` |
+| Captcha Manager | `app/captcha.py` | 预解 token 池(空池竞速/宽限窗口/certifyId 去重)、拉取验证码配置、调用求解器 |
+| Captcha Solver | `captcha_node/captcha-happy.ts` + `solver-bun.ts` | vendored 上游(jarvanh/zcode-api 4.7.1)happy-dom 求解器,Bun 主路径,输出 `verifyParam`;回退 `captcha_node/solver.js`(Node 移植版) |
 | OAuth Flow | `app/oauth.py` | Z.AI OAuth:init → poll → 兑换 API Key |
 | Settings | `app/settings.py` | 环境变量 / 默认值 / 路径 / 上游端点 |
 | Logs | `app/logs.py` | 彩色终端日志(banner / req / req_ok / req_err …) |
@@ -203,6 +203,40 @@ return pool[idx]
 
 `skip_ids` 保证同一次请求不会重复尝试已失败的账号。
 
+### 上游业务错误(HTTP 200 内嵌 code)
+
+上游把业务失败**包在 HTTP 200 里**返回(如 `{"code":1005,"msg":"exceed quota limit"}`),
+不体现为 HTTP 状态码。网关按「无 `content`/`choices` 块 + 非零 `code`」识别,
+并做两件事(见 `_upstream_biz_error` / `_upstream_biz_code`):
+
+1. **回客户端真实状态码**,而不是把失败当成功透传(否则客户端拿到没有 content 块
+   的「成功」响应,表现为莫名空回复或解析错)。
+2. **记账并切号**,而不是把账号记为「请求成功」后保持 `active`
+   (否则后台显示正常却一直接不出内容)。
+
+| 业务码 | HTTP | type | 账号处置 |
+| --- | --- | --- | --- |
+| 1005 额度耗尽 | 429 | `upstream_quota_exceeded` | 标记 `exhausted`,切下一个账号 |
+| 1003 / 1004 | 409 / 403 | `already_claimed` / `not_eligible` | 标记 `exhausted`,切号 |
+| 3006 模型不允许 | 400 | `model_not_allowed` | 回客户端 |
+| 3012 风控 | 403 | `upstream_risk_control` | 禁用账号(与 HTTP 态风控同处置) |
+| 3001 / 3003 | 400 / 503 | `invalid_request_error` / `upstream_busy` | 回客户端 |
+| 其它非零码 | 502 | `upstream_error` | 回客户端(不动账号状态) |
+
+流式 SSE 响应**不预读**(预读会破坏事件时序),故流式路径的业务错误在首包
+下发前已被识别时同样拦截,已进入事件流阶段的不再改写。
+
+### 额度可见性
+
+- 只有 **zai + JWT(Plan 通道)** 账号能查额度:`allows_billing()` 要求
+  `uses_plan_channel()`,数据源是上游 `/billing/current` + `/billing/balance`。
+- **API Key 回退账号(zai apiKey / bigmodel)查不到额度是设计限制,不是故障**:
+  上游 Key 通道不提供这些 billing 接口。此类账号后台额度区显示为空,
+  但 `use_count` / 最近请求 tick 仍正常累计,可据此判断在不在服务。
+- JWT 账号若在 `/billing/current` 返回 `plans: []`(名下无套餐),同样显示不出
+  额度窗口 —— 此时账号能否出话取决于上游是否另有免费/试用额度,billing 接口
+  不会体现;实际可用性以请求结果为准。
+
 ---
 
 ## 6. 无浏览器无痕验证
@@ -215,24 +249,37 @@ sequenceDiagram
     autonumber
     participant CM as Captcha Manager (Python)
     participant CFG as zcode.z.ai/client/configs
-    participant SV as Node Solver (jsdom)
+    participant SV as Bun Solver (happy-dom)
     participant CDN as o.alicdn.com
     participant ALI as 阿里云无痕服务
 
     CM->>CFG: GET 验证码配置（sceneId/region/prefix）
     CFG-->>CM: {sceneId, region, prefix}
-    CM->>SV: spawn solver.js（子进程）
-    SV->>SV: 构造 jsdom，注入浏览器 API 桩<br/>(matchMedia/canvas/WebGL/Worker/OffscreenCanvas)
-    SV->>CDN: 加载 AliyunCaptcha.js
+    CM->>SV: spawn solver-bun.ts（子进程，一进程一解）
+    SV->>SV: 构造 happy-dom，注入浏览器 API 桩<br/>(matchMedia/canvas/WebGL/Worker/OffscreenCanvas)
+    SV->>CDN: 加载 AliyunCaptcha.js + pe 字节码（磁盘+内存双缓存）
     SV->>ALI: initAliyunCaptcha + startTracelessVerification
     ALI-->>SV: success(verifyParam)
     SV-->>CM: stdout: VERIFY_PARAM=<param>
-    CM->>CM: 写缓存（CAPTCHA_CACHE_TTL，默认 45s）
+    CM->>CM: 入池（FIFO + TTL 淘汰）
 ```
 
 - `verifyParam` 实为 `base64(JSON{certifyId, sceneId, isSign, securityToken})`,由阿里云服务端签发。
-- **缓存**:TTL 内复用;**并发去重**:同一时刻仅跑一个求解进程(`asyncio.Lock`);
-  **重试**:`CAPTCHA_SOLVE_RETRIES`(默认 4)次。
+- **求解器来源**:`captcha_node/captcha-happy.ts` 是上游 jarvanh/zcode-api 4.7.1 的
+  **原文件**（vendor,非移植）。历史上 Node 移植版 `solver.js` 因未跟上上游修复，
+  在轮换后的 pe 字节码上失速率 >70%（表现为连环 500「多次重试无结果」）;
+  直接 vendor 同一份代码即从结构上消除漂移。上游有更新时重新 vendor 即可。
+- **运行时**:`settings.py` 探测到 bun 即走 `bun solver-bun.ts`,否则回退
+  `node solver.js`。可用 `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_SOLVER_JS` 覆盖。
+- **预解池**(对齐上游 `captcha-pool.ts`):后台补库存至 `CAPTCHA_POOL_MIN`;
+  热路径从池直取(亚毫秒)。池空时**竞速** `CAPTCHA_EMPTY_TAKE_RACE`(默认 3)路
+  并行求解,首胜即回、败者入库,总死线 `CAPTCHA_RACE_DEADLINE`(25s);
+  仍无果再等后台补货 `CAPTCHA_TAKE_GRACE`(10s)——铸码失败成簇出现,
+  宽限把多数 500 变成慢成功(全账号冷却时豁免空等)。
+- **certifyId 去重**:签发登记表(TTL 同 token)+ 池内查重,杜绝同一 certifyId
+  二次消费(上游 F008 拒绝)。`invalidate()` 清池时登记表一并清空。
+- **失败诊断**:求解器 stderr 末段(pe 失速、guest 错误摘要)捕获进日志,
+  不再被吞成「多次重试无结果」。
 - 仅 zai + JWT 账号需要;API Key 账号走 `api.z.ai` 回退端点,无需验证码。
 
 ---
@@ -287,7 +334,7 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 │   ├── logs.py            # 彩色日志
 │   ├── routes/            # gateway / admin_api / pages
 │   └── statics/           # css / js / admin/*.html
-├── captcha_node/          # Captcha Solver（Node + jsdom，solver.js）
+├── captcha_node/          # Captcha Solver（Bun 主路径 solver-bun.ts + vendored captcha-happy.ts；回退 solver.js）
 ├── main.py                # CLI 入口
 ├── data/                  # 运行时生成：accounts.db
 └── docs/ARCHITECTURE.md   # 本文件
@@ -306,7 +353,8 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
   为启发式;真实上游的耗尽信号若不同,可能需要调整 `app/quota.py` / `app/routes/gateway.py` 的判定。
 - **模型清单**:`/v1/models` 当前固定为 `GLM-5.2` 与 `GLM-5-Turbo`,未做上游动态拉取。
 - **无痕验证 SDK**:`solver.js` 运行的是阿里云自家混淆 SDK;若其指纹逻辑(feilin / cloudauth-device)更新,
-  jsdom 中补齐的浏览器 API 桩可能需要相应调整。
+  happy-dom 中补齐的浏览器 API 桩可能需要相应调整（改动应在上游
+  jarvanh/zcode-api 的 captcha-happy.ts 进行后重新 vendor，而非直接改本仓库副本）。
 - **限流/冷却时长**:`COOLING_SECONDS` 为经验默认值,非上游明确约定。
 
 如发现实际行为与本文档不符,请优先以真实上游为准,并通过 Issue/PR 帮助我们修正文档与判定逻辑。
