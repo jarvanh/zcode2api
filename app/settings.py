@@ -65,6 +65,9 @@ CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则
 CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
+CAPTCHA_EMPTY_TAKE_RACE = _int("CAPTCHA_EMPTY_TAKE_RACE", 3)  # 池空竞速并行路数
+CAPTCHA_RACE_DEADLINE = _int("CAPTCHA_RACE_DEADLINE", 25)     # 竞速总死线（秒）
+CAPTCHA_TAKE_GRACE = _int("CAPTCHA_TAKE_GRACE", 10)           # 竞速无果后等后台补货宽限（秒）
 
 # 验证码求解（无浏览器模拟浏览器环境，运行阿里云无痕 SDK）。
 # 主路径：Bun + vendored 上游 captcha-happy.ts（solver-bun.ts）——bun 存在即用，
