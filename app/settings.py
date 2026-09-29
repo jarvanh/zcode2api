@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -65,10 +66,24 @@ CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
-# 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
-NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
+# 验证码求解（无浏览器模拟浏览器环境，运行阿里云无痕 SDK）。
+# 主路径：Bun + vendored 上游 captcha-happy.ts（solver-bun.ts）——bun 存在即用，
+#   求解器实测 6/6 成功（移植版 solver.js 在 pe.070 上失速率 >70%）；
+# 回退路径：Node + 移植版 solver.js（bun 未装/不可用时自动落回，行为同旧版）。
+# 环境变量 ZCODE_NODE_PATH / ZCODE_CAPTCHA_SOLVER_JS 可显式指定，优先于探测。
+_BUN_CANDIDATE = shutil.which("bun") or str(Path.home() / ".bun" / "bin" / "bun")
+if os.getenv("ZCODE_NODE_PATH"):
+    NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
+elif Path(_BUN_CANDIDATE).exists():
+    NODE_PATH = _BUN_CANDIDATE
+else:
+    NODE_PATH = "node"
+_USE_BUN = NODE_PATH.endswith("bun")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
-CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / "solver.js"
+CAPTCHA_SOLVER_JS = _resolve_path(
+    "ZCODE_CAPTCHA_SOLVER_JS",
+    "captcha_node/solver-bun.ts" if _USE_BUN else "captcha_node/solver.js",
+)
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
 

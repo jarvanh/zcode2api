@@ -35,6 +35,17 @@ class CaptchaSolveError(Exception):
     """
 
 
+def _stderr_tail(stderr: bytes | None, limit: int = 300) -> str | None:
+    """取 solver stderr 末段作失败诊断（pe 失速/guest 错误摘要都在这里）。"""
+    if not stderr:
+        return None
+    text = stderr.decode("utf-8", "ignore").strip()
+    if not text:
+        return None
+    tail = text[-limit:]
+    return tail.replace("\n", " | ")
+
+
 class _Token:
     __slots__ = ("param", "region", "born_at")
 
@@ -57,6 +68,7 @@ class CaptchaManager:
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
         self._last_error: str | None = None
+        self._last_solver_stderr: str | None = None
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -213,8 +225,11 @@ class CaptchaManager:
                 if attempt > 1:
                     logs.ok("captcha", f"求解成功（第 {attempt} 次尝试）")
                 return _Token(param, region)
+            if last_err is None:
+                # 求解器退出但无 param：用 stderr 末段代替沉默的"无结果"
+                last_err = f"求解器无输出 (exit 诊断: {self._last_solver_stderr or 'stderr 为空'})"
             self._last_error = last_err
-            logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
+            logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果: {last_err}")
 
         logs.warn("captcha", f"求解失败: {last_err or '多次重试无结果'}")
         return None
@@ -229,19 +244,22 @@ class CaptchaManager:
             settings.NODE_PATH, str(solver), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
         except TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            self._last_solver_stderr = None  # 强杀拿不到 stderr
             return None
         except FileNotFoundError as err:
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
 
+        # 失败诊断：solver 把根因（pe 失速/guest 错误摘要）写 stderr，保留末段
+        self._last_solver_stderr = _stderr_tail(stderr)
         param = None
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
