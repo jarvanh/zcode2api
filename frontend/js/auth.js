@@ -37,9 +37,23 @@ function _keyStore(k){
 }
 const adminKey=_keyStore('zcode2api_admin_key');
 
-async function verifyKey(url,key){
-  return (await fetch(url,{headers:key?{Authorization:`Bearer ${key}`}:{}})).ok;
+/* 会话守卫：后台请求拿到 401 说明本地密钥已失效（改密/被清）。必须立刻清空
+   并回登录页 —— 否则监控页 5 秒一轮的轮询会持续用 stale key 打 401，每次都
+   计入服务端防爆破失败计数（8 次锁 IP 300 秒），40 秒即可重新锁死，且锁定期
+   间正确密码也 429（2026-09-29 两次实际锁死）。失败计数只有真正输密码才会涨。 */
+async function guardUnauthorized(r){
+  if(r.status!==401)return false;
+  adminKey.clear();
+  location.href='/admin/login';
+  return true;
 }
+
+async function verifyKey(url,key){
+  const r=await fetch(url,{headers:key?{Authorization:`Bearer ${key}`}:{}});
+  await guardUnauthorized(r);
+  return r.ok;
+}
+
 function adminLogout(){adminKey.clear();location.href='/admin/login';}
 
 /* 统一的后台 API 调用封装 */
@@ -50,14 +64,7 @@ async function api(method,path,body){
     headers:{...(body!=null&&{'Content-Type':'application/json'}),Authorization:`Bearer ${key}`},
     ...(body!=null&&{body:JSON.stringify(body)}),
   });
-  if(r.status===401){
-    // 存储的密钥已失效（后台改密/被清）：清掉并回登录页。绝不能让轮询带着
-    // stale key 反复 401 —— 每次都计入服务端防爆破失败计数，8 次即锁 IP
-    // 300 秒，正确密码也会被锁在门外（2026-09-29 实际事故）。
-    adminKey.clear();
-    location.href='/admin/login';
-    throw new Error('unauthorized');
-  }
+  if(await guardUnauthorized(r))throw new Error('unauthorized');
   if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||r.status);}
   return r.json();
 }

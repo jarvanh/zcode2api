@@ -43,8 +43,19 @@ def _is_locked(ip: str) -> bool:
     return False
 
 
-def _record_failure(ip: str) -> None:
+def _record_failure(ip: str, probed: bool = False) -> None:
+    """记录一次失败。
+
+    probed=True 表示会话探测（页面轮询 /admin/api/verify 检查本地密钥是否
+    仍然有效：密钥过期、后台改密后旧标签页都会打出 401）。这类请求不是人
+    在猜密码，却按旧逻辑每次都计数——监控页 5 秒一轮，40 秒即可把 IP 锁满
+    300 秒，锁定期内正确密码也被拒（2026-09-29 连续两次实际锁死）。
+    探测只计数不锁：锁只保留给真正的登录提交。
+    """
     rec = _failures.setdefault(ip, {"count": 0, "locked_until": 0.0})
+    if probed:
+        rec["count"] = int(rec.get("count") or 0) + 1
+        return
     rec["count"] = int(rec.get("count") or 0) + 1
     if rec["count"] >= ADMIN_FAIL_LIMIT:
         rec["locked_until"] = time.time() + ADMIN_LOCK_SECONDS
@@ -63,12 +74,16 @@ async def verify_admin_key(
     request: Request,
     authorization: str | None = Header(default=None),
     app_key: str | None = Query(default=None),
+    login: str | None = Query(default=None),
 ) -> None:
     """校验后台管理密钥。
 
     支持 `Authorization: Bearer <key>` 头或 `?app_key=<key>` 查询参数
     （后者用于 EventSource 等无法发送自定义头的场景）。
-    同一客户端连续失败达到上限后临时锁死，正确密码也要等锁过期。
+
+    `login=1` 标记「人正在提交密码」（登录页），失败计入防爆破计数；不带
+    则视为会话探测（页面轮询检查本地密钥是否仍有效），失败不计入锁定——
+    否则监控页 5 秒一轮的 stale-key 轮询会持续锁死 IP，正确密码也进不来。
     """
     ip = _client_ip(request)
     if _is_locked(ip):
@@ -79,11 +94,12 @@ async def verify_admin_key(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未配置后台密钥")
 
     token = _extract_bearer(authorization) or app_key
+    probed = login is None or str(login).strip().lower() not in ("1", "true", "yes")
     if token is None:
-        _record_failure(ip)
+        _record_failure(ip, probed=probed)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少鉴权凭证")
     if not hmac.compare_digest(token, key):
-        _record_failure(ip)
+        _record_failure(ip, probed=probed)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "鉴权凭证无效")
     _failures.pop(ip, None)
 

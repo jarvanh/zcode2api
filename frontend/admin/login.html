@@ -31,7 +31,7 @@
       const key=el.value.trim();
       if(!key)return;
       try{
-        const r=await fetch(ADMIN_API+'/verify',{headers:{Authorization:`Bearer ${key}`}});
+        const r=await fetch(ADMIN_API+'/verify?login=1',{headers:{Authorization:`Bearer ${key}`}});
         if(r.ok){await adminKey.set(key);location.href='/admin/accounts';}
         else if(r.status===429) showToast('尝试次数过多，请 5 分钟后再试','error');
         else showToast('密码无效','error');
