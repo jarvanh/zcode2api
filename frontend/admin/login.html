@@ -31,7 +31,9 @@
       const key=el.value.trim();
       if(!key)return;
       try{
-        if(await verifyKey(ADMIN_API+'/verify',key)){await adminKey.set(key);location.href='/admin/accounts';}
+        const r=await fetch(ADMIN_API+'/verify',{headers:{Authorization:`Bearer ${key}`}});
+        if(r.ok){await adminKey.set(key);location.href='/admin/accounts';}
+        else if(r.status===429) showToast('尝试次数过多，请 5 分钟后再试','error');
         else showToast('密码无效','error');
       }catch{showToast('连接失败','error');}
     }

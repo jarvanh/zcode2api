@@ -50,6 +50,14 @@ async function api(method,path,body){
     headers:{...(body!=null&&{'Content-Type':'application/json'}),Authorization:`Bearer ${key}`},
     ...(body!=null&&{body:JSON.stringify(body)}),
   });
+  if(r.status===401){
+    // 存储的密钥已失效（后台改密/被清）：清掉并回登录页。绝不能让轮询带着
+    // stale key 反复 401 —— 每次都计入服务端防爆破失败计数，8 次即锁 IP
+    // 300 秒，正确密码也会被锁在门外（2026-09-29 实际事故）。
+    adminKey.clear();
+    location.href='/admin/login';
+    throw new Error('unauthorized');
+  }
   if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||r.status);}
   return r.json();
 }
