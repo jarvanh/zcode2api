@@ -582,6 +582,27 @@ _UPSTREAM_BIZ_CODES = {
 }
 
 
+# 业务码语义分类：额度类（标记 exhausted 换号）与风控类（禁用账号）
+_QUOTA_BIZ_CODES = {1005, 1003, 1004}
+_RISK_BIZ_CODES = {3012}
+
+
+def _upstream_biz_code(text: str) -> int | None:
+    """取上游响应体里的业务码（无法解析返回 None）。"""
+    if not text or len(text) > 4096:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("content") is not None or data.get("choices") is not None:
+        return None
+    try:
+        return int(data.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
 def _upstream_biz_error(text: str) -> tuple[int, str, str] | None:
     """从上游响应体识别业务错误，返回 (http_status, type, message)；正常返回 None。"""
     if not text or len(text) > 4096:
@@ -886,7 +907,67 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 status_code=status_code,
             )
 
-        # 成功：记录用量并把打开的上游流交给调用方
+        # 成功：记录用量并把打开的上游流交给调用方。
+        # 注意：上游把业务失败包在 HTTP 200 里（{"code":1005,...}），此处必须先
+        # 读 body 判一次 —— 否则账号会被记为「请求成功」并保持 active，
+        # 后台显示正常却一直接不出内容（2026-09-29：175 无额度却显示正常）。
+        if status_code < 300:
+            is_sse = "text/event-stream" in (resp.headers.get("content-type") or "").lower()
+            if not is_sse:
+                # 同步响应：先读 body 判业务错误（流式不预读，免破坏 SSE 时序）
+                text = (await resp.aread()).decode("utf-8", "ignore")
+                hit = _upstream_biz_error(text)
+                if hit is not None:
+                    _status, etype, _emsg = hit
+                    code_hit = _upstream_biz_code(text)
+                    await cm.__aexit__(None, None, None)
+                    await client.aclose()
+                    if code_hit in _RISK_BIZ_CODES:
+                        account.record_result(False, f"风控封禁（业务码 {code_hit}）")
+                        account.ban_for_risk()
+                        account.last_error = (
+                            f"风控封禁 (业务码 {code_hit})，确认恢复后请在后台手动启用"
+                            f"（第 {account.risk_strikes} 次）"
+                        )
+                        store.update_account(account)
+                        logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，已禁用，切换下一个")
+                        return _NEXT_ACCOUNT
+                    if code_hit in _QUOTA_BIZ_CODES:
+                        account.record_result(False, f"额度用完（业务码 {code_hit}）")
+                        if account.status in (Status.INVALID, Status.DISABLED):
+                            store.update_account(account)
+                        else:
+                            _mark(account, Status.EXHAUSTED, "额度已用完")
+                            _spawn_bg(_safe_refresh(account))
+                        logs.warn(req_id, f"账号 {account.name} 额度用完（业务码 {code_hit}），切换下一个")
+                        return _NEXT_ACCOUNT
+                    # 其余业务码：不动账号状态，直接回客户端（避免持续施压）
+                    account.record_result(False, f"上游业务错误 {code_hit}")
+                    store.update_account(account)
+                    logs.req_err(req_id, f"账号 {account.name} 上游业务错误 {code_hit}")
+                    return JSONResponse(
+                        {"error": {"message": f"上游业务错误 {code_hit}", "type": etype,
+                                   "upstream": text[:400]}},
+                        status_code=_status,
+                    )
+                # 业务正常的同步响应：body 已读完，重建等价响应交给上层
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+                from fastapi import Response as _Resp
+                account.use_count += 1
+                account.last_used_at = time.time()
+                account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
+                if account.status not in (Status.INVALID, Status.DISABLED):
+                    account.risk_strikes = 0
+                    account.last_error = None
+                    account.cooling_until = None
+                    if account.status in (Status.COOLING, Status.EXHAUSTED):
+                        account.status = Status.ACTIVE
+                store.update_account(account)
+                _spawn_bg(_safe_refresh(account))
+                return _Resp(content=text, status_code=status_code,
+                             media_type=resp.headers.get("content-type") or "application/json")
+
         account.use_count += 1
         account.last_used_at = time.time()
         account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
