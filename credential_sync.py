@@ -159,15 +159,36 @@ def save_state(db_path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
-def resolve_admin_key() -> str:
+def resolve_admin_key(db_path: Path | None = None) -> str:
+    """后台密钥：环境变量 → 账号库 meta（与网关同源，改密后自动跟上）→ .env。
+
+    必须以账号库为准：后台改密后 .env 里的旧值会一直 401，cron 每 10 分钟
+    静默失败、新登录身份永远入不了池（2026-09-29 实测断链）。
+    """
     env = os.environ.get("ZCODE_ADMIN_KEY")
     if env:
         return env
+    if db_path is not None:
+        try:
+            import sqlite3
+
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = con.execute("SELECT value FROM meta WHERE key='admin_key'").fetchone()
+            finally:
+                con.close()
+            if row and row[0]:
+                return str(row[0])
+        except Exception as e:  # noqa: BLE001 - 读库失败退回 .env
+            print(f"WARN 读取账号库 admin_key 失败，退回 .env: {e}", file=sys.stderr)
     env_path = Path(__file__).parent / ".env"
-    for line in env_path.read_text().splitlines():
-        if line.startswith("ZCODE_ADMIN_KEY="):
-            return line.split("=", 1)[1].strip()
-    raise SystemExit("找不到 ZCODE_ADMIN_KEY（环境变量或 .env）")
+    try:
+        for line in env_path.read_text().splitlines():
+            if line.startswith("ZCODE_ADMIN_KEY="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    raise SystemExit("找不到 ZCODE_ADMIN_KEY（环境变量 / 账号库 meta / .env）")
 
 
 def attribute_account(
@@ -269,7 +290,7 @@ def main() -> int:
 
     state = load_state(args.db)
     stored = stored_secrets(args.db)
-    admin_key = resolve_admin_key()
+    admin_key = resolve_admin_key(args.db)
     accounts = admin_request(args.gateway, admin_key, "GET", "/accounts")
     if isinstance(accounts, dict):
         accounts = accounts.get("accounts") or accounts.get("data") or []
