@@ -184,12 +184,19 @@ def _rate_break(account) -> int:
     if account.status in (Status.INVALID, Status.DISABLED):
         return 0
     exp = account.rate_strikes - settings.RATE_BREAK_THRESHOLD
-    cool = min(settings.RATE_COOL_BASE * (2 ** exp), settings.RATE_COOL_MAX)
+    # 小池短档：可服务账号少（<= RATE_SMALL_POOL）时用短冷却 —— 最后一个
+    # 账号被熔断不应意味着服务中断 15 分钟级；60s 起步翻倍、封顶 10 分钟。
+    pool = sum(1 for a in store.list_accounts(account.provider)
+               if a.enabled and a.status in (Status.ACTIVE, Status.COOLING))
+    if pool <= settings.RATE_SMALL_POOL:
+        cool = min(settings.RATE_COOL_SMALL_BASE * (2 ** exp), settings.RATE_COOL_SMALL_MAX)
+    else:
+        cool = min(settings.RATE_COOL_BASE * (2 ** exp), settings.RATE_COOL_MAX)
     account.status = Status.COOLING
     account.cooling_until = time.time() + cool
     account.last_error = (
         f"持续 429 自动熔断 {cool // 60} 分钟"
-        f"（连续 {account.rate_strikes} 轮重试梯耗尽），到期自动回轮询"
+        f"（连续 {account.rate_strikes} 轮重试梯耗尽，池 {pool} 个），到期自动回轮询"
     )
     return cool
 
@@ -502,11 +509,23 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     放大延迟甚至吊死客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正
     进入 _try_account 的次数）。全满/无号 → 503。
     """
+    t0 = time.time()
     tried: set[str] = set()
     limit = _limit()
     attempts = 0
+    # 请求级总死线：跨账号重试/等待的总耗时上限（0 = 不限）。梯内等待与
+    # 到期试探都属长挂起，死线保证客户端在明确时限内拿到失败与已试账号
+    # 明细，可自行快速重试，而不是无限挂死。
+    deadline = settings.REQUEST_DEADLINE
 
     while attempts < MAX_ACCOUNT_ATTEMPTS:
+        if deadline and time.time() - t0 > deadline:
+            logs.warn(req_id, f"请求级死线 {deadline}s 已到，停止重试（已试 {len(tried)} 账号）")
+            return JSONResponse(
+                {"error": {"message": f"所有账号重试均未成功（请求级死线 {deadline}s）",
+                           "type": "no_available_account", "tried": sorted(tried)}},
+                status_code=503,
+            )
         account = store.select(provider, skip_ids=tried)
         if account is None:
             break

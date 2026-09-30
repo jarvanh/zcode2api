@@ -115,6 +115,16 @@ RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信
 RATE_BREAK_THRESHOLD = _int("ZCODE_RATE_BREAK_THRESHOLD", 2)
 RATE_COOL_BASE = _int("ZCODE_RATE_COOL_BASE", 900)       # 首次熔断 15 分钟
 RATE_COOL_MAX = _int("ZCODE_RATE_COOL_MAX", 7200)        # 封顶 2 小时
+# 小池短档：可服务账号 <= RATE_SMALL_POOL 时熔断改用短冷却（60s 起步、
+# 600s 封顶）——最后一个账号被熔断不应意味着服务中断 15 分钟级。
+RATE_SMALL_POOL = _int("ZCODE_RATE_SMALL_POOL", 4)
+RATE_COOL_SMALL_BASE = _int("ZCODE_RATE_COOL_SMALL_BASE", 60)
+RATE_COOL_SMALL_MAX = _int("ZCODE_RATE_COOL_SMALL_MAX", 600)
+# 请求级总死线：单请求"调度+梯等待"的总耗时上限（0 = 不限）。只约束换号
+# 循环（_dispatch），流式一旦建立即脱离死线，多长的流都不会被截断。
+# 实测被 429 梯拖住的请求 p50=300s/p90=600s/max=780s（全是梯等待叠加，
+# 正常请求 p50=5s/max=64s），600s 放行 1-2 轮完整梯、在极端叠加前止步。
+REQUEST_DEADLINE = _int("ZCODE_REQUEST_DEADLINE", 600)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
