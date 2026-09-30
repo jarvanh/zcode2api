@@ -244,14 +244,41 @@ def _last_user_text(body: dict) -> str:
 
 @router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
 async def list_models():
-    """列出可用模型（Anthropic /v1/models 风格）。"""
-    return {
-        "object": "list",
-        "data": [
-            {"id": i, "type": "model", "display_name": i, "created_at": "2025-01-01T00:00:00Z"}
-            for i in AVAILABLE_MODELS
-        ],
-    }
+    """列出可用模型（Anthropic /v1/models 风格），动态生成。
+
+    名单 = 账号池全部 entitlements 的 capabilities 并集（上游按此硬性判定
+    允许的模型，套餐外 3006），套餐变化列表自动跟随、新模型上线无需改代码；
+    取不到时回退静态 AVAILABLE_MODELS。模型名标准化为官方大小写
+    （glm-5.3-flash → GLM-5.3-Flash），静态目录只用来补充展示规格。
+    """
+    caps: set[str] = set()
+    for provider in ("zai", "bigmodel"):
+        for acc in store.list_accounts(provider):
+            for plan in acc.plans or []:
+                for ent in plan.get("entitlements") or []:
+                    for c in ent.get("capabilities") or []:
+                        if c.startswith("model:") and len(c) > 6:
+                            caps.add(c[6:])
+    catalog = {m["id"]: m for m in getattr(constants, "MODEL_CATALOG", [])}
+    ids: list[str] = []
+    for c in sorted(caps):
+        canon = MODEL_NAME_MAP.get(c.lower(), c)
+        if canon not in ids:
+            ids.append(canon)
+    if not ids:
+        ids = list(AVAILABLE_MODELS)
+    data = []
+    for i in ids:
+        spec = catalog.get(i.lower()) or catalog.get(i)
+        data.append({
+            "id": i,
+            "type": "model",
+            "display_name": i,
+            "created_at": "2025-01-01T00:00:00Z",
+            **({"context_window": spec["context_window"],
+                "max_output_tokens": spec["max_output_tokens"]} if spec else {}),
+        })
+    return {"object": "list", "data": data}
 
 
 @router.post("/v1/messages", dependencies=[Depends(verify_gateway_key)])

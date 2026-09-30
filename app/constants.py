@@ -76,9 +76,25 @@ MODEL_NAME_MAP = {
     "glm-5.1": "GLM-5.1",
     "glm-4.7": "GLM-4.7",
 }
-# /v1/models 对外公布（2026-09-05 实测：当前账号套餐不含 GLM-5.2/5-Turbo，
-# 上游 3006 model not allowed；按账号实际余额窗口公布）
+# /v1/models 回退名单（capabilities 并集取不到时使用）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
+
+# 展示规格目录（context/max_output 同步自 zcode-api src/provider/models.ts，
+# 规格源自 ZCode 3.11.2 桌面端目录）。仅作 /v1/models 展示补充；实际允许
+# 的模型由账号 entitlements 的 capabilities 动态判定（套餐外上游 3006）。
+MODEL_CATALOG = [
+    {"id": "glm-4.5-air", "context_window": 131_072, "max_output_tokens": 98_304},
+    {"id": "glm-4.6", "context_window": 200_000, "max_output_tokens": 131_072},
+    {"id": "glm-4.6v", "context_window": 131_072, "max_output_tokens": 32_768},
+    {"id": "glm-4.7", "context_window": 200_000, "max_output_tokens": 131_072},
+    {"id": "glm-5", "context_window": 200_000, "max_output_tokens": 64_000},
+    {"id": "glm-5-turbo", "context_window": 200_000, "max_output_tokens": 64_000},
+    {"id": "glm-5v-turbo", "context_window": 200_000, "max_output_tokens": 131_072},
+    {"id": "glm-5.1", "context_window": 200_000, "max_output_tokens": 64_000},
+    {"id": "glm-5.2", "context_window": 1_000_000, "max_output_tokens": 128_000},
+    {"id": "glm-5.3", "context_window": 1_000_000, "max_output_tokens": 128_000},
+    {"id": "glm-5.3-flash", "context_window": 1_000_000, "max_output_tokens": 128_000},
+]
 
 # 上游 max_tokens 合法范围（2026-09-06 实测：超限报 400 code 1210
 # 「max_tokens参数非法：限制数值范围[1,131072]」，客户端（如 auto-compact 续传）
