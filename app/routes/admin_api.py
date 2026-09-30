@@ -131,6 +131,17 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             acc.jwt_token = None
         acc.status = Status.ACTIVE
         acc.last_error = None
+    if "quota" in payload:
+        # 手工登记额度（如智谱开放平台资源包「适用于 glm-5.3-flashx」——上游
+        # billing 接口不暴露这类包，网关查不到）。仅 JWT 账号的 quota 会被后台
+        # 额度刷新覆盖；apiKey 账号无人覆写，登记后长期保留。
+        q = payload["quota"]
+        if q is None:
+            acc.quota = {}
+        elif isinstance(q, dict):
+            acc.quota = q
+        else:
+            raise HTTPException(400, "quota 必须是对象或 null")
     store.update_account(acc)
     return {"ok": True}
 
