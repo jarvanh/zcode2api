@@ -236,6 +236,10 @@ return pool[idx]
 - JWT 账号若在 `/billing/current` 返回 `plans: []`(名下无套餐),同样显示不出
   额度窗口 —— 此时账号能否出话取决于上游是否另有免费/试用额度,billing 接口
   不会体现;实际可用性以请求结果为准。
+- **智谱开放平台资源包**(如「适用于 glm-5.3-flashx 模型的推理」)不在 z.ai
+  zcode-plan billing 族(preview/current/balance)的返回中,后台**不显示但可用**:
+  经 bigmodel 通道以对应模型名请求即可消耗,如 `bigmodel/glm-5.3-flashx`
+  (网关对未知模型名原样透传,上游按资源包计费)。
 
 ---
 
