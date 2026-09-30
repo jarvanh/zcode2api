@@ -23,7 +23,8 @@ from ..claim import (
 from ..claim import claim as do_claim
 from ..install import run_install_sequence_for_account
 from ..models import PROVIDERS, Status
-from ..oauth import ZaiAuthFlow
+from ..body_transform import jwt_user_id
+from ..oauth import ZaiAuthFlow, parse_userinfo
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
@@ -302,6 +303,20 @@ async def login_poll(flow_id: str):
     zcode_jwt = data.get("token")
     access_token = (data.get("zai") or {}).get("access_token")
     label = entry.get("label") or "oauth-login"
+    # 抓取用户名：userinfo 只认 poll 返回的 data.zai.access_token（授权瞬间独有，
+    # 过期即弃），池内存量凭据打上游身份接口一律被拒——uid 与真实账号用户名的
+    # 对应关系错过这一刻就再也查不到（2026-09-30 实测 5247/1698 补查失败）。
+    uid = jwt_user_id(zcode_jwt)
+    if zcode_jwt and access_token and uid:
+        try:
+            username = parse_userinfo(await flow.userinfo(access_token), uid)
+        except Exception:  # noqa: BLE001 - 命名是锦上添花，绝不能阻塞入池主链路
+            username = None
+        if username:
+            store.set_setting(f"alias:{uid}", username)
+            if label == "oauth-login":
+                label = username
+            logs.info("oauth", f"flow_id={flow_id} 抓取用户名 uid={uid} → {username}")
     account = None
     if zcode_jwt:
         account = store.add_account("zai", label, zcode_jwt)

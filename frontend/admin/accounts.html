@@ -90,6 +90,9 @@
     <div id="add-pane-login" style="display:none">
       <div class="dialog-body">
         <div class="dialog-help">通过 Z.AI 官方 OAuth 授权登录，授权成功后自动导入到账号池（含 Coding Plan 额度）。链接约 5 分钟内有效，换设备打开亦可。</div>
+        <div class="dialog-help" style="background:var(--panel-2);border:1px solid var(--hairline);border-radius:var(--radius);padding:8px 12px;margin-bottom:10px;line-height:1.6">
+          <span style="color:var(--amber)">⚠️</span> 授权前请确认：打开授权页的浏览器里 chat.z.ai 登录的是<b>目标账号</b>（右上角显示手机号，而不是「游客/试用」）。浏览器残留的游客会话曾导致授权被静默完成成访客身份——现已强制弹出登录页（prompt=login）并在捕获到访客时拒绝入池；若打开授权页仍直接显示「登录已完成」，请先在 chat.z.ai 退出游客（或清除该站点数据）再用手机号登录目标账号，重新生成链接授权。
+        </div>
         <div id="login-idle">
           <input class="input" id="login-label" placeholder="账号备注（可选，如 acct-1）" maxlength="32" style="margin-bottom:10px">
           <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">生成授权链接</button>

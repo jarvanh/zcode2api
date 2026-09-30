@@ -131,3 +131,24 @@ def test_rename_ignores_zai_apikey_and_empty():
     acc = {"id": "z", "name": "zai-8411"}
     assert cs.maybe_rename_account(acc, "zai", "apiKey", "k.s", aliases, {}, {}) is None
     assert cs.maybe_rename_account(acc, "zai", "jwt", "", aliases, {}, {}) is None
+
+
+def test_meta_alias_seeds(tmp_path):
+    import sqlite3
+    db = tmp_path / "accounts.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.executemany("INSERT INTO meta VALUES (?, ?)", [
+        ("alias/IGNORED", "x"),                       # 斜杠 key 不匹配 alias: 前缀
+        ("alias:4321790740758411", "176gg"),
+        ("alias:51681787803732714", " 131 "),
+        ("alias:72af271e-f069-4", "guest"),           # UUID 身份不收
+        ("alias:84041790658495247", ""),              # 空值不收
+        ("gateway_key", "sk-x"),
+    ])
+    con.commit(); con.close()
+    assert cs.meta_alias_seeds(db) == {
+        "4321790740758411": "176gg",
+        "51681787803732714": "131",
+    }
+    assert cs.meta_alias_seeds(tmp_path / "missing.db") == {}

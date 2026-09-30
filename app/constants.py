@@ -40,6 +40,10 @@ USAGE_PATH = "/usage"
 # ── OAuth ────────────────────────────────────────────────────────────────────
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
+# chat.z.ai 域（非 zcode.z.ai）：OAuth access_token 换用户身份。只认 poll 返回的
+# data.zai.access_token；池内存量 zcode JWT / apiKey 打它一律 401（2026-09-30 实测
+# ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
+OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
 # ── 客户端版本（单一真相源：asar 客户端 3.11.2，旧版 3.10.2 已随官方升级）────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001

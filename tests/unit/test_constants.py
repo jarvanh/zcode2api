@@ -116,3 +116,9 @@ def test_retry_settings_defaults():
     assert settings.RETRY_5XX_TIMES == 3
     assert settings.RETRY_5XX_WAIT == 5
     assert settings.COOLING_SECONDS == 300
+
+
+def test_oauth_userinfo_url():
+    # userinfo 只认授权瞬间 poll 返回的 data.zai.access_token，域在 chat.z.ai
+    # （非 zcode.z.ai）；存量凭据打它一律 401（2026-09-30 实测）
+    assert constants.OAUTH_USERINFO_URL == "https://chat.z.ai/api/oauth/userinfo"

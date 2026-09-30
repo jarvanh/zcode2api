@@ -5,11 +5,33 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 
 import httpx
 
-from . import settings
+from . import constants, settings
+
+
+def parse_userinfo(info: dict | None, expected_uid: str | None = None) -> str | None:
+    """从 userinfo 载荷提取用户名（账号命名的依据）。
+
+    字段名按桌面端缓存形态与常见 OIDC 命名防御式解析（username/displayName/
+    name/nickname）；uid 可解析时与 JWT 身份比对，对不上视为不可信返回 None。
+    """
+    if not isinstance(info, dict):
+        return None
+    uid = str(info.get("user_id") or info.get("id") or info.get("sub") or "")
+    if expected_uid and uid and uid != expected_uid:
+        return None
+    for key in ("username", "displayName", "name", "nickname"):
+        raw = info.get(key)
+        if not isinstance(raw, str):
+            continue
+        name = re.sub(r"[\s/\\:#?\"'<>|%*`]+", "", raw.strip())[:24]
+        if name:
+            return name
+    return None
 
 
 class ZaiAuthFlow:
@@ -52,6 +74,29 @@ class ZaiAuthFlow:
             )
         res.raise_for_status()
         return res.json().get("data") or {}
+
+    async def userinfo(self, access_token: str) -> dict | None:
+        """OAuth access_token → 用户身份（uid + 用户名）。
+
+        只在授权成功的 poll 返回里有这个 token，userinfo 也只认它——池内存量
+        zcode JWT / apiKey 打上游任何身份接口都被拒（2026-09-30 实测），所以
+        用户名必须在 poll 当场抓取，错过不可补查。失败一律返回 None（命名/别名
+        是锦上添花，绝不能阻塞入池主链路）。
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.get(
+                    constants.OAUTH_USERINFO_URL,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            if res.status_code != 200:
+                return None
+            data = res.json()
+        except (httpx.HTTPError, ValueError):  # noqa: BLE001 - 上游抖动/非 JSON
+            return None
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        return data if isinstance(data, dict) else None
 
     async def exchange_api_key(self, access_token: str) -> str:
         """OAuth access_token → 业务 token → 机构/项目 → API Key。"""

@@ -155,6 +155,29 @@ def account_label(uid: str, aliases: dict[str, str]) -> str:
     return _sanitize_username(aliases.get(uid) or "") or uid[-4:]
 
 
+def meta_alias_seeds(db_path: Path) -> dict[str, str]:
+    """网关 meta 表里的 alias:<uid> 种子——后台 OAuth 授权成功时抓取的用户名
+    （admin_api login_poll 写入）。OAuth access_token 只在授权瞬间存在，meta
+    是那次抓取的持久落点；本函数只读合并，让同身份的存量账号跟着改名。"""
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT key, value FROM meta WHERE key LIKE 'alias:%'").fetchall()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001 - 库不可读时无种子可用
+        return {}
+    out: dict[str, str] = {}
+    for key, value in rows:
+        uid = key[len("alias:"):]
+        name = _sanitize_username(str(value or ""))
+        if uid.isdigit() and name:
+            out[uid] = name
+    return out
+
+
 def slot_account_spec(
     slot: str, aliases: dict[str, str] | None = None
 ) -> tuple[str | None, str | None]:
@@ -395,15 +418,19 @@ def main() -> int:
     if isinstance(accounts, dict):
         accounts = accounts.get("accounts") or accounts.get("data") or []
 
-    # ── 别名学习：uid → 用户名（凭据文件 user_info），只增不删持久积累 ────────
-    aliases: dict[str, str] = state.get("aliases") or {}
+    # ── 别名合并：state 持久积累 ← meta 种子（OAuth 抓取）← 凭据文件 user_info ──
+    aliases: dict[str, str] = dict(state.get("aliases") or {})
+    for uid, name in meta_alias_seeds(args.db).items():
+        if aliases.get(uid) != name:
+            aliases[uid] = name
+            print(f"ALIAS uid {uid} → {name}（来自网关 meta，OAuth 授权时抓取）")
     learned = learn_aliases()
-    fresh = {u: n for u, n in learned.items() if aliases.get(u) != n}
-    if fresh:
-        aliases.update(fresh)
-        state["aliases"] = aliases
-        for uid, name in fresh.items():
+    for uid, name in learned.items():
+        if aliases.get(uid) != name:
+            aliases[uid] = name
             print(f"ALIAS uid {uid} → {name}（学习自本机凭据 user_info）")
+    if aliases != (state.get("aliases") or {}):
+        state["aliases"] = aliases
 
     # ── 自动入池：本机新登录的身份（首次出现 / 消失后重现）建号入池 ──────────
     held = _pool_held_identities(accounts, stored, slots)
