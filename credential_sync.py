@@ -15,8 +15,11 @@
 
 自动入池（plan_auto_adds）：本机凭据文件出现「新登录身份」（首次出现，
 或消失过又出现=退出后重登）且池里无人持有 → 自动建号入池，命名
-zai-<uid尾4> / bigmodel-<uid尾4>-<plan>。身份「持续在场」时池里删了也
-不复活。升级首跑为播种轮：只登记在场身份、一律不添加。
+zai-<用户名|uid尾4> / bigmodel-<用户名|uid尾4>-<plan>。用户名来自凭据
+文件里的 user_info（learn_aliases），learn 到的 uid→用户名映射持久积累
+在 state["aliases"]；历史自动命名的账号在 learn 到用户名后自动补改
+（maybe_rename_account，只动自动命名的，人工命名不碰）。身份「持续在场」
+时池里删了也不复活。升级首跑为播种轮：只登记在场身份、一律不添加。
 
 用法：python3 credential_sync.py [--gateway URL] [--dry-run]
 退出码：0=无需变更或同步成功，1=同步失败。
@@ -46,6 +49,8 @@ JWT_KEY = "zcodejwttoken"
 BIGMODEL_KEY_RE = re.compile(
     r"^account-provider:coding-plan:account:bigmodel-(individual|team)-coding-plan:account:(\d+):api-key$"
 )
+# 凭据文件里的用户信息（桌面端登录时写入）：uid → username，账号命名的依据
+USER_INFO_RE = re.compile(r"(^|:)user_info$")
 
 STATE_FILENAME = "cred-sync-state.json"
 
@@ -110,6 +115,112 @@ def load_local_slots() -> dict[str, str]:
         except Exception as e:  # noqa: BLE001
             print(f"WARN 解密 {m.group(1)}-{m.group(2)} 失败: {e}", file=sys.stderr)
     return slots
+
+
+def _sanitize_username(name: str) -> str:
+    cleaned = re.sub(r"[\s/\\:#?\"'<>|%*`]+", "", (name or "").strip())
+    return cleaned[:24]
+
+
+def learn_aliases() -> dict[str, str]:
+    """从本机凭据文件学习 uid → 用户名（oauth:*:user_info，桌面端登录时写入）。
+
+    上游 billing / getCustomerInfo 都不认池内存量凭据（实测），uid 与真实
+    账号的对应关系唯一来源就是这份文件。返回值由调用方并进 state["aliases"]
+    持久积累：身份轮换后旧映射仍保留，历史账号的命名/改名有据可依。
+    """
+    try:
+        raw = json.loads(CREDENTIALS_FILE.read_text())
+    except Exception:  # noqa: BLE001 - 文件缺失/损坏时无别名可学
+        return {}
+    learned: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(value, str) or not USER_INFO_RE.search(key or ""):
+            continue
+        try:
+            info = json.loads(decrypt_value(value))
+        except Exception:  # noqa: BLE001 - 解不出按无别名处理
+            continue
+        uid = str(info.get("id") or "")
+        username = _sanitize_username(
+            str(info.get("username") or info.get("displayName") or "")
+        )
+        if uid.isdigit() and username:
+            learned[uid] = username
+    return learned
+
+
+def account_label(uid: str, aliases: dict[str, str]) -> str:
+    """账号名里的身份标签：用户名优先，学不到退回 uid 尾 4 位（旧行为）。"""
+    return _sanitize_username(aliases.get(uid) or "") or uid[-4:]
+
+
+def slot_account_spec(
+    slot: str, aliases: dict[str, str] | None = None
+) -> tuple[str | None, str | None]:
+    """槽位 → (provider, 入池账号名)。jwt/unknown 解不出身份，不入池。"""
+    aliases = aliases or {}
+    if slot.startswith("jwt/"):
+        uid = slot[len("jwt/"):]
+        if uid and uid != "unknown":
+            return "zai", f"zai-{account_label(uid, aliases)}"
+        return None, None
+    if slot.startswith("bigmodel/"):
+        plan, _, acc_id = slot[len("bigmodel/"):].partition("-")
+        if acc_id:
+            return "bigmodel", f"bigmodel-{account_label(acc_id, aliases)}-{plan}"
+        return None, None
+    return None, None
+
+
+def _bigmodel_uid(current: str, slots: dict[str, str], state: dict) -> str | None:
+    """apiKey 本身解不出身份，按「本机槽位出现过同值」反查 uid（本地槽位优先）。"""
+    for source in (slots, state):
+        for slot, value in source.items():
+            if not slot.startswith("bigmodel/") or not isinstance(value, str):
+                continue
+            if value and value == current:
+                _, _, acc_id = slot[len("bigmodel/"):].partition("-")
+                if acc_id.isdigit():
+                    return acc_id
+    return None
+
+
+def maybe_rename_account(
+    acc: dict,
+    provider: str,
+    mode: str,
+    current: str,
+    aliases: dict[str, str],
+    slots: dict[str, str],
+    state: dict,
+) -> str | None:
+    """历史自动命名账号补用户名，返回新名（无需改则 None）。
+
+    只动 cred-sync 自己起的 zai-<尾4> / bigmodel-<尾4>-<plan>——精确匹配
+    旧自动命名才改，人工命名的账号（131 / zai-175 / bigmodel-175 等）一律
+    不碰；uid 没有已学别名也不动。
+    """
+    if not current or not aliases:
+        return None
+    name = acc.get("name") or ""
+    if provider == "zai" and mode == "jwt":
+        uid = jwt_uid(current)
+        if uid and uid.isdigit() and name == f"zai-{uid[-4:]}":
+            label = account_label(uid, aliases)
+            if label != uid[-4:]:
+                return f"zai-{label}"
+        return None
+    if provider == "bigmodel" and mode == "apiKey":
+        uid = _bigmodel_uid(current, slots, state)
+        if uid:
+            for plan in ("individual", "team"):
+                if name == f"bigmodel-{uid[-4:]}-{plan}":
+                    label = account_label(uid, aliases)
+                    if label != uid[-4:]:
+                        return f"bigmodel-{label}-{plan}"
+        return None
+    return None
 
 
 def admin_request(gateway: str, admin_key: str, method: str, path: str, payload=None):
@@ -223,17 +334,6 @@ def attribute_account(
     return None, {}
 
 
-def slot_account_spec(slot: str) -> tuple[str | None, str | None]:
-    """槽位 → (provider, 入池账号名)。jwt/unknown 解不出身份，不入池。"""
-    if slot.startswith("jwt/"):
-        uid = slot[len("jwt/"):]
-        return ("zai", f"zai-{uid[-4:]}") if uid and uid != "unknown" else (None, None)
-    if slot.startswith("bigmodel/"):
-        plan, _, acc_id = slot[len("bigmodel/"):].partition("-")
-        return ("bigmodel", f"bigmodel-{acc_id[-4:]}-{plan}") if acc_id else (None, None)
-    return None, None
-
-
 def _pool_held_identities(accounts: list, stored: dict, slots: dict[str, str]) -> set[str]:
     """池里当前有哪些身份的凭据：zai/jwt 解存量 JWT 的 uid；bigmodel 按值匹配槽位。"""
     held: set[str] = set()
@@ -295,6 +395,16 @@ def main() -> int:
     if isinstance(accounts, dict):
         accounts = accounts.get("accounts") or accounts.get("data") or []
 
+    # ── 别名学习：uid → 用户名（凭据文件 user_info），只增不删持久积累 ────────
+    aliases: dict[str, str] = state.get("aliases") or {}
+    learned = learn_aliases()
+    fresh = {u: n for u, n in learned.items() if aliases.get(u) != n}
+    if fresh:
+        aliases.update(fresh)
+        state["aliases"] = aliases
+        for uid, name in fresh.items():
+            print(f"ALIAS uid {uid} → {name}（学习自本机凭据 user_info）")
+
     # ── 自动入池：本机新登录的身份（首次出现 / 消失后重现）建号入池 ──────────
     held = _pool_held_identities(accounts, stored, slots)
     adds, presence, seeded = plan_auto_adds(
@@ -305,9 +415,10 @@ def main() -> int:
 
     changed = 0
     added = 0
+    renamed = 0
 
     for slot, value in adds:
-        provider, name = slot_account_spec(slot)
+        provider, name = slot_account_spec(slot, aliases)
         if not provider:
             print(f"SKIP {slot} 身份不明，不入池")
             continue
@@ -320,6 +431,16 @@ def main() -> int:
     for acc in accounts:
         acc_id, provider, mode = acc.get("id"), acc.get("provider"), acc.get("mode")
         current = stored.get(acc_id) or ""
+
+        # ── 自动命名账号补用户名（放在归属判定前：身份已离场的也要改）──────
+        new_name = maybe_rename_account(acc, provider, mode, current, aliases, slots, state)
+        if new_name:
+            print(f"RENAME {acc_id} ({provider}/{mode})：{acc.get('name')} → {new_name}")
+            if not args.dry_run:
+                admin_request(args.gateway, admin_key, "PUT",
+                              f"/accounts/{acc_id}", {"name": new_name})
+            renamed += 1
+
         owner, candidates = attribute_account(provider, mode, current, slots, state)
 
         if owner is None:
@@ -342,8 +463,8 @@ def main() -> int:
         # presence 每轮都要落盘（在场/消失标记是自动入池的信号源）
         save_state(args.db, state)
 
-    print(f"DONE 检查 {len(accounts)} 个账号，新增 {added} 个，更新 {changed} 个"
-          + ("（dry-run）" if args.dry_run else ""))
+    print(f"DONE 检查 {len(accounts)} 个账号，新增 {added} 个，更新 {changed} 个，"
+          f"改名 {renamed} 个" + ("（dry-run）" if args.dry_run else ""))
     return 0
 
 
