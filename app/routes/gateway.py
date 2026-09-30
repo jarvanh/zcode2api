@@ -172,6 +172,28 @@ def _is_exhausted(status_code: int, text: str) -> bool:
     return any(k in low for k in _EXHAUST_KEYWORDS)
 
 
+def _rate_break(account) -> int:
+    """429 重试梯耗尽 → 连续计数；达阈值即熔断冷却（指数退避，到期自动回轮询）。
+
+    返回本次冷却秒数（0 = 未达阈值，仅计数）。INVALID/DISABLED 不熔断
+    （前者已走回退、后者是人工停用）。任何成功请求都会清零计数并解除。
+    """
+    account.rate_strikes += 1
+    if account.rate_strikes < settings.RATE_BREAK_THRESHOLD:
+        return 0
+    if account.status in (Status.INVALID, Status.DISABLED):
+        return 0
+    exp = account.rate_strikes - settings.RATE_BREAK_THRESHOLD
+    cool = min(settings.RATE_COOL_BASE * (2 ** exp), settings.RATE_COOL_MAX)
+    account.status = Status.COOLING
+    account.cooling_until = time.time() + cool
+    account.last_error = (
+        f"持续 429 自动熔断 {cool // 60} 分钟"
+        f"（连续 {account.rate_strikes} 轮重试梯耗尽），到期自动回轮询"
+    )
+    return cool
+
+
 def _is_risk_control(status_code: int, text: str) -> bool:
     """风控信号判定（3012「unusual activity」/ messages 端点 405）。
 
@@ -855,12 +877,20 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     retries_429 = 0
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
+                cool = _rate_break(account)
                 store.update_account(account)
-                logs.warn(
-                    req_id,
-                    f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
-                    f"切换下一个（账号保持可用）",
-                )
+                if cool:
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 连续 {account.rate_strikes} 轮 429 重试梯耗尽，"
+                        f"自动熔断 {cool // 60} 分钟（到期自动回轮询）",
+                    )
+                else:
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
+                        f"切换下一个（账号保持可用）",
+                    )
                 return _NEXT_ACCOUNT
 
             if status_code >= 500:
@@ -974,6 +1004,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控计数
         if account.status not in (Status.INVALID, Status.DISABLED):
             account.risk_strikes = 0
+            account.rate_strikes = 0
             account.last_error = None
             account.cooling_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):

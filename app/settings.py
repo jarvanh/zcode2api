@@ -101,6 +101,12 @@ BILLING_REFRESH_MIN_INTERVAL = _int("ZCODE_BILLING_REFRESH_MIN_INTERVAL", 60)
 RETRY_429_TIMES = _int("ZCODE_RETRY_429_TIMES", 5)       # 429 重试次数
 RETRY_429_WAIT = _int("ZCODE_RETRY_429_WAIT", 60)        # 429 重试等待秒数（上游 Retry-After 优先）
 RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信上限（防吊死客户端）
+# 429 自动熔断：重试梯连续耗尽 RATE_BREAK_THRESHOLD 轮即熔断冷却（指数退避：
+# RATE_COOL_BASE 起、每次翻倍、RATE_COOL_MAX 封顶）。冷却到期自动回轮询，
+# 任何成功请求清零计数 —— 「自动禁用 + 自动启用」闭环，无需人工介入。
+RATE_BREAK_THRESHOLD = _int("ZCODE_RATE_BREAK_THRESHOLD", 2)
+RATE_COOL_BASE = _int("ZCODE_RATE_COOL_BASE", 900)       # 首次熔断 15 分钟
+RATE_COOL_MAX = _int("ZCODE_RATE_COOL_MAX", 7200)        # 封顶 2 小时
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数

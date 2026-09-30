@@ -47,6 +47,7 @@ class Account:
     use_count: int = 0
     fail_count: int = 0
     risk_strikes: int = 0  # 累计风控封禁次数（3012/405）；成功即清零
+    rate_strikes: int = 0  # 连续 429 重试梯耗尽次数（自动熔断）；成功即清零
     recent_results: list = field(default_factory=list)  # 最近请求结果 tick（True 成功/False 失败），最新在末尾
     last_used_at: float | None = None
     last_checked_at: float | None = None
@@ -186,6 +187,7 @@ class Account:
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,
+            "rate_strikes": self.rate_strikes,
             "recent_results": self.recent_results,
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
