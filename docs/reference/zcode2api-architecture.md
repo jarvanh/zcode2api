@@ -240,7 +240,9 @@ return pool[idx]
 - **智谱开放平台资源包**(如「适用于 glm-5.3-flashx 模型的推理」)不在 z.ai
   zcode-plan billing 族(preview/current/balance)的返回中,后台**不显示但可用**:
   经 bigmodel 通道以对应模型名请求即可消耗,如 `bigmodel/glm-5.3-flashx`
-  (网关对未知模型名原样透传,上游按资源包计费)。
+  (网关对未知模型名原样透传,上游按资源包计费)。资源包挂在**购买它的那个
+  智谱账号**的 key 上——多账号时用直连探测归因(逐 key 打一次
+  glm-5.3-flashx,1113=无包,200=有包),登记到对应账号。
 
 ---
 
