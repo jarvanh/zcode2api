@@ -54,6 +54,26 @@ def _stderr_tail(stderr: bytes | None, limit: int = 300) -> str | None:
     return tail.replace("\n", " | ")
 
 
+def _cool_all_accounts(seconds: int, reason: str) -> int:
+    """让全部可走 Plan 通道的账号同步冷却（验证码风暴时减少对上游的施压）。
+
+    只动 active 账号（exhausted/invalid/disabled 保持原状态，冷却不洗掉
+    已判定的语义）；冷却到期由 is_selectable 的 cooling_until 逻辑自动恢复。
+    返回被冷却的账号数。
+    """
+    from .models import Status
+
+    n = 0
+    for acc in store.list_accounts("zai"):
+        if acc.status == Status.ACTIVE and acc.enabled:
+            acc.status = Status.COOLING
+            acc.cooling_until = time.time() + seconds
+            acc.last_error = reason
+            store.update_account(acc)
+            n += 1
+    return n
+
+
 def _parse_certify_id(param: str) -> str | None:
     """从 base64-JSON verifyParam 解出 certifyId（对齐 zapi parseCertifyId）。"""
     try:
@@ -93,6 +113,14 @@ class CaptchaManager:
         # 已签发 certifyId → 签发时刻（monotonic s），TTL 同 token：过期后上游
         # 也不可能再接受该 ID，登记即失效
         self._issued: dict[str, float] = {}
+        # 铸码失败风暴检测（对齐 zapi maybeFireMintStormReset 的信号语义）：
+        # 滑动窗口记录成功/失败时刻。连续多枚铸码失败且零成功 ≈ 出口 IP 被阿里
+        # 云风控盯上（"too many captcha requests"族）——此时继续高频求解只会
+        # 加剧风控，应让账号提前冷却，等 IP 侧解除后再恢复。
+        self._mint_failures: list[float] = []
+        self._mint_successes: list[float] = []
+        self._storm_cool_until: float = 0.0   # 风暴冷却截止（monotonic s）
+        self._last_storm_at: float = 0.0      # 上次触发时刻（去重窗口）
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -148,9 +176,63 @@ class CaptchaManager:
             for a in store.list_accounts("zai")
         )
 
+    # ── 铸码失败风暴检测 ─────────────────────────────────────────────────────
+    def _prune_mint_windows(self, now: float) -> None:
+        f_cut, s_cut = now - 300.0, now - 180.0
+        self._mint_failures = [t for t in self._mint_failures if t > f_cut]
+        self._mint_successes = [t for t in self._mint_successes if t > s_cut]
+
+    def _note_mint_failure(self) -> None:
+        """solver 一轮完整重试（_solve_one）失败记账，并检测失败风暴。"""
+        now = time.monotonic()
+        self._mint_failures.append(now)
+        self._prune_mint_windows(now)
+        self._maybe_fire_storm(now)
+
+    def _note_mint_success(self) -> None:
+        now = time.monotonic()
+        self._mint_successes.append(now)
+        self._prune_mint_windows(now)
+        if self._storm_cool_until and now >= self._storm_cool_until:
+            # 冷却到期后的首次成功：IP 侧已解除，出口恢复
+            self._storm_cool_until = 0.0
+            logs.ok("captcha", "铸码风暴冷却解除（恢复成功），恢复常规求解节奏")
+
+    def _maybe_fire_storm(self, now: float) -> None:
+        """风暴判定（对齐 zapi）：5 分钟内 ≥8 次铸码失败且 3 分钟内零成功。
+
+        触发动作：让全部可服务账号进入同步冷却 STORM_COOL_SECONDS（长于上游
+        风控窗口的经验值），期间补货门关闭、热路径改走宽限等待，不再对被
+        盯上的出口 IP 施压。12 分钟去重窗口防止连续触发。
+        """
+        if now - self._last_storm_at < settings.CAPTCHA_STORM_DEDUPE:
+            return
+        fails = len([t for t in self._mint_failures if t > now - 300.0])
+        succs = len([t for t in self._mint_successes if t > now - 180.0])
+        if fails < settings.CAPTCHA_STORM_THRESHOLD or succs > 0:
+            return
+        self._last_storm_at = now
+        self._storm_cool_until = now + settings.CAPTCHA_STORM_COOL
+        cool_min = settings.CAPTCHA_STORM_COOL // 60
+        logs.warn(
+            "captcha",
+            f"铸码失败风暴：{fails} 次失败/5min 且 0 成功/3min，疑似出口 IP 被阿里云风控；"
+            f"全部账号同步冷却 {cool_min} 分钟（停止对被盯上的出口施压，到期自动恢复）",
+        )
+        _cool_all_accounts(cool_min * 60, reason=f"验证码风暴：铸码连续失败 {fails} 次")
+
+    def _storm_gate_closed(self) -> bool:
+        """风暴冷却期间禁止主动铸码（热路径仍可消费池内余量/宽限等待）。"""
+        return bool(self._storm_cool_until and time.monotonic() < self._storm_cool_until)
+
     async def _refill_loop(self) -> None:
         while True:
             try:
+                # 风暴冷却期间停止主动铸码（不产生上游流量，等 IP 侧解除）
+                if self._storm_gate_closed():
+                    await self._evict_expired()
+                    await asyncio.sleep(5)
+                    continue
                 # 无可服务账号（全冷却/禁用/无号）：只淘汰过期 token，不解新码（不产生上游流量）
                 if not self._gate_open():
                     await self._evict_expired()
@@ -348,6 +430,7 @@ class CaptchaManager:
                     continue
                 if attempt > 1:
                     logs.ok("captcha", f"求解成功（第 {attempt} 次尝试）")
+                self._note_mint_success()
                 return _Token(param, region)
             if last_err is None:
                 # 求解器退出但无 param：用 stderr 末段代替沉默的"无结果"
@@ -356,6 +439,7 @@ class CaptchaManager:
             logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果: {last_err}")
 
         logs.warn("captcha", f"求解失败: {last_err or '多次重试无结果'}")
+        self._note_mint_failure()
         return None
 
     async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:

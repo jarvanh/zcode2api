@@ -68,6 +68,14 @@ CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 CAPTCHA_EMPTY_TAKE_RACE = _int("CAPTCHA_EMPTY_TAKE_RACE", 3)  # 池空竞速并行路数
 CAPTCHA_RACE_DEADLINE = _int("CAPTCHA_RACE_DEADLINE", 25)     # 竞速总死线（秒）
 CAPTCHA_TAKE_GRACE = _int("CAPTCHA_TAKE_GRACE", 10)           # 竞速无果后等后台补货宽限（秒）
+# 铸码失败风暴检测（对齐 zapi mint-storm 信号语义；执行端为全账号同步冷却，
+# zapi 的 Telegram IP 重置是作者私有环境设施，开源代码未接线）：
+# 5 分钟内 >= CAPTCHA_STORM_THRESHOLD 次铸码失败且 3 分钟内零成功 → 触发，
+# 全部 active 账号冷却 CAPTCHA_STORM_COOL 秒（到期自动恢复），冷却期间停止
+# 主动铸码（不对被盯上的出口 IP 施压）；CAPTCHA_STORM_DEDUPE 去重窗口。
+CAPTCHA_STORM_THRESHOLD = _int("CAPTCHA_STORM_THRESHOLD", 8)
+CAPTCHA_STORM_COOL = _int("CAPTCHA_STORM_COOL", 900)         # 15 分钟
+CAPTCHA_STORM_DEDUPE = _int("CAPTCHA_STORM_DEDUPE", 720)     # 12 分钟去重
 
 # 验证码求解（无浏览器模拟浏览器环境，运行阿里云无痕 SDK）。
 # 主路径：Bun + vendored 上游 captcha-happy.ts（solver-bun.ts）——bun 存在即用，
