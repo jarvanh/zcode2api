@@ -54,11 +54,12 @@ def _stderr_tail(stderr: bytes | None, limit: int = 300) -> str | None:
     return tail.replace("\n", " | ")
 
 
-def _cool_all_accounts(seconds: int, reason: str) -> int:
+def _cool_all_accounts(seconds: int, reason: str, persist: bool = True) -> int:
     """让全部可走 Plan 通道的账号同步冷却（验证码风暴时减少对上游的施压）。
 
     只动 active 账号（exhausted/invalid/disabled 保持原状态，冷却不洗掉
     已判定的语义）；冷却到期由 is_selectable 的 cooling_until 逻辑自动恢复。
+    persist=False 仅改内存对象不落库（单测替身用），防止测试账号写进真库。
     返回被冷却的账号数。
     """
     from .models import Status
@@ -69,7 +70,8 @@ def _cool_all_accounts(seconds: int, reason: str) -> int:
             acc.status = Status.COOLING
             acc.cooling_until = time.time() + seconds
             acc.last_error = reason
-            store.update_account(acc)
+            if persist:
+                store.update_account(acc)
             n += 1
     return n
 
