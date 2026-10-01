@@ -60,9 +60,10 @@ GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
 BIGMODEL_CHANNEL_ENABLED = os.getenv("ZCODE_BIGMODEL_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
-# 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）
-CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则补）
-CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
+# 预解 token 池。真浏览器求解重（单枚 10–40s、Chromium 数百 MB），池收敛为 1/2
+#（TTL 95s → 稳态约 95s 解一枚，Chromium 占空比 ~10–40%）；回滚 legacy 可调大。
+CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 1)        # 目标库存（低于则补）
+CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 2)        # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 CAPTCHA_EMPTY_TAKE_RACE = _int("CAPTCHA_EMPTY_TAKE_RACE", 3)  # 池空竞速并行路数
@@ -77,26 +78,21 @@ CAPTCHA_STORM_THRESHOLD = _int("CAPTCHA_STORM_THRESHOLD", 8)
 CAPTCHA_STORM_COOL = _int("CAPTCHA_STORM_COOL", 900)         # 15 分钟
 CAPTCHA_STORM_DEDUPE = _int("CAPTCHA_STORM_DEDUPE", 720)     # 12 分钟去重
 
-# 验证码求解（无浏览器模拟浏览器环境，运行阿里云无痕 SDK）。
-# 主路径：Bun + vendored 上游 captcha-happy.ts（solver-bun.ts）——bun 存在即用，
-#   求解器实测 6/6 成功（移植版 solver.js 在 pe.070 上失速率 >70%）；
-# 回退路径：Node + 移植版 solver.js（bun 未装/不可用时自动落回，行为同旧版）。
-# 环境变量 ZCODE_NODE_PATH / ZCODE_CAPTCHA_SOLVER_JS 可显式指定，优先于探测。
-_BUN_CANDIDATE = shutil.which("bun") or str(Path.home() / ".bun" / "bin" / "bun")
-if os.getenv("ZCODE_NODE_PATH"):
-    NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
-elif Path(_BUN_CANDIDATE).exists():
-    NODE_PATH = _BUN_CANDIDATE
-else:
-    NODE_PATH = "node"
-_USE_BUN = NODE_PATH.endswith("bun")
+# 验证码求解（真浏览器：puppeteer-core + 系统 Chromium 跑阿里云官方无痕 SDK，
+# 对齐 zcode-switch captcha.js。happy-dom 路线 2026-09 起被风控「unusual
+# activity」全拒，solver.js 仅留作回滚：ZCODE_CAPTCHA_SOLVER=legacy）
+NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
-CAPTCHA_SOLVER_JS = _resolve_path(
-    "ZCODE_CAPTCHA_SOLVER_JS",
-    "captcha_node/solver-bun.ts" if _USE_BUN else "captcha_node/solver.js",
+CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "pw").strip().lower() or "pw")
+CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
+    "solver.js" if CAPTCHA_SOLVER_MODE == "legacy" else "solver_pw.js"
 )
+# Chromium 可执行文件（solver_pw.js 用；env 可覆盖，缺省按常见路径探测）
+CHROMIUM_PATH = os.getenv("ZCODE_CHROMIUM_PATH", "/usr/local/bin/chromium")
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
-CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时（秒）
+# 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
+# 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
+CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
@@ -132,6 +128,10 @@ RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒�
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
+# 激活上报 + preview + 领取（对齐 zcode-switch 10 分钟轮次）。0 = 关闭轮次，
+# 仅入池/手动触发。运行期可在后台设置改（meta 表即时生效）
+CLAIM_ROUND_INTERVAL = _int("ZCODE_CLAIM_ROUND_INTERVAL", 600)
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖
@@ -151,7 +151,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.5.11"
+APP_VERSION = "2.6.3"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

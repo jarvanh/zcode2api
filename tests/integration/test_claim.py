@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import constants
 from tests.conftest import seed_account
 
 GOOD_JWT = "h1.eyJzdWIiOiJhIn0.sig"
@@ -91,7 +92,7 @@ class TestClaim:
         from app.fingerprint import profile_for
 
         profile = profile_for(acc)
-        assert headers.get("x-zcode-app-version") == "3.11.2"  # BILLING_APP_VERSION
+        assert headers.get("x-zcode-app-version") == constants.BILLING_APP_VERSION
         assert headers.get("x-platform") == profile.platform_full
         assert headers.get("x-device-mid") == profile.device_mid
         assert b"mock-claim-plan" in body
@@ -142,7 +143,7 @@ class TestClaim:
         body = _json.loads(body)
         # user_id 来自 JWT payload（GOOD_JWT sub="a" 兜底）；无 Authorization 头
         assert body["user_id"] == "a"
-        assert body["app_version"] == "3.11.2"
+        assert body["app_version"] == constants.BILLING_APP_VERSION
         assert body["device_mid"]
         # 指纹档案（2026-09-07）：事件字段按账号指纹出值，与 billing 头同源
         from app.fingerprint import profile_for
@@ -168,8 +169,8 @@ class TestClaim:
                          if c[1].endswith("/billing/preview")]
         assert preview_calls
         h = preview_calls[-1][2]
-        assert h.get("user-agent") == "ZCode/3.11.2"
-        assert h.get("x-zcode-app-version") == "3.11.2"
+        assert h.get("user-agent") == f"ZCode/{constants.BILLING_APP_VERSION}"
+        assert h.get("x-zcode-app-version") == constants.BILLING_APP_VERSION
         assert h.get("x-title") == "Z Code@electron"
         assert h.get("x-release-channel") == "stable"
         # 平台/语言/设备按账号指纹档案出值（2026-09-07 随机指纹池）
@@ -346,7 +347,7 @@ class TestManualClaim:
 
         profile = profile_for(acc)
         assert headers.get("x-device-mid") == profile.device_mid
-        assert headers.get("x-zcode-app-version") == "3.11.2"  # 客户端 claim 头形态
+        assert headers.get("x-zcode-app-version") == constants.BILLING_APP_VERSION
         assert headers.get("x-platform") == profile.platform_full
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 0
@@ -553,3 +554,34 @@ class TestAutoClaimOnPoolEntry:
         res = await client.post("/admin/api/accounts/nonexistent/fingerprint/rotate",
                                 headers={"Authorization": "Bearer zcode"})
         assert res.status_code == 404
+
+
+@pytest.mark.integration
+class TestClaimUpstreamSemantics:
+    """3.11.2 领取语义对齐（zcode-switch claim.rs）：server_time 随成功载荷
+    下发；1005 附带名额恢复时间 next_at（data.plan.ends_at 秒 → 毫秒）。"""
+
+    async def test_claim_success_includes_server_time_and_plan_window(self, claim_env):
+        client, mock, _stub, acc = claim_env
+        mock.state.claim_scenario = "claim_with_server_time"
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id]},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is True
+        assert outcome["server_time"] == 1_787_800_000_000
+        assert outcome["starts_at"] == 1_787_918_400_000
+        assert outcome["ends_at"] == 1_788_138_000_000
+
+    async def test_claim_1005_carries_next_at(self, claim_env):
+        client, mock, _stub, acc = claim_env
+        mock.state.claim_scenario = "claim_quota_full"
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id]},
+                                headers={"Authorization": "Bearer zcode"})
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert outcome["code"] == 1005
+        assert outcome["next_at"] == 1_787_900_000_000
+        assert "名额已用完" in outcome["message"]

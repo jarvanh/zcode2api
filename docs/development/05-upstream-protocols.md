@@ -38,10 +38,13 @@ AI:      zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages   (Plan 通道, Bear
 1. POST zcode.z.ai/api/v1/oauth/cli/init
    Headers: Authorization: Bearer <本地随机 poll_token>, Content-Type: application/json
    Body:    {"provider": "zai"}
-   → data.{flow_id, authorize_url}
-2. 浏览器打开 authorize_url（chat.z.ai/api/oauth/authorize?client_id=client_P8X5CMWmlaRO9gyO-KSqtg&...）
+   → data.{flow_id, authorize_url, poll_token?}（2026-09 新协议：服务端下发 poll_token，
+     后续 poll 必须采用该值；未下发时回落本地随机值，兼容旧协议）
+2. 浏览器打开 authorize_url（chat.z.ai/api/oauth/authorize?client_id=client_P8X5CMWmlaRO9gyO-KSqtg&...；
+   新协议下 redirect 直接指向官方 cli callback，客户端原样使用不再改写）
 3. GET zcode.z.ai/api/v1/oauth/cli/poll/{flow_id}   (Bearer poll_token，轮询至授权完成)
    → data.accessToken（含过期时间）+ zcodejwttoken（视返回结构）
+   poll 4xx 承载 code=3004 → 会话过期（重新发起），其余 4xx → 终态 failed
 4. POST api.z.ai/api/auth/z/login  {"token": "<access_token>"}  → 业务 JWT
 5. GET  chat.z.ai/api/oauth/userinfo (Bearer access_token)      → user_id
 6. 兑换 API Key：getCustomerInfo(默认机构/项目) → api_keys(name="zcode-api-key") → copy/{key} 取 secretKey
@@ -109,12 +112,15 @@ GET  billing/preview   → data.previews[]: ClaimPlan{plan_id,name,description,p
                           查询参数: app_version 必带；platform 参数 preview 容忍、client/configs 拒绝（3001）
 POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCode-App-Version + X-Platform
                           （实测缺版本/平台头即使验证码有效也 3007 —— asar claimManualPlan 头形态）; body: {plan_id}
-                          成功 → starts_at/ends_at 生效窗口
-                          失败码: already_claimed / quota_exhausted → 按服务端 next window 退避
+                          成功 → data.server_time（服务端时钟，秒）+ data.plan.{starts_at,ends_at} 生效窗口（3.11.2 起）
+                          失败码: 1003 already_claimed / 1005 quota_exhausted（data.plan.ends_at × 1000 = 名额恢复时间 next_at）
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.11.2"`；
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.14.3"`（官方客户端
+现行版实证：ZCode.exe ProductVersion 3.14.3.7762 / app.asar 内置常量，构建 2026-09-22；
+zcode-switch Windows 路径读注册表本机真实版同值。**活动投放按最低客户端版本门槛
+（见上「前置」行），官方升版后钉旧版会 preview 恒空 ineligible——升版先改此常量**）；
 无账号路径的 `CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`）。
 有账号时 `X-Platform` / preview `platform` 跟该号 DeviceProfile 走（成套桌面 SKU，一号一台），禁止再盖成全局 darwin-arm64。
 `USER_AGENT` / `X-ZCode-App-Version` / configs 查询串全部引用版本常量。
