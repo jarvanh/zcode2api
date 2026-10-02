@@ -767,8 +767,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         status 推导通道；回退通道自己的 429 重试预算独立计满后再换号）
       - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
         COOLING_SECONDS 并换下一个账号
-      - 风控（3012/405「unusual activity」真封禁）：直接禁用账号（UI 展示），
-        人工确认恢复后手动启用，不做自动退避
+      - 风控（3012/405「unusual activity」）：指数退避冷却（base 900s 起，封顶
+        24h），累计 RISK_BAN_STRIKES 次升级禁用（UI 展示），人工确认恢复
     """
     captcha_retries = 0
     retries_429 = 0
@@ -838,29 +838,42 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
-            # 风控（3012「unusual activity」/ 405）：真封禁 → 禁用账号，人工恢复。
-            # 必须先于 exhausted/其它错误判定，且不再重试（避免对封禁账号持续施压）。
+            # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
+            # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控
+            # 账号持续施压）；冷却期零上游流量（is_cooling 全通道门禁）。
             if _is_risk_control(status_code, text):
-                account.record_result(False, f"风控封禁 HTTP {status_code}（3012/unusual activity）")
-                account.ban_for_risk()
-                account.last_error = (
-                    f"风控封禁 (3012/unusual activity) HTTP {status_code}，"
-                    f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
+                account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
+                account.risk_penalty(
+                    settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
+                    settings.RISK_BAN_STRIKES,
                 )
+                if account.status == Status.DISABLED:
+                    account.last_error = (
+                        f"风控封禁 (3012/unusual activity) HTTP {status_code}，"
+                        f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
+                    )
+                    penalty_note = f"已升级禁用（第 {account.risk_strikes} 次）"
+                else:
+                    cool_until = time.strftime(
+                        "%H:%M", time.localtime(account.cooling_until)
+                    ) if account.cooling_until else "?"
+                    account.last_error = (
+                        f"命中风控 (3012/unusual activity) HTTP {status_code}，"
+                        f"指数退避冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+                    )
+                    penalty_note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
                 store.update_account(account)
                 if needs_captcha and account.has_apikey_fallback():
                     logs.warn(
                         req_id,
-                        f"账号 {account.name} 命中风控 HTTP {status_code}，已禁用 Plan 通道"
-                        f"（累计第 {account.risk_strikes} 次），切 API Key 回退",
+                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切 API Key 回退",
                     )
                     needs_captcha = False
                     force_fallback = True
                     continue
                 logs.warn(
                     req_id,
-                    f"账号 {account.name} 命中风控 HTTP {status_code}，已禁用"
-                    f"（累计第 {account.risk_strikes} 次），切换下一个",
+                    f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
                 )
                 return _NEXT_ACCOUNT
 
@@ -898,6 +911,18 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
+                # 1113「无余额/无资源包」是 Key 的永久状态（api.z.ai 实测秒回），
+                # 原地等待重试毫无意义，只会把客户端吊死在 RETRY_429_TIMES×WAIT 里
+                # ——快速换号/失败。
+                if "1113" in text or "insufficient balance" in text.lower():
+                    account.record_result(False, "429 1113 无余额（Key 无资源包，永久态）")
+                    logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额，跳过等待重试")
+                    if needs_captcha and account.has_apikey_fallback():
+                        needs_captcha = False
+                        force_fallback = True
+                        retries_429 = 0
+                        continue
+                    return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
                 # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
                 #（与上方 3012/401/403 切回退同一语义）
@@ -955,8 +980,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         return _NEXT_ACCOUNT
                     continue
                 account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
-                if account.status in (Status.INVALID, Status.DISABLED):
-                    # Key 回退 5xx 不得覆盖废 JWT / 风控禁用，否则冷却结束会重开 Plan
+                if account.status in (Status.INVALID, Status.DISABLED) or account.is_cooling():
+                    # Key 回退 5xx 不得覆盖废 JWT / 风控禁用，否则冷却结束会重开 Plan；
+                    # 风控冷却同理（冷却期不覆盖，避免缩短风控退避）
                     store.update_account(account)
                     logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，Plan 已停用，切换下一个")
                 else:
@@ -1047,8 +1073,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         account.use_count += 1
         account.last_used_at = time.time()
         account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
-        # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控计数
-        if account.status not in (Status.INVALID, Status.DISABLED):
+        # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控计数；
+        # 风控冷却未到期同样不洗（上游风控标记为小时级粘性，回退通道成功不代表
+        # Plan 通道已解除，洗掉会立刻重打 Plan 并累加计数）。冷却已过期后的
+        # Plan 通道成功即证明恢复，全量清理（清风控计数）。
+        if account.status not in (Status.INVALID, Status.DISABLED) and not account.is_cooling():
             account.risk_strikes = 0
             account.rate_strikes = 0
             account.last_error = None
