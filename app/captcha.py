@@ -126,6 +126,9 @@ class CaptchaManager:
         self._mint_successes: list[float] = []
         self._storm_cool_until: float = 0.0   # 风暴冷却截止（monotonic s）
         self._last_storm_at: float = 0.0      # 上次触发时刻（去重窗口）
+        # 闲置停解（对齐 zapi deep-idle）：最后一次取用时刻（monotonic s）。
+        # 0 = 从未取用（视为闲置，后台不预热——起服后第一个请求才唤醒）。
+        self._last_take_at: float = 0.0
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -230,6 +233,18 @@ class CaptchaManager:
         """风暴冷却期间禁止主动铸码（热路径仍可消费池内余量/宽限等待）。"""
         return bool(self._storm_cool_until and time.monotonic() < self._storm_cool_until)
 
+    # ── 闲置停解（对齐 zapi deep-idle）───────────────────────────────────────
+    def _idle(self, now: float | None = None) -> bool:
+        """零流量时段判定：无取用超过 CAPTCHA_IDLE_AFTER 秒即闲置。
+
+        从未取用（_last_take_at=0）按闲置算——起服后不为第一个可能永远不来
+        的请求空烧真浏览器。
+        """
+        if settings.CAPTCHA_IDLE_AFTER <= 0:
+            return False
+        now = time.monotonic() if now is None else now
+        return self._last_take_at <= 0 or (now - self._last_take_at) >= settings.CAPTCHA_IDLE_AFTER
+
     async def _refill_loop(self) -> None:
         while True:
             try:
@@ -237,6 +252,12 @@ class CaptchaManager:
                 if self._storm_gate_closed():
                     await self._evict_expired()
                     await asyncio.sleep(5)
+                    continue
+                # 闲置停解：零流量时段只淘汰过期 token（让池自然蒸发清空），
+                # 不铸新码；任意取用即恢复（get_verify_param 里打点）
+                if self._idle():
+                    await self._evict_expired()
+                    await asyncio.sleep(3)
                     continue
                 # 无可服务账号（全冷却/禁用/无号）：只淘汰过期 token，不解新码（不产生上游流量）
                 if not self._gate_open():
@@ -257,8 +278,12 @@ class CaptchaManager:
                 await asyncio.sleep(5)
 
     async def _refill_batch(self, need: int) -> None:
-        """串行补充（求解有 CPU 开销，避免并发爆 Node 进程）。"""
-        if self._refilling:
+        """串行补充（求解有 CPU 开销，避免并发爆 Node 进程）。
+
+        闲置（无取用超阈值/从未取用）直接返回——门禁在此兜底而不仅靠
+        _refill_loop 的分支顺序，热路径误触发的补货同样被拦。
+        """
+        if self._idle() or self._refilling:
             return
         self._refilling = True
         try:
@@ -293,7 +318,9 @@ class CaptchaManager:
         return any(t.certify_id == certify_id for t in list(self._pool._queue))
 
     def _put(self, token: _Token) -> None:
-        # 已签发/池内已有的 certifyId 不再入库（对齐 zapi pushToken 查重）
+        # 已签发（=已消费，_pop_fresh 出口登记）/池内已有的 certifyId 不再
+        # 入库（对齐 zapi pushToken：只查重、不登记——登记必须发生在真正
+        # 交给客户端的出口，否则池内 token 会被自己的账本拦成不可用）。
         if token.certify_id and (self._is_issued(token.certify_id) or self._pool_has_certify_id(token.certify_id)):
             return
         try:
@@ -341,7 +368,9 @@ class CaptchaManager:
         """取一枚可用 token：池内直取 → 池空竞速现解 → 宽限窗口等补货。
 
         返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
+        取用即打点 _last_take_at——闲置停解由任意请求唤醒（对齐 zapi wake）。
         """
+        self._last_take_at = time.monotonic()
         # 1) 池内直取（亚毫秒；取出即触发后台补货）
         token = self._pop_fresh()
         if token is not None:
@@ -373,7 +402,10 @@ class CaptchaManager:
         """空池竞速：并行 EMPTY_TAKE_RACE 路求解，首个成功即回、其余入库。
 
         全部失败或总死线 RACE_DEADLINE 内无胜者 → None（错误已记 _last_error）。
-        超时后竞速任务继续在后台跑（_bg_tasks 持引用），迟到成功经 _put 入库。
+        超时后竞速任务继续在后台跑（_bg_tasks 持引用）：竞速内部对「服务」
+        与「入库」区分对待——死线超时返回 None 后，迟到成功不再有 served
+        窗口，全部经 _put 入库（等价 zapi 背景波收尾，也是闲置唤醒后的
+        冷启动路径：请求超时离开，token 落池给下一次请求亚毫秒直取）。
         """
         racers = max(1, settings.CAPTCHA_EMPTY_TAKE_RACE)
         loop = asyncio.get_running_loop()
@@ -393,12 +425,13 @@ class CaptchaManager:
                 if failed >= racers and not win.done():
                     win.set_result(None)
                 return
-            if served:
-                self._put(token)  # 输了竞速但铸出有效 token：入库不浪费
+            if served or win.done():
+                # 已有胜者，或调用方已按死线超时离开：铸出有效 token 一律
+                # 入库（此前 win.done() 分支会把迟到成功整个丢弃）
+                self._put(token)
                 return
             served = True  # 事件循环单线程，查改之间无 await，此判原子
-            if not win.done():
-                win.set_result(token)
+            win.set_result(token)
 
         for _ in range(racers):
             task = asyncio.create_task(racer())

@@ -78,6 +78,12 @@ CAPTCHA_STORM_THRESHOLD = _int("CAPTCHA_STORM_THRESHOLD", 8)
 CAPTCHA_STORM_COOL = _int("CAPTCHA_STORM_COOL", 900)         # 15 分钟
 CAPTCHA_STORM_DEDUPE = _int("CAPTCHA_STORM_DEDUPE", 720)     # 12 分钟去重
 
+# 闲置停解（对齐 zapi deep-idle 语义）：零流量时段后台停止铸码，不对上游
+# 产无谓的求解流量（真浏览器一枚 10–40s + 数百 MB Chromium，闲时空转代价高）。
+# 无取用超过 CAPTCHA_IDLE_AFTER 秒 → 后台补货停（池内余量自然过期蒸发）；
+# 任意 get_verify_param 取用（含池空竞速）立即恢复。0 = 不停解。
+CAPTCHA_IDLE_AFTER = _int("CAPTCHA_IDLE_AFTER", 600)
+
 # 验证码求解（真浏览器：puppeteer-core + 系统 Chromium 跑阿里云官方无痕 SDK，
 # 对齐 zcode-switch captcha.js。happy-dom 路线 2026-09 起被风控「unusual
 # activity」全拒，solver.js 仅留作回滚：ZCODE_CAPTCHA_SOLVER=legacy）
