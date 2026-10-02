@@ -6,6 +6,7 @@
   <title>zcode-hub · 请求监控</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+  <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
 </head>
 <body>
 <div id="admin-header" data-active="/admin/monitoring"></div>
@@ -47,7 +48,7 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">Token 总量</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M21 8a9 3 0 0 1-18 0 9 3 0 0 1 18 0Z"/><path d="M3 8v8a9 3 0 0 0 18 0V8"/></svg></span></div><div class="stat-num" id="s-tok" style="color:var(--amber)">—</div><div class="stat-sub" id="s-tok-sub"></div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">输入</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-in">—</div><div class="stat-sub" id="s-in-sub"></div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">输出</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-out">—</div><div class="stat-sub" id="s-out-sub"></div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均首字</div><span class="stat-icon" style="color:#6da8e8"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/></svg></span></div><div class="stat-num" id="s-ttfb" style="color:#6da8e8">—</div><div class="stat-sub" id="s-ttfb-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均首字</div><span class="stat-icon" style="color:var(--blue)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/></svg></span></div><div class="stat-num" id="s-ttfb" style="color:var(--blue)">—</div><div class="stat-sub" id="s-ttfb-sub"></div></div>
   </div>
 
   <div class="section-head">

@@ -6,6 +6,7 @@
   <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+  <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
 </head>
 <body>
 <div id="admin-header" data-active="/admin/accounts"></div>
@@ -45,7 +46,7 @@
   <div class="stat-grid">
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">账户总数</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:var(--mint)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:var(--mint)">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#b78ae0"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#b78ae0">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:var(--purple)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:var(--purple)">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
   </div>
 
