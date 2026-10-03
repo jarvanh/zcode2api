@@ -20,6 +20,15 @@ import pytest_asyncio
 import uvicorn
 from httpx import ASGITransport, AsyncClient
 
+# 测试环境隔离（必须在导入 app.settings 之前）。
+# settings 模块导入时会执行 load_dotenv()，把仓库 .env 里的真实密钥
+# （ZCODE_ADMIN_KEY / ZCODE_GATEWAY_KEY）灌进测试进程：网关测试默认无鉴权
+# 应放行、后台测试用代码默认 key，全部被打成 401（2026-10-03 实证 6 例）。
+# python-dotenv 默认 override=False 不覆盖已存在的环境变量，
+# 故此处先占位成测试基线值：后台 key 用代码默认 zcode，网关 key 置空。
+os.environ["ZCODE_ADMIN_KEY"] = "zcode"
+os.environ["ZCODE_GATEWAY_KEY"] = ""
+
 from app import settings
 from tests.mock_upstream import server as mock_server_module
 
