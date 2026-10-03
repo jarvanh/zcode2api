@@ -419,6 +419,17 @@ def build_app() -> FastAPI:
             })
         return Response(json.dumps({"data": data}), media_type="application/json")
 
+    @app.get("/api/oauth/userinfo")
+    async def oauth_userinfo(request: Request) -> Response:
+        """OAuth 用户名抓取端点（2026-10-03）：此前该 URL 硬编码指向真网
+        chat.z.ai，测试环境 poll ready 前同步打真网（DNS+TLS 可达 0.8s），
+        把 ready 响应拖超测试断言的 0.4s 死线。conftest 已把
+        OAUTH_USERINFO_URL 指到这里，永不打真网。"""
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({
+            "data": {"user_id": "mock", "username": "mock-user"}
+        }), media_type="application/json")
+
     @app.post("/api/auth/z/login")
     async def z_login(request: Request) -> Response:
         body = await request.body()

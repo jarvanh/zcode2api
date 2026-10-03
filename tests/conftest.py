@@ -29,7 +29,7 @@ from httpx import ASGITransport, AsyncClient
 os.environ["ZCODE_ADMIN_KEY"] = "zcode"
 os.environ["ZCODE_GATEWAY_KEY"] = ""
 
-from app import settings
+from app import constants, settings
 from tests.mock_upstream import server as mock_server_module
 
 # 开发机常驻系统代理（如 Clash 监听 127.0.0.1:7897）时，httpx 默认 trust_env=True
@@ -132,6 +132,9 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网
     monkeypatch.setattr(settings, "OAUTH_API_BASE", f"{base}/api/v1")
     monkeypatch.setattr(settings, "ZAI_EXCHANGE_ORIGIN", base)
+    # OAuth userinfo（用户名抓取）也指向 Mock —— 该调用在 poll ready 前同步执行，
+    # 打真网会把 ready 响应拖过测试死线（2026-10-03 实测 0.8s > 0.4s）
+    monkeypatch.setattr(constants, "OAUTH_USERINFO_URL", f"{base}/api/oauth/userinfo")
 
     from app.routes import gateway as gateway_module
     monkeypatch.setattr(gateway_module, "captcha_manager", stub_captcha)

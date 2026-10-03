@@ -18,7 +18,7 @@ class TestAdminAuthThrottle:
 
         for _ in range(3):
             res = await client.get("/admin/api/verify",
-                                   headers={"Authorization": "Bearer wrong-password"})
+                                   headers={"Authorization": "Bearer wrong-password"}, params={"login": "1"})
             assert res.status_code == 401
 
         locked = await client.get("/admin/api/verify",
@@ -40,7 +40,7 @@ class TestAdminAuthThrottle:
 
         for _ in range(3):
             res = await client.get("/admin/api/verify",
-                                   headers={"Authorization": "Bearer wrong-password"})
+                                   headers={"Authorization": "Bearer wrong-password"}, params={"login": "1"})
             assert res.status_code == 401
         locked = await client.get("/admin/api/verify",
                                   headers={"Authorization": "Bearer zcode"})

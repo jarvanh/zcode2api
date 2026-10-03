@@ -149,6 +149,8 @@ class TestMonitoringRecording:
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert res.status_code == 200
+        # 直通路径 create_task 后立即返回响应；任务需让出一拍才真正起跑
+        await asyncio.sleep(0.01)
         assert started.is_set()
         # 任务仍在飞行中：必须被模块级强引用持有
         assert len(gateway_module._bg_tasks) >= 1
