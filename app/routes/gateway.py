@@ -845,7 +845,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
                 account.risk_penalty(
                     settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
-                    settings.RISK_BAN_STRIKES,
+                    settings.RISK_BAN_STRIKES, settings.RISK_STRIKE_DECAY_SECONDS,
                 )
                 if account.status == Status.DISABLED:
                     account.last_error = (
@@ -853,6 +853,22 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
                     )
                     penalty_note = f"已升级禁用（第 {account.risk_strikes} 次）"
+                    if settings.RISK_AUTO_ROTATE:
+                        # 「风控后换设备重生」自动化：升级禁用即换发全新设备
+                        # （新 SKU + 新 device_mid），后台补跑安装序；账号重新
+                        # 启用时已是全新身份（billing/claim 头同源跟随档案）
+                        from ..fingerprint import profile_for, rotate
+                        from ..install import schedule_install
+
+                        old_mid = profile_for(account).device_mid[:8]
+                        rotate(account)
+                        account.installed_at = None
+                        schedule_install(account)
+                        logs.warn(
+                            req_id,
+                            f"账号 {account.name} 风控禁用，已自动换发设备指纹"
+                            f"（旧 mid {old_mid}）",
+                        )
                 else:
                     cool_until = time.strftime(
                         "%H:%M", time.localtime(account.cooling_until)
@@ -1079,6 +1095,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # Plan 通道成功即证明恢复，全量清理（清风控计数）。
         if account.status not in (Status.INVALID, Status.DISABLED) and not account.is_cooling():
             account.risk_strikes = 0
+            account.last_risk_at = None
             account.rate_strikes = 0
             account.last_error = None
             account.cooling_until = None

@@ -197,6 +197,66 @@ class TestRiskControlBan:
         assert risk.is_selectable() is False
         assert risk.is_cooling() is True  # 冷却中有恢复倒计时
 
+    async def test_fallback_5xx_preserves_risk_cooldown(self, gateway_client, fresh_app, monkeypatch):
+        """风控冷却中回退 Key 5xx 耗尽：不得用 300s 普通冷却覆盖 900s 风控退避
+        （gateway 5xx 分支的 is_cooling() 守卫）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_5XX_TIMES", 1)
+        monkeypatch.setattr(settings, "RETRY_5XX_WAIT", 0)
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-risk-5xx")
+        acc.api_key = "sk-risk-5xx-fb"
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+        mock.state.sequences["sk-risk-5xx-fb"[:16]] = ["server_error"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 回退通道也 5xx 耗尽
+        assert acc.status == Status.COOLING
+        # 风控退避（900s）未被普通冷却（300s）覆盖
+        assert acc.cooling_until - time.time() > 500
+        assert "命中风控" in (acc.last_error or "")
+        assert "5xx" not in (acc.last_error or "")
+        assert acc.risk_strikes == 1
+
+    async def test_risk_disable_auto_rotates_fingerprint(self, gateway_client, fresh_app, monkeypatch):
+        """风控升级禁用时自动换发设备指纹（2.6.8：「风控后换设备重生」自动化），
+        重新启用时即全新身份；RISK_AUTO_ROTATE=False 关闭。"""
+        client, mock = gateway_client
+        from app.fingerprint import profile_for
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RISK_BAN_STRIKES", 1)
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-rot")
+        old_mid = profile_for(acc).device_mid
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 唯一账号被禁用
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.DISABLED
+        assert profile_for(after).device_mid != old_mid  # 已换发全新设备
+
+    async def test_risk_disable_auto_rotate_can_be_disabled(self, gateway_client, fresh_app, monkeypatch):
+        client, mock = gateway_client
+        from app.fingerprint import profile_for
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RISK_BAN_STRIKES", 1)
+        monkeypatch.setattr(settings, "RISK_AUTO_ROTATE", False)
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-norot")
+        old_mid = profile_for(acc).device_mid
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.DISABLED
+        assert profile_for(after).device_mid == old_mid  # 未换发
+
     async def test_ban_recoverable_by_manual_enable(self, gateway_client, fresh_app):
         client, mock = gateway_client
         from tests.conftest import seed_account
@@ -421,6 +481,7 @@ class TestCooldownBehavior:
 
         acc = seed_account(fresh_app, _GOOD_JWT, name="a-good")
         acc.risk_strikes = 3
+        acc.last_risk_at = time.time() - 60
         acc.status = Status.COOLING
         acc.cooling_until = time.time() - 1  # 已过期才可选；成功后应彻底清理
         acc.last_error = "风控封禁 (3012/unusual activity) HTTP 405，确认恢复后请在后台手动启用（第 3 次）"
@@ -430,6 +491,7 @@ class TestCooldownBehavior:
         assert res.status_code == 200
         after = fresh_app.list_accounts("zai")[0]
         assert after.risk_strikes == 0
+        assert after.last_risk_at is None
         assert after.status == Status.ACTIVE
         assert after.last_error is None
         assert after.cooling_until is None
