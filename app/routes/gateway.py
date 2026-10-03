@@ -421,6 +421,13 @@ async def chat_completions(request: Request):
             status_code=500,
         )
     if not isinstance(result, _Upstream):
+        # 同步直通（_try_account 已读完 body 并收口监控含 tokens）：此处仅把
+        # Anthropic message 转换为 OpenAI chat.completion；错误响应原样返回
+        raw = getattr(result, "body", None)
+        if result.status_code < 300 and raw:
+            data = _safe_json(raw.decode("utf-8", "ignore"))
+            if isinstance(data, dict) and data.get("type") == "message":
+                return JSONResponse(anthropic_to_openai(data, str(body.get("model") or "")))
         return result
 
     model = str(body.get("model") or "")
@@ -1063,6 +1070,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account.record_result(False, f"上游业务错误 {code_hit}")
                     store.update_account(account)
                     logs.req_err(req_id, f"账号 {account.name} 上游业务错误 {code_hit}")
+                    reqlog.finish_error(req_id, f"上游业务错误 {code_hit}", status=_status)
                     return JSONResponse(
                         {"error": {"message": f"上游业务错误 {code_hit}", "type": etype,
                                    "upstream": text[:400]}},
@@ -1075,14 +1083,29 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 account.use_count += 1
                 account.last_used_at = time.time()
                 account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
-                if account.status not in (Status.INVALID, Status.DISABLED):
+                # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控
+                # 计数；风控冷却未到期同样不洗（与下方流式路径同一守卫语义，
+                # 否则 3012 后同请求走 Key 回退成功会把冷却洗掉，立刻重打 Plan）
+                if account.status not in (Status.INVALID, Status.DISABLED) and not account.is_cooling():
                     account.risk_strikes = 0
+                    account.last_risk_at = None
+                    account.rate_strikes = 0
                     account.last_error = None
                     account.cooling_until = None
                     if account.status in (Status.COOLING, Status.EXHAUSTED):
                         account.status = Status.ACTIVE
                 store.update_account(account)
                 _spawn_bg(_safe_refresh(account))
+                # 同步直通在此收口监控条目（含 tokens 与用量记账）：原先同步响应
+                # 只有流式路径闭环，非流式条目永远滞留「进行中」——reqlog._inflight
+                # 无界增长，监控页也把已完成请求永远显示为进行中
+                sync_data = _safe_json(text)
+                sync_usage = (sync_data.get("usage") or {}) if isinstance(sync_data, dict) else {}
+                reqlog.finish_ok(req_id, t_first=time.time() - attempt_t0, status=status_code,
+                                 input_tokens=sync_usage.get("input_tokens"),
+                                 output_tokens=sync_usage.get("output_tokens"))
+                record_usage(model_name, sync_usage.get("input_tokens"),
+                             sync_usage.get("output_tokens"))
                 return _Resp(content=text, status_code=status_code,
                              media_type=resp.headers.get("content-type") or "application/json")
 
