@@ -305,9 +305,17 @@ function tierBadgeHtml(a){
   return label?`<span class="tier-b ${cls}">${label}</span>`:'';
 }
 
+/* 上游真实身份 ID：账号名是人起的（bigmodel-131 / bigmodel-131-individual 这类
+   前缀撞车、后缀规则不统一），UID 才是上游侧的唯一标识，用来一眼区分账号。
+   jwt = JWT payload 的 user_id；apiKey = key 的点分前缀（key_id）。
+   展示截断前 8 位（实测已足够区分全部账号），悬停看全串、点击复制。 */
+function shortUid(u){u=String(u||'');return u.length>12?u.slice(0,8)+'…':u;}
+function copyUid(u){navigator.clipboard.writeText(String(u||'')).then(()=>showToast('UID 已复制','success')).catch(()=>showToast('复制失败','error'));}
+
 function credCell(a){
   const isJwt=a.mode==='jwt';
-  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}</div>
+  const uid=a.uid?'<span class="uid-tag" onclick="copyUid(\''+esc(a.uid)+'\')" title="上游真实身份 ID（点击复制）：' + esc(a.uid) + '">' + esc(shortUid(a.uid)) + '</span>':'';
+  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}${uid}</div>
     <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>`;
 }
 

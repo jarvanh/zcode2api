@@ -78,6 +78,23 @@ class Account:
     def secret(self) -> str | None:
         return self.jwt_token if self.mode == "jwt" else self.api_key
 
+    def uid(self) -> str | None:
+        """账号的上游真实身份标识（用于区分同名 / 命名混乱的账号）。
+
+        - jwt：解 JWT payload 的 user_id（sub 兜底）
+        - apiKey：取 key 的点分前缀（key_id，上游按此识别调用方）
+
+        仅展示用，不参与任何鉴权与调度逻辑。
+        """
+        if self.mode == "jwt":
+            from .body_transform import jwt_user_id  # 局部导入：避免与调用方形成环
+
+            return jwt_user_id(self.jwt_token)
+        key = (self.api_key or "").strip()
+        if "." in key:
+            return key.split(".", 1)[0] or None
+        return None
+
     def risk_penalty(self, base: float, cap: float, ban_strikes: int,
                      decay_seconds: float) -> None:
         """命中风控（3012/405「unusual activity」）：指数退避冷却，累计
@@ -192,6 +209,7 @@ class Account:
         return {
             "id": self.id,
             "name": self.name,
+            "uid": self.uid(),
             "provider": self.provider,
             "mode": self.mode,
             "token_masked": masked,
