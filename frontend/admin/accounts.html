@@ -314,8 +314,11 @@ function copyUid(u){navigator.clipboard.writeText(String(u||'')).then(()=>showTo
 
 function credCell(a){
   const isJwt=a.mode==='jwt';
+  // 上游用户名：OAuth 授权瞬间抓取（按 uid 存 alias:{uid}）。存量账号补查不到
+  // （userinfo 只认授权瞬间的 access_token，池内 JWT 打过去 401），有值才显示。
+  const un=a.username?'<span class="uname-tag" title="上游用户名（OAuth 授权时抓取）">'+esc(a.username)+'</span>':'';
   const uid=a.uid?'<span class="uid-tag" onclick="copyUid(\''+esc(a.uid)+'\')" title="上游真实身份 ID（点击复制）：' + esc(a.uid) + '">' + esc(shortUid(a.uid)) + '</span>':'';
-  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}${uid}</div>
+  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}${un}${uid}</div>
     <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>`;
 }
 

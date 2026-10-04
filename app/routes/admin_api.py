@@ -37,10 +37,30 @@ async def verify():
 
 
 # ── 账号列表 + 概览统计 ──────────────────────────────────────────────────────
+def _username_for(account) -> str | None:
+    """账号对应的上游用户名（OAuth 授权瞬间抓取，按 uid 存 alias:{uid}）。
+
+    存量账号补查不到：userinfo 只认 poll 返回的 access_token（授权瞬间独有、
+    过期即弃），池内存量 JWT 打过去一律 401（2026-09-30 实测）——所以这里
+    只有 OAuth 入池的账号才可能有值，其余返回 None 属预期。
+
+    之前 alias 只写不读（入池存了却无人消费），故抓到了也不会显示；此处补上消费端。
+    """
+    uid = account.uid()
+    if not uid:
+        return None
+    alias = store.get_setting(f"alias:{uid}")
+    return str(alias) if alias else None
+
+
 @router.get("/accounts")
 async def list_accounts():
     now = time.time()
-    accounts = [a.public_view() for a in store.list_accounts()]
+    accounts = []
+    for a in store.list_accounts():
+        view = a.public_view()
+        view["username"] = _username_for(a)
+        accounts.append(view)
     stats = {"total": len(accounts), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
              "calls": 0, "fail": 0}
