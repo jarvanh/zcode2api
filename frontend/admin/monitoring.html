@@ -15,7 +15,7 @@
   <div class="page-hd">
     <div>
       <div class="page-title">请求监控</div>
-      <div class="page-sub">网关请求实时观测 · 内存环形日志（保留最近 500 条，重启清零）</div>
+      <div class="page-sub">网关请求观测 · 实时为内存环形日志（最近 500 条，重启清零）· 7 / 30 天取自磁盘历史（按天聚合，保留 30 天）</div>
     </div>
     <div class="page-actions">
       <span class="live-dot" id="live-dot">实时监控中</span>
@@ -23,7 +23,7 @@
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
         刷新
       </button>
-      <button onclick="doClear()" class="page-action-btn" id="btn-clear">
+      <button onclick="doClear()" class="page-action-btn" id="btn-clear" title="仅清空内存实时日志，磁盘历史保留">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
         清空
       </button>
@@ -55,7 +55,8 @@
     <div class="mon-tabs" id="mon-tabs">
       <button class="mon-tab" data-tab="account" onclick="setTab('account')">账号</button>
       <button class="mon-tab" data-tab="model" onclick="setTab('model')">模型</button>
-      <button class="mon-tab active" data-tab="live" onclick="setTab('live')">实时 <span class="mon-tab-count" id="live-count">0</span></button>
+      <button class="mon-tab" data-tab="daily" onclick="setTab('daily')">每日</button>
+      <button class="mon-tab active" data-tab="live" onclick="setTab('live')" id="tab-live">实时 <span class="mon-tab-count" id="live-count">0</span></button>
     </div>
     <div class="section-meta" id="last-updated"></div>
   </div>
@@ -67,10 +68,15 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let entries = [];
+let entries = [];      // 实时层：内存环形日志
+let hist = null;       // 历史层：/monitoring/history 聚合结果
 let tab = 'live';
 const state = { range: 'today', status: 'all', q: '', keep: 500 };
 let pollTimer = null;
+
+// 7 / 30 天走磁盘历史聚合；其余走内存实时日志
+const HIST_DAYS = { '7d': 7, '30d': 30 };
+const isHist = () => state.range in HIST_DAYS;
 
 const $ = id => document.getElementById(id);
 
@@ -216,48 +222,169 @@ function renderLive(){
   $('list').innerHTML=filtered().length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">所选时间范围内没有请求</div>`;
 }
 
+// ── 磁盘历史（7 / 30 天）视图 ────────────────────────────────────────────────
+function histRows(key){
+  if(!hist)return [];
+  const q=state.q.trim().toLowerCase();
+  return (hist[key]||[]).filter(r=>!q||String(r.name).toLowerCase().includes(q));
+}
+
+function renderHistStats(){
+  const t=hist.totals;
+  $('s-calls').textContent=t.calls;
+  $('s-calls-sub').textContent=`${hist.from} ~ ${hist.to} · 磁盘历史`;
+  $('s-rate').textContent=t.rate!=null?t.rate.toFixed(1)+'%':'—';
+  $('s-rate-sub').textContent=`成功 ${t.ok}`;
+  $('s-fail').textContent=t.fail;
+  $('s-fail-sub').textContent='';
+  $('s-tok').textContent=(t.in||t.out)?fmtTok(t.in+t.out):'—';
+  $('s-tok-sub').textContent='仅非流式与 OpenAI 流可统计';
+  $('s-in').textContent=fmtTok(t.in);
+  $('s-in-sub').textContent=`占比 ${t.in+t.out?Math.round(t.in/(t.in+t.out)*100):0}%`;
+  $('s-out').textContent=fmtTok(t.out);
+  $('s-out-sub').textContent=`占比 ${t.in+t.out?Math.round(t.out/(t.in+t.out)*100):0}%`;
+  $('s-ttfb').textContent=t.ttfb!=null?fmtSec(t.ttfb):'—';
+  $('s-ttfb-sub').textContent=t.ttfb_n?`样本 ${t.ttfb_n}`:'';
+  // 走势改为按天调用量（历史视图没有分钟级数据）
+  $('s-calls-spark').innerHTML=spark(hist.daily.map(d=>d.calls),'var(--amber)');
+  $('live-count').textContent='';
+}
+
+function renderHistAgg(key){
+  const rows=histRows(key==='account'?'accounts':'models');
+  const head=`<div class="mon-head mon-grid-hist"><span>${key==='account'?'账号':'模型'}</span><span>调用</span><span>成功</span><span>失败</span><span>成功率</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
+  const body=rows.map(g=>`
+    <div class="mon-row mon-grid-hist">
+      <span class="mon-name" title="${esc(g.name)}">${esc(g.name)}</span>
+      <span class="mon-num">${g.calls}</span>
+      <span class="mon-num">${g.ok}</span>
+      <span class="mon-num"${g.fail?' style="color:var(--red)"':''}>${g.fail}</span>
+      <span class="mon-num">${g.rate!=null?g.rate.toFixed(1)+'%':'—'}</span>
+      <span class="mon-num">${fmtTok(g.in)}</span>
+      <span class="mon-num">${fmtTok(g.out)}</span>
+      <span class="mon-num">${g.ttfb!=null?fmtSec(g.ttfb):'—'}</span>
+      <span class="mon-time">${fmtTs(g.last)}</span>
+    </div>`).join('');
+  $('list').innerHTML=rows.length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">${state.q?'没有匹配的账号 / 模型':'近 ' + hist.days + ' 天没有请求'}</div>`;
+}
+
+function errBlock(errors){
+  if(!errors||!errors.length)return '';
+  return `<div class="hist-err">
+    <div class="hist-err-hd">主要错误</div>
+    ${errors.map(e=>`<div class="hist-err-row"><span class="hist-err-msg" title="${esc(e.error)}">${esc(e.error)}</span><span class="mon-num">${e.count}</span></div>`).join('')}
+  </div>`;
+}
+
+function renderHistDaily(){
+  const daily=hist.daily||[];
+  const max=Math.max(...daily.map(d=>d.calls),1);
+  const chart=`<div class="hist-chart">${daily.map(d=>{
+    const h=Math.max(d.calls?Math.round(d.calls/max*76):2,2);
+    return `<div class="hist-col" title="${d.name} · 调用 ${d.calls} · 成功 ${d.ok} · 失败 ${d.fail}">
+      <div class="hist-bar-wrap"><i class="hist-bar" style="height:${h}px"></i></div>
+      <div class="hist-lbl">${d.name.slice(5)}</div>
+    </div>`;
+  }).join('')}</div>`;
+  const head=`<div class="mon-head mon-grid-hist"><span>日期</span><span>调用</span><span>成功</span><span>失败</span><span>成功率</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
+  const body=daily.map(d=>`
+    <div class="mon-row mon-grid-hist">
+      <span class="mon-name">${d.name}</span>
+      <span class="mon-num">${d.calls}</span>
+      <span class="mon-num">${d.ok}</span>
+      <span class="mon-num"${d.fail?' style="color:var(--red)"':''}>${d.fail}</span>
+      <span class="mon-num">${d.rate!=null?d.rate.toFixed(1)+'%':'—'}</span>
+      <span class="mon-num">${fmtTok(d.in)}</span>
+      <span class="mon-num">${fmtTok(d.out)}</span>
+      <span class="mon-num">${d.ttfb!=null?fmtSec(d.ttfb):'—'}</span>
+      <span class="mon-time">${fmtTs(d.last)}</span>
+    </div>`).join('');
+  $('list').innerHTML=`<div class="hist-daily">${chart}<div class="acct-table">${head}${body}</div>${errBlock(hist.errors)}</div>`;
+}
+
+function renderHist(){
+  renderHistStats();
+  if(tab==='daily')renderHistDaily();else renderHistAgg(tab);
+}
+
 function render(){
-  const list=filtered();
-  renderStats(list);
-  if(tab==='live')renderLive();else renderAgg(tab);
+  if(isHist()&&hist){renderHist();}
+  else{
+    const list=filtered();
+    renderStats(list);
+    if(tab==='live')renderLive();else renderAgg(tab);
+  }
   $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
 }
 
+// 历史视图没有在途概念：实时页签与状态筛选在该模式下不适用，直接隐藏/禁用
+function syncMode(){
+  const h=isHist();
+  $('tab-live').classList.toggle('is-disabled',h);
+  $('tab-live').title=h?'磁盘历史只存已收口请求（无在途），实时页签仅用于 1 小时 / 今天':'';
+  $('status-sel').style.display=h?'none':'';
+  $('btn-clear').style.display=h?'none':'';
+  $('live-dot').textContent=h?'历史聚合':'实时监控中';
+  if(h&&tab==='live')tab='account';
+}
+
 function renderChips(){
-  const defs=[['1h','1 小时'],['today','今天'],['all','全部']];
+  const defs=[['1h','1 小时'],['today','今天'],['7d','7 天'],['30d','30 天']];
   $('range-chips').innerHTML=defs.map(([v,label])=>
     `<button class="filter-chip${state.range===v?' active':''}" onclick="setRange('${v}')">${label}</button>`).join('');
 }
 
-function setRange(v){state.range=v;renderChips();render();}
-function setTab(t){tab=t;document.querySelectorAll('.mon-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));render();}
+function setRange(v){
+  state.range=v;
+  renderChips();
+  syncMode();
+  syncTabs();
+  load().catch(()=>showToast('加载失败','error'));
+}
+function syncTabs(){document.querySelectorAll('.mon-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
+function setTab(t){
+  if(isHist()&&t==='live')return;
+  tab=t;syncTabs();render();
+}
 function onSearch(v){state.q=v;render();}
 function onStatus(v){state.status=v;render();}
 
 async function load(){
-  const res=await api('GET','/monitoring');
-  entries=res.entries||[];
-  state.keep=res.keep||500;
+  if(isHist()){
+    hist=await api('GET',`/monitoring/history?days=${HIST_DAYS[state.range]}`);
+  }else{
+    const res=await api('GET','/monitoring');
+    entries=res.entries||[];
+    state.keep=res.keep||500;
+  }
   render();
 }
 function doRefresh(){load().catch(()=>showToast('加载失败','error'));}
 async function doClear(){
   try{
     await api('POST','/monitoring/clear');
-    showToast('已清空','success');
+    showToast('已清空实时日志（磁盘历史保留）','success');
     await load();
   }catch{
     showToast('清空失败','error');
   }
 }
 
+function startPoll(){
+  clearInterval(pollTimer);
+  // 历史聚合要读多个按天文件，无需 5 秒一轮
+  pollTimer=setInterval(()=>{if(!document.hidden)load().catch(()=>{});},isHist()?60000:5000);
+}
+
 (async()=>{
   const key=await adminKey.get();
   if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
   renderChips();
+  syncMode();
+  syncTabs();
   await renderAdminHeader();
   await load();
-  pollTimer=setInterval(()=>{if(!document.hidden)load().catch(()=>{});},5000);
+  startPoll();
 })();
 </script>
 </body>

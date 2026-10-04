@@ -663,6 +663,16 @@ async def monitoring():
     return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
 
 
+@router.get("/monitoring/history")
+async def monitoring_history(days: int = 7):
+    """磁盘请求历史聚合（近 days 天，默认 7）。
+
+    实时页的内存日志只有 500 条且重启清零，看不了趋势；这里按天读
+    data/reqlog-<日期>.jsonl 做聚合，仅回传统计而非明细（30 天可达数万条）。
+    """
+    return reqlog.history(days)
+
+
 @router.post("/monitoring/clear")
 async def monitoring_clear():
     reqlog.clear()
