@@ -26,6 +26,7 @@ import asyncio
 import base64
 import json
 import os
+import signal
 import time
 
 import httpx
@@ -44,6 +45,27 @@ class CaptchaSolveError(Exception):
 
     独立于 ClaimError 体系（验证码先于领域层使用），路由层按兜底回执处理。
     """
+
+
+def _kill_solver_tree(proc: asyncio.subprocess.Process) -> None:
+    """强杀 solver 及其整棵子进程树（真 Chromium）。
+
+    solver 用 start_new_session=True 起在独立进程组里，这里直接向整个组发
+    SIGKILL，确保 puppeteer 拉起的浏览器不会在父进程死后被 init/systemd
+    收养成永生孤儿。只杀 proc 本身会让 Chromium 遗留：孤儿累积到几十个即
+    可吃光内存与 swap（2026-10-05 实测 92 个 / 27.6GB），最终新请求连
+    Chromium 都起不动，Cloudflare 侧表现为 524。
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    # 进程组不可用（已退出/权限不足）时退化为杀单个进程
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def _stderr_tail(stderr: bytes | None, limit: int = 300) -> str | None:
@@ -499,14 +521,16 @@ class CaptchaManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,  # 本地保留 stderr 捕获（失败诊断用）
             env=solver_env,
+            # 独立进程组：solver 会拉起真 Chromium 子进程，超时强杀时必须
+            # 按组收割，否则只杀 node 会留下永生孤儿浏览器（2026-10-05 实测
+            # 累积 92 个、吃掉 27.6GB RSS，把内存和 swap 榨干后新请求连
+            # Chromium 都起不来，Cloudflare 侧表现为 524 超时）。
+            start_new_session=True,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
         except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_solver_tree(proc)
             self._last_solver_stderr = None  # 强杀拿不到 stderr
             return None
         except FileNotFoundError as err:
