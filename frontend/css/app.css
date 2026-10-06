@@ -139,6 +139,16 @@ select.input option{background:var(--panel);color:var(--ink)}
 .section-count-badge{min-width:20px;height:20px;padding:0 7px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;background:var(--panel);border:1px solid var(--hairline);color:var(--ink-mute);font-family:var(--mono);font-size:11px;font-weight:600}
 .section-meta{font-size:12px;color:var(--ink-mute)}
 
+/* Captcha route panel */
+.cap-panel{margin:0 0 22px;padding:16px 18px;border-radius:12px;background:var(--panel);border:1px solid var(--hairline-soft)}
+.cap-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}
+.cap-title{font-size:13px;font-weight:600;color:var(--ink)}
+.cap-sub{font-size:11px;color:var(--ink-mute);margin-top:3px;line-height:1.5}
+.cap-meta{font-size:12px;color:var(--ink-mute);font-family:var(--mono);white-space:nowrap}
+.cap-empty{font-size:12px;color:var(--ink-mute);padding:6px 0}
+.cap-panel .stat-grid{margin-bottom:0}
+.cap-panel .stat-cell{min-height:104px;gap:6px}
+
 /* Stat cards */
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
 .stat-cell{min-height:88px;padding:14px 16px;border-radius:12px;background:var(--panel);border:1px solid var(--hairline-soft);display:flex;flex-direction:column;gap:12px}

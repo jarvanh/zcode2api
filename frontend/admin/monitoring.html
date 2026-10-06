@@ -51,6 +51,17 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均首字</div><span class="stat-icon" style="color:var(--blue)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/></svg></span></div><div class="stat-num" id="s-ttfb" style="color:var(--blue)">—</div><div class="stat-sub" id="s-ttfb-sub"></div></div>
   </div>
 
+  <div class="cap-panel">
+    <div class="cap-hd">
+      <div>
+        <div class="cap-title">验证码路线</div>
+        <div class="cap-sub">按 solver 路线统计铸码成功率与耗时 · 近 7 天 · 取自 captchalog 磁盘台账（切换路线后分别记账）</div>
+      </div>
+      <div class="cap-meta" id="cap-meta"></div>
+    </div>
+    <div class="stat-grid" id="cap-grid"></div>
+  </div>
+
   <div class="section-head">
     <div class="mon-tabs" id="mon-tabs">
       <button class="mon-tab" data-tab="account" onclick="setTab('account')">账号</button>
@@ -359,6 +370,52 @@ async function load(){
   }
   render();
 }
+
+// ── 验证码路线卡片 ────────────────────────────────────────────────────────────
+let capLedger=null;
+let capTimer=null;
+const CAP_DAYS=7;
+
+function fmtMs(ms){
+  if(ms==null||isNaN(ms))return '—';
+  return ms>=1000?(ms/1000).toFixed(2)+'s':Math.round(ms)+'ms';
+}
+
+async function loadCaptcha(){
+  try{
+    capLedger=await api('GET',`/captcha/ledger?days=${CAP_DAYS}`);
+  }catch{
+    capLedger=null;   // 台账不可读不阻断主流程（无数据 / 旧版本后端）
+  }
+  renderCaptcha();
+}
+
+function renderCaptcha(){
+  const grid=$('cap-grid'), meta=$('cap-meta');
+  const routes=(capLedger&&capLedger.routes)||[];
+  if(!routes.length){
+    grid.innerHTML='<div class="cap-empty">暂无铸码记录</div>';
+    meta.textContent='';
+    return;
+  }
+  // 最近有产出的路线即当前生效路线
+  const liveTs=Math.max(...routes.map(r=>r.last_ts||0));
+  grid.innerHTML=routes.map(r=>{
+    const rate=r.success_rate||0;
+    const color=rate>=0.9?'var(--mint)':rate>=0.5?'var(--amber)':(r.attempts?'var(--red)':'var(--ink-mute)');
+    const isLive=r.last_ts&&r.last_ts===liveTs;
+    return `<div class="stat-cell">
+      <div class="stat-top">
+        <div class="stat-label" title="${esc(r.route)} · ${esc(r.runtime)}">${esc(r.route)}</div>
+        <span class="stat-icon" style="color:${color}"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span>
+      </div>
+      <div class="stat-num" style="color:${color}">${r.attempts?(rate*100).toFixed(1)+'%':'—'}</div>
+      <div class="stat-sub">成功 ${r.ok} / 尝试 ${r.attempts}${r.fail?` · <span style="color:var(--red)">失败 ${r.fail}</span>`:''}</div>
+      <div class="stat-sub">均耗时 ${fmtMs(r.avg_ms)} · ${esc(r.runtime)}${isLive?' · <span style="color:var(--mint)">当前</span>':''}</div>
+    </div>`;
+  }).join('');
+  meta.textContent=liveTs?`最近铸码 ${fmtTs(liveTs)}`:'';
+}
 function doRefresh(){load().catch(()=>showToast('加载失败','error'));}
 async function doClear(){
   try{
@@ -374,6 +431,9 @@ function startPoll(){
   clearInterval(pollTimer);
   // 历史聚合要读多个按天文件，无需 5 秒一轮
   pollTimer=setInterval(()=>{if(!document.hidden)load().catch(()=>{});},isHist()?60000:5000);
+  // 铸码台账同样读磁盘按天文件，独立 60 秒一轮
+  clearInterval(capTimer);
+  capTimer=setInterval(()=>{if(!document.hidden)loadCaptcha().catch(()=>{});},60000);
 }
 
 (async()=>{
@@ -384,6 +444,7 @@ function startPoll(){
   syncTabs();
   await renderAdminHeader();
   await load();
+  await loadCaptcha();
   startPoll();
 })();
 </script>
