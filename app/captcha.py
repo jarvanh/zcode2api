@@ -47,6 +47,56 @@ class CaptchaSolveError(Exception):
     """
 
 
+def _proc_children() -> dict[int, list[int]]:
+    """读 /proc 建立 ppid -> [pid] 映射（一次遍历，供进程树递归使用）。"""
+    tree: dict[int, list[int]] = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            # comm 字段可能含空格/括号，stat 末尾 "...) PPID ..." 才是可靠切分点
+            rp = data.rfind(b")")
+            if rp < 0:
+                continue
+            fields = data[rp + 2:].split()
+            if len(fields) < 2:
+                continue
+            try:
+                ppid = int(fields[1])
+            except ValueError:
+                continue
+            tree.setdefault(ppid, []).append(int(entry))
+    except OSError:
+        pass
+    return tree
+
+
+def _collect_descendants(root: int, tree: dict[int, list[int]]) -> list[int]:
+    """按 ppid 递归收集 root 的全部后代（深度优先）。
+
+    ⚠️ 关键：Chromium 启动时会自行 setsid()，脱离 solver 的进程组 ——
+    实测 solver pgid=732645 / chrome pgid=732741，两者不同组，因此
+    killpg(solver组) 根本打不到浏览器。但 chrome 的 ppid 仍是 solver，
+    按 /proc 遍历 ppid 树才能抓住它。这是 2026-10-06 孤儿泄漏的根因。
+    """
+    out: list[int] = []
+    stack = list(tree.get(root, []))
+    seen = {root}
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        stack.extend(tree.get(pid, []))
+    return out
+
+
 def _kill_solver_tree(proc: asyncio.subprocess.Process) -> None:
     """强杀 solver 及其整棵子进程树（真 Chromium）。
 
@@ -55,13 +105,39 @@ def _kill_solver_tree(proc: asyncio.subprocess.Process) -> None:
     收养成永生孤儿。只杀 proc 本身会让 Chromium 遗留：孤儿累积到几十个即
     可吃光内存与 swap（2026-10-05 实测 92 个 / 27.6GB），最终新请求连
     Chromium 都起不动，Cloudflare 侧表现为 524。
+
+    2026-10-06 强化：Chromium 自行 setsid() 逃出进程组，killpg 打不到它，
+    故先按 /proc 递归收割全部后代（含 setsid 的 chrome 与其 crashpad），
+    再 killpg / kill 兜底。三层递进，任一层失败都不影响下一层。
     """
+    root = proc.pid
+    victims: list[int] = []
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        return
+        victims = _collect_descendants(root, _proc_children())
+    except Exception:
+        victims = []
+
+    # 1) 优先收割浏览器等子进程：先 TERM 给它一次优雅退出的机会
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    # 2) 进程组收割（覆盖同组但未出现在 ppid 树里的进程）
+    try:
+        os.killpg(os.getpgid(root), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
-    # 进程组不可用（已退出/权限不足）时退化为杀单个进程
+
+    # 3) 兜底：对仍在的后代补 SIGKILL（setsid 逃逸者只能靠这一步）
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    # 4) 最后杀 solver 自身
     try:
         proc.kill()
     except (ProcessLookupError, OSError):
