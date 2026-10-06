@@ -63,7 +63,9 @@ CREATE TABLE claim_history (
 | `CLAIM_ENABLED` / `CLAIM_AUTO` | false / true | 领取开关 / 后台自动 |
 | `CLAIM_POLL_INTERVAL` / `CLAIM_COOLDOWN` | 300s / 600s | 领取轮询 / 失败退避 |
 | `ZAI_UPSTREAM_URL` / `ZAI_FALLBACK_URL` / `BIGMODEL_UPSTREAM_URL` | 官方端点 | 上游可覆写（测试注入用） |
-| `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_TIMEOUT` / `ZCODE_CAPTCHA_RETRIES` | node / 40s / 4 | 验证码求解 |
+| `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_TIMEOUT` / `ZCODE_CAPTCHA_RETRIES` | node / **240**s / 4 | 验证码求解（超时需容得下 Chromium 启动 + solver 进程内自旋重试） |
+| `ZCODE_CAPTCHA_SOLVER_JS` | 空 | 显式指定求解器脚本，**优先级最高**（如 `captcha_node/solver-bun.ts`） |
+| `ZCODE_CAPTCHA_SOLVER` | pw | 未显式指定时推导：`legacy` → `solver.js`，`pw` → `solver_pw.js` |
 
 ## 3. enc:v1 编解码（ZCode 客户端凭证格式，zsw zcrypto.rs）
 

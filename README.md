@@ -57,7 +57,8 @@ cp .env.example .env            # 按需修改密钥、端口等
   - 模型列表：`GET http://127.0.0.1:3000/v1/models`
   - 探活端点：`GET http://127.0.0.1:3000/meta`
 
-> 使用 Z.AI **JWT 模式**需要 Node.js 求解验证码，首次先执行：`cd captcha_node && npm install`。
+> 使用 Z.AI **JWT 模式**需要求解验证码：happy-dom 路线需 bun，真浏览器路线需
+> Node + 系统 Chromium。首次先执行：`cd captcha_node && npm install`。
 
 ## 快速上手一个账号
 
@@ -130,11 +131,22 @@ python cli.py import <file>          导入账号
 ## 无痕验证（免浏览器）
 
 JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Aliyun-Captcha-Verify-Param`）。
-本项目**不启动真实浏览器**，而是用 **Node + jsdom** 在模拟浏览器环境中运行阿里云官方无痕 SDK 直接求解该参数。
 
-- 求解器位于 `captcha_node/solver.js`，首次使用前执行 `cd captcha_node && npm install`。
-- `app/captcha.py` 以子进程方式调用，内置预热池、结果缓存（默认 45s）、并发去重与失败重试。
-- 求解器在 jsdom 中补齐了 SDK 依赖的浏览器 API（`matchMedia`、canvas/WebGL、`Worker`、`OffscreenCanvas`）。
+存在**两条求解路线**，由配置切换（详见环境变量表）：
+
+- **happy-dom 模拟（默认）**：`captcha_node/solver-bun.ts` + vendored `captcha-happy.ts`，
+  Bun 运行，**不启动真实浏览器**，纯 JS 模拟 DOM + 伪造指纹骗过风控。
+- **真浏览器**：`captcha_node/solver_pw.js`，Node + puppeteer-core 拉真 Chromium，
+  官方 SDK 在真环境里自行通过。较重（数百 MB / 枚），且需系统存在 Chromium。
+
+两条路线子进程协议一致（stdout 打印 `VERIFY_PARAM=…` + 退出码 0），故可互相切换：
+显式指定 `ZCODE_CAPTCHA_SOLVER_JS` 优先，否则按 `ZCODE_CAPTCHA_SOLVER` 推导，默认真浏览器。
+
+- `app/captcha.py` 以子进程方式调用，内置预热池（目标 1–2 枚、单枚 TTL 95s）、
+  池空竞速（3 路并行，死线 25s）、宽限补货（10s）、失败风暴检测与 certifyId 去重。
+- 铸码台账：`app/captcha_ledger.py` 按路线记录每次求解，落盘
+  `data/captchalog-<日期>.jsonl`（保留 30 天），供 `GET /admin/api/captcha/ledger`
+  统计各路线成功率与平均耗时。
 - 配置与会话缓存兜底：`client/configs` 拉取失败时回落内置默认参数。
 
 ## 鉴权
@@ -159,10 +171,12 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
 | `ZCODE_ACCOUNT_CONCURRENCY` | 2 | 单账号并发上限，0 不限（运行时可在后台设置改，以库为准）|
 | `ZCODE_CLAIM_ROUND_INTERVAL` | 600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
-| `ZCODE_NODE_PATH` | node | 验证码求解所用 Node 可执行文件 |
+| `ZCODE_NODE_PATH` | node | 求解器可执行文件（bun 或 node） |
+| `ZCODE_CAPTCHA_SOLVER_JS` | 空 | 显式指定求解器脚本（相对路径按项目根解析）；**优先级最高**，如 `captcha_node/solver-bun.ts` |
+| `ZCODE_CAPTCHA_SOLVER` | pw | 未显式指定时的推导：`legacy` → `solver.js`，`pw` → `solver_pw.js` |
 | `ZCODE_CAPTCHA_RETRIES` | 4 | 单次求解失败重试次数 |
-| `ZCODE_CAPTCHA_TIMEOUT` | 40 | 单次求解超时（秒）|
-| `CAPTCHA_CACHE_TTL` | 45000 | 验证码结果缓存时长（ms）|
+| `ZCODE_CAPTCHA_TIMEOUT` | 240 | 单次求解超时（秒，需容得下 Chromium 启动 + 进程内自旋重试） |
+| `ZCODE_CHROMIUM_PATH` | /usr/local/bin/chromium | 真浏览器路线用的 Chromium（不存在时 solver 内部按常见路径探测） |
 | `ZAI_UPSTREAM_URL` / `ZAI_FALLBACK_URL` / `BIGMODEL_UPSTREAM_URL` | — | 上游端点覆盖 |
 
 ## 开发与测试

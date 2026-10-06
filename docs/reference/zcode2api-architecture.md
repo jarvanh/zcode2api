@@ -97,7 +97,7 @@ graph TD
 | Request Builder | `app/agent.py` | 按凭证选上游端点、组装请求头(含 `X-Aliyun-Captcha-Verify-Param`) |
 | Quota Monitor | `app/quota.py` | 单账号额度查询 + 状态判定 + 后台周期刷新任务 |
 | Captcha Manager | `app/captcha.py` | 预解 token 池(空池竞速/宽限窗口/certifyId 去重)、拉取验证码配置、调用求解器 |
-| Captcha Solver | `captcha_node/captcha-happy.ts` + `solver-bun.ts` | vendored 上游(jarvanh/zcode-api 4.7.1)happy-dom 求解器,Bun 主路径,输出 `verifyParam`;回退 `captcha_node/solver.js`(Node 移植版) |
+| Captcha Solver | `captcha_node/captcha-happy.ts` + `solver-bun.ts` | vendored 上游(jarvanh/zcode-api 4.7.1)happy-dom 求解器,Bun 主路径,输出 `verifyParam`;真浏览器回退 `captcha_node/solver_pw.js`(puppeteer-core + Chromium);历史 Node 移植版 `solver.js` 仅 `ZCODE_CAPTCHA_SOLVER=legacy` 时启用 |
 | OAuth Flow | `app/oauth.py` | Z.AI OAuth:init → poll → 兑换 API Key |
 | Settings | `app/settings.py` | 环境变量 / 默认值 / 路径 / 上游端点 |
 | Logs | `app/logs.py` | 彩色终端日志(banner / req / req_ok / req_err …) |
@@ -276,8 +276,16 @@ sequenceDiagram
   **原文件**（vendor,非移植）。历史上 Node 移植版 `solver.js` 因未跟上上游修复，
   在轮换后的 pe 字节码上失速率 >70%（表现为连环 500「多次重试无结果」）;
   直接 vendor 同一份代码即从结构上消除漂移。上游有更新时重新 vendor 即可。
-- **运行时**:`settings.py` 探测到 bun 即走 `bun solver-bun.ts`,否则回退
-  `node solver.js`。可用 `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_SOLVER_JS` 覆盖。
+- **运行时与路线切换**:优先级 `ZCODE_CAPTCHA_SOLVER_JS`(显式指定脚本,相对路径按
+  项目根解析) > `ZCODE_CAPTCHA_SOLVER`(`legacy`→`solver.js`,`pw`→`solver_pw.js`)
+  > 默认 `pw`。显式变量留空即回落。当前线上为
+  `ZCODE_CAPTCHA_SOLVER_JS=captcha_node/solver-bun.ts` + `ZCODE_NODE_PATH=bun`。
+  ⚠️ 2026-10-06 前 `ZCODE_CAPTCHA_SOLVER_JS` 只写在 `.env` 而 `settings.py` 从未读取,
+  导致上游架构落盘即空转;`14371e5` 起改为显式优先,链路才真正接通。
+- **铸码台账**(`app/captcha_ledger.py`):每次 `_run_solver` 子进程尝试落一条
+  `data/captchalog-<北京日期>.jsonl`(保留 30 天),字段 `ts/route/runtime/ok/
+  attempt/dur_ms/region/err`;`GET /admin/api/captcha/ledger?days=N` 按
+  (route, runtime) 聚合成功率与均耗时 —— 多路线并存时用数据决定用哪条。
 - **预解池**(对齐上游 `captcha-pool.ts`):后台补库存至 `CAPTCHA_POOL_MIN`;
   热路径从池直取(亚毫秒)。池空时**竞速** `CAPTCHA_EMPTY_TAKE_RACE`(默认 3)路
   并行求解,首胜即回、败者入库,总死线 `CAPTCHA_RACE_DEADLINE`(25s);
@@ -332,7 +340,8 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 
 所有可调参数集中在 `app/settings.py`,均可由环境变量覆盖(见 `README.md` 的环境变量表)。
 要点:`ZCODE_PORT`、`ZCODE_DATA_DIR`、`ZCODE_QUOTA_REFRESH_INTERVAL`、`ZCODE_COOLING_SECONDS`、
-`ZCODE_NODE_PATH`、`ZCODE_CAPTCHA_TIMEOUT`、`ZCODE_CAPTCHA_RETRIES`、`CAPTCHA_CACHE_TTL`。
+`ZCODE_NODE_PATH`、`ZCODE_CAPTCHA_SOLVER_JS`、`ZCODE_CAPTCHA_SOLVER`、`ZCODE_CAPTCHA_TIMEOUT`、
+`ZCODE_CAPTCHA_RETRIES`（注:`CAPTCHA_CACHE_TTL` 已不存在,现由 token TTL + 预解池管理）。
 
 ---
 

@@ -89,7 +89,7 @@ stdout_logfile=/personal/zcode-hub/logs/out.log
 | 症状 | 排查 |
 |------|------|
 | 全部请求 503 no_available_account | `GET /admin/api/pool` 看状态分布；`billing` 端点 401 多为 JWT 过期（需重登）而非无额度 |
-| 验证码连续失败 | 确认 `captcha_node/node_modules` 已装且已安装 bun（`~/.bun/bin/bun`，无 bun 自动回退 node solver.js）；`ZCODE_CAPTCHA_TIMEOUT` 调大；pe 字节码失速时看日志 stderr 末段诊断（solver stderr 已捕获） |
+| 验证码连续失败 | 先查 `GET /admin/api/captcha/ledger?days=7` 按路线看成功率与均耗时，定位是哪条路线在塌；再确认 `captcha_node/node_modules` 已装、bun 在 `~/.bun/bin/bun`；`ZCODE_CAPTCHA_TIMEOUT` 调大；pe 字节码失速时看日志 stderr 末段诊断（solver stderr 已捕获） |
 | 额度一直是 0 / 401 | WAF 拦截：检查是否带全套身仿真头；错峰参数是否被调成 0 |
 | 领取一直 ineligible | `identity.appVersion` 低于活动要求，升级配置值 |
 | .zsb 导入解密失败 | 口令错误（错口令即失败无提示，是设计行为）；确认 KDF 迭代未被改 |
