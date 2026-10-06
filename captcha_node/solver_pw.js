@@ -155,6 +155,13 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     defaultViewport: { width: 1280, height: 720 },
     protocolTimeout: 60_000,
     timeout: 90_000,
+    // CDP 走 --remote-debugging-pipe（fd 3/4）而非 --remote-debugging-port。
+    // 端口模式下 CDP 断连不等于 Chrome 退出（设计上允许多 client，断一个不自杀），
+    // 且 Chrome 启动时自行 setsid()，不在 solver 进程组内 —— 于是父进程被
+    // killpg 强杀后浏览器被 systemd 收养成永生孤儿（2026-10-06 实测累积 33 个 /
+    // PSS 4.4GB，上一次的 killpg 修复对此无效）。pipe 模式下写端随 node 一起
+    // 关闭，Chrome 检测到管道断裂即自行退出，从根上杜绝孤儿。
+    pipe: true,
   });
   const stopWatchdog = oomWatchdog(browser.process() ? browser.process().pid : process.pid);
   try {
