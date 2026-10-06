@@ -92,14 +92,22 @@ CAPTCHA_STORM_DEDUPE = _int("CAPTCHA_STORM_DEDUPE", 720)     # 12 分钟去重
 CAPTCHA_IDLE_AFTER = _int("CAPTCHA_IDLE_AFTER", 600)
 
 # 验证码求解（真浏览器：puppeteer-core + 系统 Chromium 跑阿里云官方无痕 SDK，
-# 对齐 zcode-switch captcha.js。happy-dom 路线 2026-09 起被风控「unusual
-# activity」全拒，solver.js 仅留作回滚：ZCODE_CAPTCHA_SOLVER=legacy）
+# 对齐 zcode-switch captcha.js）。happy-dom 路线（solver.js / solver-bun.ts）
+# 2026-09 起曾被风控「unusual activity」全拒，故默认仍走 pw 路线；
+# ZCODE_CAPTCHA_SOLVER=legacy 回退 solver.js。
+#
+# ZCODE_CAPTCHA_SOLVER_JS 可显式指定求解器脚本（相对路径按项目根解析），
+# 优先于 mode 推导的默认值 —— 上游 Bun + happy-dom 架构（solver-bun.ts）
+# 由此接入；留空则回落 mode 默认值。
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
 CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "pw").strip().lower() or "pw")
-CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
-    "solver.js" if CAPTCHA_SOLVER_MODE == "legacy" else "solver_pw.js"
-)
+if (os.getenv("ZCODE_CAPTCHA_SOLVER_JS") or "").strip():
+    CAPTCHA_SOLVER_JS = _resolve_path("ZCODE_CAPTCHA_SOLVER_JS", "")
+else:
+    CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
+        "solver.js" if CAPTCHA_SOLVER_MODE == "legacy" else "solver_pw.js"
+    )
 # Chromium 可执行文件（solver_pw.js 用；env 可覆盖，缺省按常见路径探测）
 CHROMIUM_PATH = os.getenv("ZCODE_CHROMIUM_PATH", "/usr/local/bin/chromium")
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
