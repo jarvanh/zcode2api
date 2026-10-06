@@ -8,7 +8,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import logs, reqlog
+from .. import captcha_ledger, logs, reqlog
 from ..auth_admin import verify_admin_key
 from ..captcha import CaptchaSolveError
 from ..claim import (
@@ -686,3 +686,20 @@ async def monitoring_history(days: int = 7):
 async def monitoring_clear():
     reqlog.clear()
     return {"ok": True}
+
+
+# ── 验证码台账 ─────────────────────────────────────────────────────────────────
+@router.get("/captcha/ledger")
+async def captcha_ledger_history(days: int = 7):
+    """按 solver 路线聚合铸码成功率（近 days 天，默认 7）。
+
+    多路线并存（happy-dom / 真浏览器）时用数据回答「该用哪条」，
+    而不是靠注释里的风控回忆。
+    """
+    return captcha_ledger.history(days)
+
+
+@router.get("/captcha/ledger/recent")
+async def captcha_ledger_recent():
+    """内存近期铸码明细（重启清零，按时间序）。"""
+    return {"entries": captcha_ledger.snapshot(), "keep": captcha_ledger.KEEP}

@@ -31,7 +31,7 @@ import time
 
 import httpx
 
-from . import constants, logs, settings
+from . import captcha_ledger, constants, logs, settings
 from .store import store
 
 # 池参数：真浏览器求解重（10–40s/枚），默认 min1/max2 见 settings 注释
@@ -580,7 +580,10 @@ class CaptchaManager:
 
     async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:
         solver = settings.CAPTCHA_SOLVER_JS
+        runtime = os.path.basename(str(settings.NODE_PATH))
         if not solver.exists():
+            captcha_ledger.record(route=solver.name, runtime=runtime, ok=False,
+                                  dur_ms=0, region=region, err=f"求解器缺失: {solver.name}")
             raise RuntimeError(
                 f"未找到求解器 {solver}，请先在 captcha_node 下执行 npm install"
             )
@@ -591,6 +594,7 @@ class CaptchaManager:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)
+        t0 = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             settings.NODE_PATH, str(solver), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
@@ -608,8 +612,14 @@ class CaptchaManager:
         except TimeoutError:
             _kill_solver_tree(proc)
             self._last_solver_stderr = None  # 强杀拿不到 stderr
+            captcha_ledger.record(route=solver.name, runtime=runtime, ok=False,
+                                  dur_ms=int((time.monotonic() - t0) * 1000), region=region,
+                                  err=f"超时强杀（>{settings.CAPTCHA_SOLVE_TIMEOUT}s）")
             return None
         except FileNotFoundError as err:
+            captcha_ledger.record(route=solver.name, runtime=runtime, ok=False,
+                                  dur_ms=int((time.monotonic() - t0) * 1000), region=region,
+                                  err=f"无法启动 Node: {err}")
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
 
         # 失败诊断：solver 把根因（pe 失速/guest 错误摘要）写 stderr，保留末段
@@ -618,6 +628,12 @@ class CaptchaManager:
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 param = line[len("VERIFY_PARAM="):].strip()
+        # 铸码台账：一次 solver 子进程尝试一条（含重试与竞速败者），按路线可统计成功率
+        captcha_ledger.record(
+            route=solver.name, runtime=runtime, ok=bool(param),
+            dur_ms=int((time.monotonic() - t0) * 1000), region=region,
+            err=None if param else (self._last_solver_stderr or "求解器无输出"),
+        )
         return param
 
     # ── 失效 ─────────────────────────────────────────────────────────────────
