@@ -232,6 +232,11 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "risk_biz_3012":
+            # HTTP 200 内嵌业务码 3012 的风控形态（与 405 形态同因不同载体）。
+            # 原实现在此路径误调不存在的 Account.ban_for_risk → AttributeError 500
+            # 且账号不冷却；此场景钉住指数退避冷却与换号回归（2026-10-07 审查修复）。
+            return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
         if scenario == "not_found":

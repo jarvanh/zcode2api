@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import os
 import time
 
 from fastapi import Header, HTTPException, Query, Request, status
@@ -11,8 +12,17 @@ from .store import store
 
 ADMIN_FAIL_LIMIT = 8
 ADMIN_LOCK_SECONDS = 300
+# 失败记录容量上限：每伪造 IP 一条记录的字典不能无界增长
+#（对公网暴露的实例，攻击者可用海量假 IP 撑爆内存）
+_MAX_FAIL_TRACKED = 4096
 
-# ip -> {count, locked_until}
+# 是否信任反代注入的客户端 IP 头（cf-connecting-ip / x-real-ip）。
+# 部署在 CF/Nginx 反代之后时必须开启（否则所有请求共享代理 IP，一个 IP
+# 锁定全站）；无反代直连暴露时置 False —— 直连场景该头可被客户端伪造，
+# 每伪造一个 IP 即获得一个全新的失败计数桶，等效绕过登录锁定。
+TRUST_PROXY_IP = os.getenv("ZCODE_TRUST_PROXY_IP", "1").strip().lower() not in ("0", "false", "no")
+
+# ip -> {count, locked_until, last}
 _failures: dict[str, dict] = {}
 
 
@@ -22,13 +32,33 @@ def reset_failures() -> None:
 
 
 def _client_ip(request: Request) -> str:
-    for header in ("cf-connecting-ip", "x-real-ip"):
-        val = (request.headers.get(header) or "").strip()
-        if val:
-            return val.split(",")[0].strip()
+    if TRUST_PROXY_IP:
+        for header in ("cf-connecting-ip", "x-real-ip"):
+            val = (request.headers.get(header) or "").strip()
+            if val:
+                return val.split(",")[0].strip()
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
+
+
+def _gc_failures(now: float) -> None:
+    """清理过期失败记录，防无界增长。
+
+    锁定窗口已过且超过一个锁定周期未再失败的记录直接淘汰；仍超容量
+    时按 last 淘汰最旧的一半（锁定中的记录保留，避免 GC 放走爆破者）。
+    """
+    stale = [
+        ip for ip, rec in _failures.items()
+        if float(rec.get("locked_until") or 0) < now
+        and now - float(rec.get("last") or 0) > ADMIN_LOCK_SECONDS
+    ]
+    for ip in stale:
+        _failures.pop(ip, None)
+    if len(_failures) > _MAX_FAIL_TRACKED:
+        ordered = sorted(_failures.items(), key=lambda kv: float(kv[1].get("last") or 0))
+        for ip, _ in ordered[: len(ordered) // 2]:
+            _failures.pop(ip, None)
 
 
 def _is_locked(ip: str) -> bool:
@@ -52,13 +82,16 @@ def _record_failure(ip: str, probed: bool = False) -> None:
     300 秒，锁定期内正确密码也被拒（2026-09-29 连续两次实际锁死）。
     探测只计数不锁：锁只保留给真正的登录提交。
     """
-    rec = _failures.setdefault(ip, {"count": 0, "locked_until": 0.0})
+    now = time.time()
+    _gc_failures(now)
+    rec = _failures.setdefault(ip, {"count": 0, "locked_until": 0.0, "last": now})
+    rec["last"] = now
     if probed:
         rec["count"] = int(rec.get("count") or 0) + 1
         return
     rec["count"] = int(rec.get("count") or 0) + 1
     if rec["count"] >= ADMIN_FAIL_LIMIT:
-        rec["locked_until"] = time.time() + ADMIN_LOCK_SECONDS
+        rec["locked_until"] = now + ADMIN_LOCK_SECONDS
 
 
 def _extract_bearer(authorization: str | None) -> str | None:

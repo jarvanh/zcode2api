@@ -163,7 +163,7 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 |------|--------|------|
 | `ZCODE_PORT` | 3000 | 服务端口 |
 | `ZCODE_HOST` | 0.0.0.0 | 监听地址 |
-| `ZCODE_ADMIN_KEY` | change-me | 后台密码初始值（之后写库，以库为准）|
+| `ZCODE_ADMIN_KEY` | zcode | 后台密码初始值（之后写库，以库为准；部署后立即在后台改掉）|
 | `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空不校验（生产务必设置）|
 | `ZCODE_BIGMODEL_CHANNEL` | 0 | bigmodel Key 回退通道（`bigmodel/` 前缀 / `x-provider: bigmodel` 头）；默认关闭，`1` 开启（后台「设置」可改，以库为准）|
 | `ZCODE_DATA_DIR` | data | 数据目录（SQLite 存放处）|

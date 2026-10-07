@@ -26,7 +26,8 @@ def _enc(plain: str) -> str:
     key = hashlib.sha256(SECRET.encode()).digest()
     iv = b"0123456789abcdef"
     ct = AESGCM(key).encrypt(iv, plain.encode(), None)
-    b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
     return f"enc:v1:{b64(iv)}.{b64(ct[-16:])}.{b64(ct[:-16])}"
 
 
@@ -146,7 +147,8 @@ def test_meta_alias_seeds(tmp_path):
         ("alias:84041790658495247", ""),              # 空值不收
         ("gateway_key", "sk-x"),
     ])
-    con.commit(); con.close()
+    con.commit()
+    con.close()
     assert cs.meta_alias_seeds(db) == {
         "4321790740758411": "176gg",
         "51681787803732714": "131",

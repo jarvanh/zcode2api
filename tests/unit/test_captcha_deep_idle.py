@@ -145,7 +145,8 @@ class TestRaceLateArrival:
 
         async def fast_solve(config):
             counter["n"] += 1
-            import base64, json as _json
+            import base64
+            import json as _json
 
             cid = f"cid-{counter['n']}"
             return _token(base64.b64encode(_json.dumps({"certifyId": cid}).encode()).decode())

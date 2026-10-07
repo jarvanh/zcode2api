@@ -16,6 +16,7 @@ from .models import Account
 _DROP_HEADERS = {
     "host",
     "content-length",
+    "content-type",
     "x-api-key",
     "authorization",
     "user-agent",
@@ -29,6 +30,10 @@ _DROP_HEADERS = {
     "connection",
     "true-client-ip",
     "x-original-forwarded-for",
+    # 协议头固定由本服务生成（application/json / anthropic-version），
+    # 客户端自定义值（如 multipart boundary、异常版本号）会破坏上游请求形状
+    "anthropic-version",
+    "anthropic-beta",
     # 身份/追踪头由本服务仿真生成，禁止客户端透传覆盖（指纹一致性）
     "x-device-mid",
     "x-request-id",

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .. import captcha_ledger, logs, reqlog
 from ..auth_admin import verify_admin_key
+from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
 from ..claim import (
     AUTH_EXPIRED_MESSAGE,
@@ -22,7 +23,6 @@ from ..claim import (
 )
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
-from ..body_transform import jwt_user_id
 from ..oauth import ZaiAuthFlow, parse_userinfo
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store

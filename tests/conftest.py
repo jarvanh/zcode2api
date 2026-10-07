@@ -108,6 +108,10 @@ class _StubCaptcha:
     def invalidate(self) -> None:
         self.invalidated += 1
 
+    async def fetch_config(self) -> dict:
+        """与 Mock 上游 /api/v1/client/configs 返回的 captcha 配置同形。"""
+        return {"region": "cn", "enabled": True}
+
 
 @pytest.fixture
 def stub_captcha() -> _StubCaptcha:
@@ -135,9 +139,19 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     # OAuth userinfo（用户名抓取）也指向 Mock —— 该调用在 poll ready 前同步执行，
     # 打真网会把 ready 响应拖过测试死线（2026-10-03 实测 0.8s > 0.4s）
     monkeypatch.setattr(constants, "OAUTH_USERINFO_URL", f"{base}/api/oauth/userinfo")
+    # client/configs 双消费方收口到 Mock：install._fetch_client_configs 与
+    # captcha.fetch_config 都直读 constants.CLIENT_CONFIGS_URL（不走 settings），
+    # 不补此 patch 时入池安装序/验证码配置会打真实 zcode.z.ai —— 后台任务
+    # 在 fixture teardown undo 后才跑到 IO，在受限网络下把 event loop 的
+    # _cancel_all_tasks 挂死（2026-10-07 审查实证，test_oauth_login 第 8 用例起）。
+    monkeypatch.setattr(constants, "CLIENT_CONFIGS_URL", f"{base}/api/v1/client/configs")
 
     from app.routes import gateway as gateway_module
     monkeypatch.setattr(gateway_module, "captcha_manager", stub_captcha)
+    # claim.py 是 from-import 绑定（不同于 gateway 的模块属性引用），单独换绑：
+    # 否则 auto_claim 后台任务用真实单例起 solver 子进程/打真网，同样挂死 teardown。
+    from app import claim as claim_module
+    monkeypatch.setattr(claim_module, "captcha_manager", stub_captcha)
 
     from app.main import create_app
     gateway = create_app()

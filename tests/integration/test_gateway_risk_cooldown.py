@@ -160,6 +160,51 @@ class TestRiskControlBan:
         assert after.is_selectable() is False
         assert fresh_app.select("zai") is None
 
+    async def test_biz_3012_cools_account_and_switches(self, gateway_client, fresh_app):
+        """HTTP 200 内嵌业务码 3012：账号指数退避冷却，请求换下一号成功。
+
+        原实现此路径误调不存在的 Account.ban_for_risk → AttributeError 500、
+        账号不冷却不换号（2026-10-07 审查实锤）；修复后与 405 形态同处置。
+        """
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        risky = seed_account(fresh_app, _RISK_JWT, name="a-biz-risk")
+        good = seed_account(fresh_app, _GOOD_JWT, name="a-biz-good")
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_biz_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200  # 由 good 账号接住
+        assert res.json()["content"][0]["text"] == "Hello from mock upstream"
+
+        after = fresh_app.find("zai", risky.id)
+        assert after.status == Status.COOLING  # 不是 500，也不是跳过冷却
+        assert after.risk_strikes == 1
+        assert after.is_selectable() is False
+        assert after.last_error is not None and "业务码 3012" in after.last_error
+        good_after = fresh_app.find("zai", good.id)
+        assert good_after.status == Status.ACTIVE
+
+    async def test_biz_3012_falls_back_to_apikey_same_request(self, gateway_client, fresh_app):
+        """HTTP 200 内嵌业务码 3012：同请求切 API Key 回退，不 503（与 405 同形）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-biz-risk-fb")
+        acc.api_key = "sk-biz-risk-fallback"
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_biz_3012"]
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.COOLING
+        assert after.risk_strikes == 1
+        paths = [c[1] for c in mock.state.calls[before:] if c[1].endswith("/messages")]
+        assert "/api/v1/zcode-plan/anthropic/v1/messages" in paths
+        assert "/api/anthropic/v1/messages" in paths
+
     async def test_pure_apikey_401_marked_invalid(self, gateway_client, fresh_app):
         """纯 API Key 401 应标 INVALID，避免死 Key 永远轮询。"""
         client, mock = gateway_client

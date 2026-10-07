@@ -52,10 +52,35 @@ def is_probe_request(headers) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes"}
 
 
+# 用量明细保留天数：与 reqlog 的 HISTORY_DAYS 同语义，按天文件整体删除。
+# 不清理时高流量实例 data/ 目录以 ~每天一个文件无限增长（2026-10-07 审查发现）。
+USAGE_HISTORY_DAYS = 30
+_usage_prune_day = ""
+
+
+def _usage_maybe_prune(data_dir: str) -> None:
+    """跨天首写时清理过期 usage-*.jsonl（与 reqlog._maybe_prune 同范式）。"""
+    global _usage_prune_day
+    today = datetime.now(_BJ).strftime("%Y-%m-%d")
+    if _usage_prune_day == today:
+        return
+    _usage_prune_day = today
+    cutoff = (datetime.now(_BJ) - timedelta(days=USAGE_HISTORY_DAYS)).strftime("%Y-%m-%d")
+    try:
+        for name in os.listdir(data_dir):
+            if not (name.startswith("usage-") and name.endswith(".jsonl")):
+                continue
+            day = name[6:-6]
+            if len(day) == 10 and day < cutoff:
+                os.remove(os.path.join(data_dir, name))
+    except OSError:
+        pass  # 清理失败不影响记账
+
+
 def record_usage(model: str, tin=None, tout=None, credit=None) -> None:
     """落盘单条用量明细（best-effort：失败只记日志，绝不影响主流程）。
 
-    文件：data/usage-<北京日期>.jsonl
+    文件：data/usage-<北京日期>.jsonl（保留 USAGE_HISTORY_DAYS 天）
     """
     try:
         day = datetime.now(_BJ).strftime("%Y-%m-%d")
@@ -70,6 +95,7 @@ def record_usage(model: str, tin=None, tout=None, credit=None) -> None:
         }
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
         with _usage_lock:
+            _usage_maybe_prune(settings.DATA_DIR)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as err:  # noqa: BLE001 - 记账失败不能影响调度
@@ -261,6 +287,51 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     if status_value == Status.COOLING:
         account.cooling_until = time.time() + settings.COOLING_SECONDS
     store.update_account(account)
+
+
+def _apply_risk_strike(account: Account, signal: str, req_id: str) -> str:
+    """风控打击落地（405/3012 与 HTTP 200 内嵌业务码 3012 共用）。
+
+    指数退避冷却自动恢复，累计 RISK_BAN_STRIKES 次升级禁用（人工恢复）；
+    升级禁用且 RISK_AUTO_ROTATE 开启时自动换发全新设备指纹并补跑安装序。
+    返回 penalty_note 供调用方日志。
+    """
+    account.risk_penalty(
+        settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
+        settings.RISK_BAN_STRIKES, settings.RISK_STRIKE_DECAY_SECONDS,
+    )
+    if account.status == Status.DISABLED:
+        account.last_error = (
+            f"风控封禁 ({signal})，确认恢复后请在后台手动启用"
+            f"（第 {account.risk_strikes} 次）"
+        )
+        note = f"已升级禁用（第 {account.risk_strikes} 次）"
+        if settings.RISK_AUTO_ROTATE:
+            # 「风控后换设备重生」自动化：升级禁用即换发全新设备
+            # （新 SKU + 新 device_mid），后台补跑安装序；账号重新
+            # 启用时已是全新身份（billing/claim 头同源跟随档案）
+            from ..fingerprint import profile_for, rotate
+            from ..install import schedule_install
+
+            old_mid = profile_for(account).device_mid[:8]
+            rotate(account)
+            account.installed_at = None
+            schedule_install(account)
+            logs.warn(
+                req_id,
+                f"账号 {account.name} 风控禁用，已自动换发设备指纹"
+                f"（旧 mid {old_mid}）",
+            )
+    else:
+        cool_until = time.strftime(
+            "%H:%M", time.localtime(account.cooling_until)
+        ) if account.cooling_until else "?"
+        account.last_error = (
+            f"命中风控 ({signal})，指数退避冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+        )
+        note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+    store.update_account(account)
+    return note
 
 
 def _last_user_text(body: dict) -> str:
@@ -561,7 +632,7 @@ async def _early_flush_anthropic_stream(task: asyncio.Task, req_id: str):
             return
         logs.req_ok(req_id)
         reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
-        record_usage(getattr(up, "model", "-"))
+        record_usage(up.model)
         yield f"data: {text}\n\n"
         return
     try:
@@ -569,7 +640,7 @@ async def _early_flush_anthropic_stream(task: asyncio.Task, req_id: str):
             yield chunk
         logs.req_ok(req_id)
         reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
-        record_usage(getattr(up, "model", "-"))
+        record_usage(up.model)
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
         raise
@@ -1137,17 +1208,18 @@ def _upstream_biz_error(text: str) -> tuple[int, str, str] | None:
 class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
-    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed")
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "model", "on_close", "_closed")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 on_close=None) -> None:
+                 model: str = "-", on_close=None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
         self.t_first = t_first
         self.account_name = account_name
         self.mode = mode
+        self.model = model
         self.on_close = on_close
         self._closed = False
 
@@ -1175,7 +1247,7 @@ class _Upstream:
                 logs.req_ok(req_id)
                 reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
                 # 直通路径无 usage 明细，仅记录模型与探测标记
-                record_usage(getattr(up, "model", "-"))
+                record_usage(up.model)
             except asyncio.CancelledError:
                 reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
                 raise
@@ -1279,42 +1351,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             # 账号持续施压）；冷却期零上游流量（is_cooling 全通道门禁）。
             if _is_risk_control(status_code, text):
                 account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
-                account.risk_penalty(
-                    settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
-                    settings.RISK_BAN_STRIKES, settings.RISK_STRIKE_DECAY_SECONDS,
+                penalty_note = _apply_risk_strike(
+                    account, f"3012/unusual activity HTTP {status_code}", req_id,
                 )
-                if account.status == Status.DISABLED:
-                    account.last_error = (
-                        f"风控封禁 (3012/unusual activity) HTTP {status_code}，"
-                        f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
-                    )
-                    penalty_note = f"已升级禁用（第 {account.risk_strikes} 次）"
-                    if settings.RISK_AUTO_ROTATE:
-                        # 「风控后换设备重生」自动化：升级禁用即换发全新设备
-                        # （新 SKU + 新 device_mid），后台补跑安装序；账号重新
-                        # 启用时已是全新身份（billing/claim 头同源跟随档案）
-                        from ..fingerprint import profile_for, rotate
-                        from ..install import schedule_install
-
-                        old_mid = profile_for(account).device_mid[:8]
-                        rotate(account)
-                        account.installed_at = None
-                        schedule_install(account)
-                        logs.warn(
-                            req_id,
-                            f"账号 {account.name} 风控禁用，已自动换发设备指纹"
-                            f"（旧 mid {old_mid}）",
-                        )
-                else:
-                    cool_until = time.strftime(
-                        "%H:%M", time.localtime(account.cooling_until)
-                    ) if account.cooling_until else "?"
-                    account.last_error = (
-                        f"命中风控 (3012/unusual activity) HTTP {status_code}，"
-                        f"指数退避冷却至 {cool_until}（第 {account.risk_strikes} 次）"
-                    )
-                    penalty_note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
-                store.update_account(account)
                 if needs_captcha and account.has_apikey_fallback():
                     logs.warn(
                         req_id,
@@ -1488,13 +1527,16 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     await client.aclose()
                     if code_hit in _RISK_BIZ_CODES:
                         account.record_result(False, f"风控封禁（业务码 {code_hit}）")
-                        account.ban_for_risk()
-                        account.last_error = (
-                            f"风控封禁 (业务码 {code_hit})，确认恢复后请在后台手动启用"
-                            f"（第 {account.risk_strikes} 次）"
-                        )
-                        store.update_account(account)
-                        logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，已禁用，切换下一个")
+                        penalty_note = _apply_risk_strike(account, f"业务码 {code_hit}", req_id)
+                        if needs_captcha and account.has_apikey_fallback():
+                            logs.warn(
+                                req_id,
+                                f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，切 API Key 回退",
+                            )
+                            needs_captcha = False
+                            force_fallback = True
+                            continue
+                        logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，切换下一个")
                         return _NEXT_ACCOUNT
                     if code_hit in _QUOTA_BIZ_CODES:
                         account.record_result(False, f"额度用完（业务码 {code_hit}）")
@@ -1567,7 +1609,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         _spawn_bg(_safe_refresh(account))
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
-                         account_name=account.name, mode=account.mode)
+                         account_name=account.name, mode=account.mode, model=model_name)
 
 
 def _safe_json(text: str):
