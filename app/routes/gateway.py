@@ -201,6 +201,34 @@ def _rate_break(account) -> int:
     return cool
 
 
+def _has_other_selectable(account: Account) -> bool:
+    """池内除该账号外是否还有其他可服务账号（供 429 换号优先判定）。
+
+    只看「其他账号」，不把同账号的 API Key 回退通道当作换号目标 —— 回退
+    通道由 force_fallback 单独处理，两者语义不同（换号 vs 换通道）。
+    """
+    try:
+        return store.select(account.provider, skip_ids={account.id}) is not None
+    except Exception:  # noqa: BLE001 - 判定失败按「无其他账号」兑底，走原有兜底
+        return False
+
+
+def _has_recoverable_account(provider: str) -> bool:
+    """池内是否存在「额度耗尽、预期分钟级自动恢复」的账号 —— 排队只对它有意义。
+
+    EXHAUSTED：额度窗口滚动恢复（后台探测发现即回轮询），排队等待划算。
+    COOLING 不排：5xx/风控冷却已知时长（300s 起、风控最长 24h），干等只会
+    把连接吊死到 CDN 边缘 ~100s 硬超时（HTTP 524），应快速 503 让客户端
+    自行重试；429 刚失败而仍 ACTIVE 的号秒级内也不会好转，同理不排队。
+    （2026-10-07 实测：对这两类排队会把单账号 429 用例拖成 240s+ 挂死、
+    上游被无谓重打十几次。）
+    """
+    return any(
+        a.enabled and a.status == Status.EXHAUSTED
+        for a in store.list_accounts(provider)
+    )
+
+
 def _is_risk_control(status_code: int, text: str) -> bool:
     """风控信号判定（3012「unusual activity」/ messages 端点 405）。
 
@@ -959,13 +987,21 @@ async def _wait_for_account(req_id, provider: str, t0: float,
 
     返回秒数 → 调用方继续轮询选号（账号可能已恢复）；
     返回 None → 不该排队（功能关闭 / 排队预算耗尽 / 请求死线已到 /
-    池子空），由调用方走原有 503 路径，不做无谓空等。
+    池子空 / 池内无可恢复账号），由调用方走原有 503 路径，不做无谓空等。
     """
     max_wait = settings.QUEUE_WAIT
     if max_wait <= 0:
         return None
     # 池子压根没有账号（区别于「有账号但都不可用」）→ 排队毫无意义
     if not store.list_accounts(provider):
+        return None
+    # 排队只对「预期自动恢复」的故障有意义：EXHAUSTED 额度分钟级滚动恢复、
+    # COOLING 到期自动回轮询。429/5xx 刚失败而仍 ACTIVE 的号秒级内不会好转
+    # —— 对它们排队只会反复重打同一账号（每轮重带满额重试梯），放大上游
+    # 压力并把 TTFB 拖过 CDN 边缘 ~100s 硬超时（HTTP 524；2026-10-07 实测
+    # 单账号 429 用例被排队拖成 240s+ 挂死、上游被无谓重打十几次）。
+    # 无可恢复账号 → 快速 503，让客户端自行重试。
+    if not _has_recoverable_account(provider):
         return None
     remaining = max_wait - queued
     if remaining <= 0:
@@ -1328,6 +1364,16 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
                 # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
                 #（与上方 3012/401/403 切回退同一语义）
+                #
+                # 429 换号优先（2026-10-07 实证，对齐 workbuddy-gateway 做法）：
+                # 池内还有其他可服务账号时立刻换号，而不是原地静默等待 —— 实测
+                # 60s×2 轮即 120s 会撞穿 CDN 边缘 ~100s 硬超时（HTTP 524），且等待
+                # 期间零字节发给客户端（实测 183 次 429、67 次踩到第 2 轮以上）。
+                # 仅当全池都被限流（无号可换）时，才回退到下方原地等待兜底。
+                if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(account):
+                    account.record_result(False, "429 频控，换号优先（不原地静默等待）")
+                    logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号")
+                    return _NEXT_ACCOUNT
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
                     wait = _parse_retry_after(resp.headers.get("retry-after")) or settings.RETRY_429_WAIT
