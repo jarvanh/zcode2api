@@ -834,6 +834,13 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     limit = _limit()
     attempts = 0
     queued = 0.0  # 已排队等待的秒数（选不到号时累计）
+    # 排队预算：非流式请求无法 early flush（提前发头会破坏本地聚合协议），
+    # 排队静默直接计入 TTFB —— 预算必须压在 CDN 边缘 ~100s 硬超时内
+    #（QUEUE_WAIT_SYNC=60s，与 QUEUE_WAIT 取小），超时快速 503 而非 CF 524。
+    stream = bool(body.get("stream"))
+    budget: float | None = None
+    if not stream and settings.QUEUE_WAIT_SYNC > 0:
+        budget = float(min(settings.QUEUE_WAIT, settings.QUEUE_WAIT_SYNC))
     # 请求级总死线：跨账号重试/等待的总耗时上限（0 = 不限）。梯内等待与
     # 到期试探都属长挂起，死线保证客户端在明确时限内拿到失败与已试账号
     # 明细，可自行快速重试，而不是无限挂死。
@@ -851,7 +858,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         if account is None:
             # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
             # 返回 None 表示不排队（关闭 / 预算耗尽 / 空池）→ 走下方 503。
-            waited = await _wait_for_account(req_id, provider, t0, deadline, queued)
+            waited = await _wait_for_account(req_id, provider, t0, deadline, queued, budget)
             if waited is None:
                 break
             queued += waited
@@ -982,14 +989,19 @@ def _trigger_quota_probe(req_id, provider: str) -> None:
 
 
 async def _wait_for_account(req_id, provider: str, t0: float,
-                            deadline: float, queued: float) -> float | None:
+                            deadline: float, queued: float,
+                            budget: float | None = None) -> float | None:
     """选不到可用账号时限界排队等待，返回实际等待秒数或 None。
 
+    budget：本次请求的排队总预算（秒）；None = 用 settings.QUEUE_WAIT。
+    非流式请求无法 early flush（提前发头会破坏本地聚合协议），排队静默
+    直接计入 TTFB —— 由调用方把预算压到 QUEUE_WAIT_SYNC（CDN ~100s 红
+    线内），超时快速 503，而不是让 CF 判 524。
     返回秒数 → 调用方继续轮询选号（账号可能已恢复）；
     返回 None → 不该排队（功能关闭 / 排队预算耗尽 / 请求死线已到 /
     池子空 / 池内无可恢复账号），由调用方走原有 503 路径，不做无谓空等。
     """
-    max_wait = settings.QUEUE_WAIT
+    max_wait = settings.QUEUE_WAIT if budget is None else budget
     if max_wait <= 0:
         return None
     # 池子压根没有账号（区别于「有账号但都不可用」）→ 排队毫无意义

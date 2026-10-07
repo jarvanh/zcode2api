@@ -157,7 +157,12 @@ REQUEST_DEADLINE = _int("ZCODE_REQUEST_DEADLINE", 600)
 # 排队让请求等一等，把分钟级抖动吃掉；限界是因为「当天额度真耗尽」等也无用，
 # 那时排队只是把报错推迟，不如早点告诉客户端。
 # 0 = 关闭（维持秒回 503 的旧行为）。实际生效值再与 REQUEST_DEADLINE 取小。
-QUEUE_WAIT = _int("ZCODE_QUEUE_WAIT", 240)  # 排队总时长上限（秒）
+QUEUE_WAIT = _int("ZCODE_QUEUE_WAIT", 240)  # 排队总时长上限（秒，流式）
+# 非流式请求的排队预算：无法 early flush（提前发头会破坏本地聚合协议），
+# 排队静默直接计入 TTFB —— 必须压在 CDN 边缘 ~100s 硬超时内快速失败
+#（60s + 梯内开销留余量），超时给明确 503 而非 CF 524 页。实际生效值
+# 再与 QUEUE_WAIT 取小。
+QUEUE_WAIT_SYNC = _int("ZCODE_QUEUE_WAIT_SYNC", 60)
 QUEUE_POLL = _int("ZCODE_QUEUE_POLL", 5)    # 排队期间重新选号的间隔（秒）
 # 排队触发的主动额度探测最小间隔（秒）：并发排队时会同时涌进多个请求，
 # 不节流会让 billing 查询放大成风控信号（见上方 BILLING 风控说明）。

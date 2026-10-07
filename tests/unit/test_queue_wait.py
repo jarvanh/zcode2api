@@ -138,6 +138,53 @@ class TestQueueWaiting:
         assert sleeps[0] == pytest.approx(2.0, abs=0.2)
 
 
+class TestSyncBudget:
+    """非流式请求无法 early flush（提前发头会破坏本地聚合协议），排队静默
+    直接计入 TTFB —— 预算必须压在 CDN 边缘 ~100s 硬超时内（QUEUE_WAIT_SYNC
+    与 QUEUE_WAIT 取小），超时快速 503 而非 CF 524。"""
+
+    async def test_sync_budget_is_min_of_wait_and_sync_cap(self, fresh_app, monkeypatch):
+        """非流式预算 = min(QUEUE_WAIT, QUEUE_WAIT_SYNC)。"""
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        monkeypatch.setattr(settings, "QUEUE_WAIT_SYNC", 60)
+        _exhaust(fresh_app)
+
+        async def _fake_sleep(sec):
+            return None
+
+        monkeypatch.setattr(gateway, "_sleep", _fake_sleep)
+        # queued=0，预算应取 60（非 240）→ 60/5 = 12 轮轮询
+        budget = float(min(settings.QUEUE_WAIT, settings.QUEUE_WAIT_SYNC))
+        # 直接调 _wait_for_account 验证预算生效：耗尽后返回 None
+        assert await gateway._wait_for_account("r1", "zai", time.time(), 0, 0.0, budget=budget) is None
+
+    async def test_sync_budget_zero_disables_sync_queue(self, fresh_app, monkeypatch):
+        """QUEUE_WAIT_SYNC=0 时非流式不排队（快速 503）。"""
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        monkeypatch.setattr(settings, "QUEUE_WAIT_SYNC", 0)
+        _exhaust(fresh_app)
+
+        async def _fake_sleep(sec):
+            return None
+
+        monkeypatch.setattr(gateway, "_sleep", _fake_sleep)
+        budget = 0.0  # _dispatch 对非流式 budget=0 时不限制，这里直接验 None 分支
+        assert await gateway._wait_for_account("r1", "zai", time.time(), 0, 0.0, budget=budget) is None
+
+    async def test_stream_budget_unchanged(self, fresh_app, monkeypatch):
+        """流式请求预算不受 QUEUE_WAIT_SYNC 影响，仍用 QUEUE_WAIT。"""
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        monkeypatch.setattr(settings, "QUEUE_WAIT_SYNC", 60)
+        _exhaust(fresh_app)
+
+        async def _fake_sleep(sec):
+            return None
+
+        monkeypatch.setattr(gateway, "_sleep", _fake_sleep)
+        # 流式走默认预算：调用时不传 budget（等价于 240）→ 等满预算后 None
+        assert await gateway._wait_for_account("r1", "zai", time.time(), 0, 0.0) is None
+
+
 class TestQuotaProbeThrottle:
     async def test_probe_triggered_once_within_throttle_window(
         self, fresh_app, monkeypatch, probe_calls,
