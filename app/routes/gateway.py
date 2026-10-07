@@ -408,6 +408,7 @@ async def messages(request: Request):
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
         except TimeoutError:
+            logs.warn(req_id, f"上游首字超 {settings.EARLY_FLUSH_GRACE}s 宽限期，early-flush 先发 200+SSE 头（后续失败降级 SSE error）")
             return StreamingResponse(
                 _early_flush_anthropic_stream(task, req_id),
                 status_code=200, media_type="text/event-stream",
@@ -706,6 +707,7 @@ async def chat_completions(request: Request):
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
         except TimeoutError:
+            logs.warn(req_id, f"上游首字超 {settings.EARLY_FLUSH_GRACE}s 宽限期，early-flush 先发 200+SSE 头（后续失败降级 SSE error）")
             return StreamingResponse(
                 _early_flush_openai_stream(task, req_id, str(body.get("model") or "")),
                 status_code=200, media_type="text/event-stream",
