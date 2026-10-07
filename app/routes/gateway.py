@@ -249,6 +249,54 @@ def _last_user_text(body: dict) -> str:
     return ""
 
 
+def _allowed_model_ids() -> list[str]:
+    """账号池全部 entitlements 的 capabilities 并集（小写），与 /v1/models 同源。
+
+    上游按此硬性判定允许的模型（套餐外返回业务码 3006），名单随套餐自动
+    变化，新模型上线无需改代码。池空 / 无套餐信息时返回空列表 —— 静态
+    AVAILABLE_MODELS 只是展示回退而非授权事实，拿它拦截会在冷启动误杀。
+    """
+    caps: set[str] = set()
+    for provider in ("zai", "bigmodel"):
+        for acc in store.list_accounts(provider):
+            for plan in acc.plans or []:
+                for ent in plan.get("entitlements") or []:
+                    for c in ent.get("capabilities") or []:
+                        if c.startswith("model:") and len(c) > 6:
+                            caps.add(c[6:].lower())
+    return sorted(caps)
+
+
+def _reject_model_not_allowed(model: str) -> JSONResponse | None:
+    """套餐外模型 → 400；返回 None 表示放行。
+
+    必须在调度之前即时拒绝，而不是让排队去等一个绝无可能的账号：
+    2026-10-07 实证，客户端请求 glm-5.3 而套餐只授权 glm-5.3-flash，排队
+    尽职等 5s 后仍出 503，报错被误导成「额度耗尽」，既浪费排队预算又
+    掩盖真实原因。这里直接给出可用模型清单，客户端一眼能看懂。
+    """
+    allowed = _allowed_model_ids()
+    if not allowed:
+        # 授权名单拿不到（空池 / 无套餐信息）→ 放行，交由调度走原有 503 路径，
+        # 不按静态展示名单误杀（回归基线 test_no_account_503 锁定该行为）
+        return None
+    if (model or "").lower() in allowed:
+        return None
+    canon = [MODEL_NAME_MAP.get(m, m) for m in allowed]
+    logs.warn("gateway", f"套餐外模型 {model or '(空)'} 被拒（可用：{', '.join(canon)}）")
+    return JSONResponse(
+        {"error": {
+            "message": (
+                f"模型 {model or '(空)'} 不在套餐允许范围内（上游 3006）。"
+                f"可用模型：{', '.join(canon)}"
+            ),
+            "type": "model_not_allowed",
+            "allowed_models": canon,
+        }},
+        status_code=400,
+    )
+
+
 @router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
 async def list_models():
     """列出可用模型（Anthropic /v1/models 风格），动态生成。
@@ -311,6 +359,10 @@ async def messages(request: Request):
             status_code=403,
         )
     body = _normalize_body(body)
+    # 套餐外模型即时拒绝（上游 3006）：否则会去排队等一个绝无可能的账号，
+    # 最终出「额度耗尽」误导性 503。必须在 _dispatch 之前。
+    if (rejected := _reject_model_not_allowed(str(body.get("model") or ""))) is not None:
+        return rejected
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
     # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
@@ -400,6 +452,10 @@ async def chat_completions(request: Request):
             status_code=403,
         )
     body = _normalize_body(body)
+    # 套餐外模型即时拒绝（上游 3006）：否则会去排队等一个绝无可能的账号，
+    # 最终出「额度耗尽」误导性 503。必须在 _dispatch 之前。
+    if (rejected := _reject_model_not_allowed(str(body.get("model") or ""))) is not None:
+        return rejected
     port = request.url.port or settings.PORT
     # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
     _probe_flag.set(is_probe_request(request.headers))
