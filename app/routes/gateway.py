@@ -25,7 +25,7 @@ from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
-from ..quota import fetch_quota
+from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
@@ -520,6 +520,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     tried: set[str] = set()
     limit = _limit()
     attempts = 0
+    queued = 0.0  # 已排队等待的秒数（选不到号时累计）
     # 请求级总死线：跨账号重试/等待的总耗时上限（0 = 不限）。梯内等待与
     # 到期试探都属长挂起，死线保证客户端在明确时限内拿到失败与已试账号
     # 明细，可自行快速重试，而不是无限挂死。
@@ -535,7 +536,14 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             )
         account = store.select(provider, skip_ids=tried)
         if account is None:
-            break
+            # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
+            # 返回 None 表示不排队（关闭 / 预算耗尽 / 空池）→ 走下方 503。
+            waited = await _wait_for_account(req_id, provider, t0, deadline, queued)
+            if waited is None:
+                break
+            queued += waited
+            tried.clear()  # 期间账号状态可能已刷新，重新给每个账号机会
+            continue
         tried.add(account.id)
         if limit > 0 and _inflight.get(account.id, 0) >= limit:
             logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
@@ -572,6 +580,18 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             slot_box[0] = None
         return result
 
+    if queued:
+        logs.req_err(req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队等待 {queued:.0f}s）")
+        reqlog.finish_error(
+            req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）", status=503,
+        )
+        return JSONResponse(
+            {"error": {
+                "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
+                "type": "no_available_account", "queued_seconds": round(queued),
+            }},
+            status_code=503,
+        )
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
     return JSONResponse(
@@ -613,6 +633,80 @@ def _make_slot_releaser(account_id: str):
     def _release() -> None:
         _release_slot(account_id)
     return _release
+
+
+# ── 限界排队：选不到可用账号时等一等 ────────────────────────────────────────
+# 动机：上游额度是分钟级滚动恢复的（2026-10-06 实测故障窗 4 分钟：账号被
+# 标记 EXHAUSTED → 后台探测发现额度恢复 → 回轮询）。旧行为秒回 503，把这类
+# 自愈型故障全部变成用户可见报错；排队能把它吃掉。
+# 限界的理由：当天额度真耗尽时等也无用，排队只是把报错推迟。
+_queue_probe_lock = threading.Lock()
+_queue_probe_last = 0.0
+
+
+def _trigger_quota_probe(req_id, provider: str) -> None:
+    """排队期间主动探测一次额度，不等后台周期（节流防 billing 查询放大）。
+
+    后台探测周期较长（默认分钟级），排队时若只干等，等于把恢复时间对齐到
+    后台节奏上；主动探一次能把分钟级抖动再压短。并发排队会同时涌进多个
+    请求，故按 QUEUE_PROBE_MIN_INTERVAL 全局节流——billing/* 连续查询是
+    上游风控「unusual activity」的信号源，不能放大。
+    """
+    global _queue_probe_last
+    now = time.time()
+    with _queue_probe_lock:
+        if now - _queue_probe_last < settings.QUEUE_PROBE_MIN_INTERVAL:
+            return
+        _queue_probe_last = now
+    targets = [
+        a for a in store.list_accounts(provider)
+        if a.mode == "jwt" and a.allows_billing()
+    ]
+    if not targets:
+        return
+    logs.warn(req_id, f"排队触发主动额度探测（{len(targets)} 个账号）")
+    _spawn_bg(refresh_accounts(targets))
+
+
+async def _wait_for_account(req_id, provider: str, t0: float,
+                            deadline: float, queued: float) -> float | None:
+    """选不到可用账号时限界排队等待，返回实际等待秒数或 None。
+
+    返回秒数 → 调用方继续轮询选号（账号可能已恢复）；
+    返回 None → 不该排队（功能关闭 / 排队预算耗尽 / 请求死线已到 /
+    池子空），由调用方走原有 503 路径，不做无谓空等。
+    """
+    max_wait = settings.QUEUE_WAIT
+    if max_wait <= 0:
+        return None
+    # 池子压根没有账号（区别于「有账号但都不可用」）→ 排队毫无意义
+    if not store.list_accounts(provider):
+        return None
+    remaining = max_wait - queued
+    if remaining <= 0:
+        logs.warn(req_id, f"排队已累计 {queued:.0f}s，达上限 {max_wait}s，停止等待")
+        return None
+    if deadline:
+        elapsed = time.time() - t0
+        if elapsed >= deadline:
+            return None
+        remaining = min(remaining, deadline - elapsed)
+
+    poll = max(1, settings.QUEUE_POLL)
+    logs.warn(req_id, f"暂无可用账号，排队等待（剩余预算 {remaining:.0f}s，每 {poll}s 重试选号）")
+    _trigger_quota_probe(req_id, provider)
+
+    waited = 0.0
+    while waited < remaining:
+        step = min(float(poll), remaining - waited)
+        await _sleep(step)
+        waited += step
+        if store.select(provider) is not None:
+            logs.warn(req_id, f"排队 {waited:.0f}s 后账号恢复可用，继续调度")
+            return waited
+        if deadline and time.time() - t0 >= deadline:
+            return waited  # 死线到：交给主循环的死线分支出 503
+    return None  # 排队预算耗尽
 
 
 _NEXT_ACCOUNT = object()

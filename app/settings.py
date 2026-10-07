@@ -145,6 +145,18 @@ RATE_COOL_SMALL_MAX = _int("ZCODE_RATE_COOL_SMALL_MAX", 600)
 # 实测被 429 梯拖住的请求 p50=300s/p90=600s/max=780s（全是梯等待叠加，
 # 正常请求 p50=5s/max=64s），600s 放行 1-2 轮完整梯、在极端叠加前止步。
 REQUEST_DEADLINE = _int("ZCODE_REQUEST_DEADLINE", 600)
+# ── 限界排队（选不到可用账号时）────────────────────────────────────────────
+# 账号池全被标记 EXHAUSTED / COOLING 时，旧行为是立刻 503。但上游额度是
+# 分钟级滚动恢复的（2026-10-06 实测故障窗 4 分钟：账号耗尽 → 后台 60s 探测
+# 发现额度恢复 → 回轮询），秒回 503 会把这类自愈型故障全部变成用户可见报错。
+# 排队让请求等一等，把分钟级抖动吃掉；限界是因为「当天额度真耗尽」等也无用，
+# 那时排队只是把报错推迟，不如早点告诉客户端。
+# 0 = 关闭（维持秒回 503 的旧行为）。实际生效值再与 REQUEST_DEADLINE 取小。
+QUEUE_WAIT = _int("ZCODE_QUEUE_WAIT", 240)  # 排队总时长上限（秒）
+QUEUE_POLL = _int("ZCODE_QUEUE_POLL", 5)    # 排队期间重新选号的间隔（秒）
+# 排队触发的主动额度探测最小间隔（秒）：并发排队时会同时涌进多个请求，
+# 不节流会让 billing 查询放大成风控信号（见上方 BILLING 风控说明）。
+QUEUE_PROBE_MIN_INTERVAL = _int("ZCODE_QUEUE_PROBE_MIN_INTERVAL", 30)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
