@@ -157,6 +157,19 @@ QUEUE_POLL = _int("ZCODE_QUEUE_POLL", 5)    # 排队期间重新选号的间隔�
 # 排队触发的主动额度探测最小间隔（秒）：并发排队时会同时涌进多个请求，
 # 不节流会让 billing 查询放大成风控信号（见上方 BILLING 风控说明）。
 QUEUE_PROBE_MIN_INTERVAL = _int("ZCODE_QUEUE_PROBE_MIN_INTERVAL", 30)
+# ── Early Flush「响应头先行」（治 CDN 边缘 524）────────────────────────────
+# 背景：客户端经 Cloudflare Tunnel 访问时，CDN 边缘对「已建连但迟迟拿不到
+# 响应头」的请求有 ~100s 硬超时（HTTP 524）。调度排队、429/504 重试梯与
+# 上游首字延迟叠加会把 TTFB 推过 100s：请求明明活着，却被边缘掐断（同型
+# 问题 workbuddy-gateway earlyflush.go 已实证并修复，2026-09-28）。
+# 方案：流式请求给宽限期——期内完成保持真实状态码语义（clirelay 可按码
+# 重试）；耗尽仍未拿到上游响应，提前下发 200+SSE 响应头，CDN「等待响应
+# 头」计时随之停止。此后上游失败降级为 SSE error 事件而非伪造正常结束。
+# 仅流式路径启用（非流式本地聚合完整 JSON，提前发头会破坏协议）。0 = 禁用。
+EARLY_FLUSH_GRACE = _int("ZCODE_EARLY_FLUSH_GRACE", 30)
+# 提前发头后、等待调度结果期间的心跳间隔（SSE 注释行）：既冲刷缓冲，
+# 也防流式 idle 被中间层掐断。<=0 时回退 15s。
+EARLY_FLUSH_BEAT = _int("ZCODE_EARLY_FLUSH_BEAT", 15)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数

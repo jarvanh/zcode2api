@@ -373,19 +373,43 @@ async def messages(request: Request):
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
                  bool(body.get("stream")), _last_user_text(body))
 
-    try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
-    except asyncio.CancelledError:
-        # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
-        # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
-        reqlog.finish_error(req_id, "客户端断开", status=499)
-        raise
-    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
-        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
-        return JSONResponse(
-            {"error": {"message": "网关内部错误", "type": "internal_error"}},
-            status_code=500,
-        )
+    if body.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
+        # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
+        # 停掉 CDN 计时，此后失败降级 SSE error 事件（见 earlyflush 块注释）
+        task = asyncio.create_task(_dispatch(req_id, body, incoming_headers, port, provider))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
+        except TimeoutError:
+            return StreamingResponse(
+                _early_flush_anthropic_stream(task, req_id),
+                status_code=200, media_type="text/event-stream",
+                headers=dict(_EARLY_FLUSH_SSE_HEADERS),
+            )
+        except asyncio.CancelledError:
+            # 客户端断开必须显式取消派生任务——分离任务不会随请求取消而终止
+            task.cancel()
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+        except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+            reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+            return JSONResponse(
+                {"error": {"message": "网关内部错误", "type": "internal_error"}},
+                status_code=500,
+            )
+    else:
+        try:
+            result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        except asyncio.CancelledError:
+            # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
+            # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+        except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+            reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+            return JSONResponse(
+                {"error": {"message": "网关内部错误", "type": "internal_error"}},
+                status_code=500,
+            )
     if isinstance(result, _Upstream):
         # dispatch 返回与流式生成器启动之间的取消窗口：兜底关闭释放并发槽位
         try:
@@ -428,6 +452,188 @@ async def _stream_or_biz_error(up: _Upstream, req_id: str):
     return up.to_streaming(req_id)
 
 
+# ── Early Flush「响应头先行」（治 CDN 边缘 524）────────────────────────────
+# 设计见 settings.EARLY_FLUSH_GRACE 注释：宽限期内保持真实状态码语义；
+# 宽限期耗尽仍未拿到上游响应，则先发 200+SSE 头停掉 CDN 的「等待响应头」
+# 计时，此后失败只能降级为 SSE error 事件（状态码已不可改），绝不伪造
+# 正常结束。仅流式路径启用。
+_EARLY_FLUSH_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse_error_chunk(style: str, status_code: int, etype: str, message: str) -> str:
+    """按端点协议构造 SSE 错误事件（early flush 后状态码不可改，只能事件化）。"""
+    if style == "openai":
+        payload = {"error": {"message": message, "type": etype, "code": status_code}}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
+    payload = {"type": "error", "error": {"type": etype, "message": message}}
+    return f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _jsonresp_error(resp) -> tuple[int, str, str]:
+    """从调度层返回的 JSONResponse 提取 (status, type, message)，供 SSE 错误事件复用。"""
+    try:
+        data = json.loads(bytes(resp.body).decode("utf-8", "ignore"))
+        err = data.get("error") or {}
+        return (resp.status_code, str(err.get("type") or "api_error"),
+                str(err.get("message") or "调度失败"))
+    except Exception:  # noqa: BLE001 - 解析失败兑底为通用错误
+        return resp.status_code, "api_error", "调度失败"
+
+
+async def _early_flush_anthropic_stream(task: asyncio.Task, req_id: str):
+    """/v1/messages 的 early flush 流（Anthropic SSE 语义）。
+
+    首个 yield 立即把 200+SSE 响应头冲刷到线缆；等待调度期间按
+    EARLY_FLUSH_BEAT 发注释心跳；成功透传上游流，失败降级 SSE error 事件。
+    """
+    beat = settings.EARLY_FLUSH_BEAT if settings.EARLY_FLUSH_BEAT > 0 else 15
+    yield ": early-flush\n\n"
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=beat)
+            break
+        except TimeoutError:
+            yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            # 客户端断开必须显式取消派生任务——分离任务不会随请求取消而终止
+            task.cancel()
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+    if not isinstance(result, _Upstream):
+        # 调度层失败（reqlog 已在 _dispatch 内收口）：状态码不可改，降级 SSE error
+        status, etype, emsg = _jsonresp_error(result)
+        logs.warn(req_id, f"early-flush 后调度失败 {status}，降级 SSE error: {emsg}")
+        yield _sse_error_chunk("anthropic", status, etype, emsg)
+        return
+    up = result
+    ctype = (up.resp.headers.get("content-type") or "").lower()
+    if "text/event-stream" not in ctype:
+        # 少见：流式请求拿到同步 JSON——业务错误事件化，成功原样单事件透传
+        try:
+            raw = await up.resp.aread()
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+            yield _sse_error_chunk("anthropic", 502, "upstream_error", f"读取上游响应失败: {err}")
+            return
+        finally:
+            await up.close()
+        text = raw.decode("utf-8", "ignore")
+        hit = _upstream_biz_error(text)
+        if hit:
+            status, etype, emsg = hit
+            detail = f"{emsg}（上游: {text[:160]}）"
+            logs.req_err(req_id, detail)
+            reqlog.finish_error(req_id, detail, status=status, t_first=up.t_first)
+            yield _sse_error_chunk("anthropic", status, etype, emsg)
+            return
+        logs.req_ok(req_id)
+        reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
+        record_usage(getattr(up, "model", "-"))
+        yield f"data: {text}\n\n"
+        return
+    try:
+        async for chunk in up.resp.aiter_bytes():
+            yield chunk
+        logs.req_ok(req_id)
+        reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
+        record_usage(getattr(up, "model", "-"))
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+        raise
+    except Exception as err:  # noqa: BLE001
+        logs.req_err(req_id, f"流传输中断: {err}")
+        reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        yield _sse_error_chunk("anthropic", 502, "upstream_error", f"流传输中断: {err}")
+    finally:
+        await up.close()
+
+
+async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str):
+    """/v1/chat/completions 的 early flush 流（OpenAI chunk 语义，走 StreamConverter）。"""
+    beat = settings.EARLY_FLUSH_BEAT if settings.EARLY_FLUSH_BEAT > 0 else 15
+    yield ": early-flush\n\n"
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=beat)
+            break
+        except TimeoutError:
+            yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            task.cancel()
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+    if not isinstance(result, _Upstream):
+        status, etype, emsg = _jsonresp_error(result)
+        logs.warn(req_id, f"early-flush 后调度失败 {status}，降级 SSE error: {emsg}")
+        yield _sse_error_chunk("openai", status, etype, emsg)
+        return
+    up = result
+    ctype = (up.resp.headers.get("content-type") or "").lower()
+    if "text/event-stream" not in ctype:
+        # 少见：流式请求拿到同步 JSON——业务错误事件化，成功原样单事件透传
+        try:
+            raw = await up.resp.aread()
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+            yield _sse_error_chunk("openai", 502, "upstream_error", f"读取上游响应失败: {err}")
+            return
+        finally:
+            await up.close()
+        text = raw.decode("utf-8", "ignore")
+        hit = _upstream_biz_error(text)
+        if hit:
+            status, etype, emsg = hit
+            logs.req_err(req_id, emsg)
+            reqlog.finish_error(req_id, emsg, status=status, t_first=up.t_first)
+            yield _sse_error_chunk("openai", status, etype, emsg)
+            return
+        data = _safe_json(text)
+        usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
+        logs.req_ok(req_id)
+        reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                         input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+        record_usage(model, usage.get("input_tokens"), usage.get("output_tokens"))
+        yield f"data: {text}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    conv = StreamConverter(model)
+    try:
+        yield conv.start()
+        async for line in up.resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            evt = _safe_json(data_str)
+            if isinstance(evt, dict):
+                for out in conv.feed(evt):
+                    yield out
+        yield conv.done()
+        logs.req_ok(req_id)
+        reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                         input_tokens=conv.usage.get("prompt_tokens"),
+                         output_tokens=conv.usage.get("completion_tokens"))
+        record_usage(model, conv.usage.get("prompt_tokens"), conv.usage.get("completion_tokens"))
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+        raise
+    except Exception as err:  # noqa: BLE001
+        logs.req_err(req_id, f"流传输中断: {err}")
+        reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        yield _sse_error_chunk("openai", 502, "upstream_error", f"流传输中断: {err}")
+    finally:
+        await up.close()
+
+
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
 async def chat_completions(request: Request):
     try:
@@ -465,17 +671,40 @@ async def chat_completions(request: Request):
     reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
                  bool(payload.get("stream")), _last_user_text(body))
 
-    try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
-    except asyncio.CancelledError:
-        reqlog.finish_error(req_id, "客户端断开", status=499)
-        raise
-    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
-        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
-        return JSONResponse(
-            {"error": {"message": "网关内部错误", "type": "internal_error"}},
-            status_code=500,
-        )
+    if payload.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
+        # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
+        # 停掉 CDN 计时，此后失败降级 SSE error 事件（见 earlyflush 块注释）
+        task = asyncio.create_task(_dispatch(req_id, body, incoming_headers, port, provider))
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
+        except TimeoutError:
+            return StreamingResponse(
+                _early_flush_openai_stream(task, req_id, str(body.get("model") or "")),
+                status_code=200, media_type="text/event-stream",
+                headers=dict(_EARLY_FLUSH_SSE_HEADERS),
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+        except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+            reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+            return JSONResponse(
+                {"error": {"message": "网关内部错误", "type": "internal_error"}},
+                status_code=500,
+            )
+    else:
+        try:
+            result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499)
+            raise
+        except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+            reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+            return JSONResponse(
+                {"error": {"message": "网关内部错误", "type": "internal_error"}},
+                status_code=500,
+            )
     if not isinstance(result, _Upstream):
         # 同步直通（_try_account 已读完 body 并收口监控含 tokens）：此处仅把
         # Anthropic message 转换为 OpenAI chat.completion；错误响应原样返回
