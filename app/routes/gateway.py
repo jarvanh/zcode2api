@@ -239,18 +239,43 @@ def _has_other_selectable(account: Account) -> bool:
         return False
 
 
-def _has_recoverable_account(provider: str) -> bool:
+def _quota_windows_live(account, now: float) -> bool:
+    """额度窗口是否仍有「滚动恢复」的可能（至少一窗未到期）。
+
+    EXHAUSTED 之所以值得排队，是因为日窗会到期重置、后台 60s 探测发现即
+    拉回轮询。但窗口本身已过期（expires_at <= now）时，重置不会再发生，
+    恢复只能靠上游新发授权（grant / 领取），排队干等纯属浪费预算。
+
+    quota 缺失（尚未刷新、或上游不提供额度）时按「仍可恢复」处理：宁可
+    保留旧的排队行为，也不拿空数据把账号判死。
+    """
+    quota = getattr(account, "quota", None) or {}
+    windows = [w for w in quota.values() if isinstance(w, dict)]
+    if not windows:
+        return True
+    return any(
+        (w.get("expires_at") or 0) > now for w in windows
+    )
+
+
+def _has_recoverable_account(provider: str, now: float | None = None) -> bool:
     """池内是否存在「额度耗尽、预期分钟级自动恢复」的账号 —— 排队只对它有意义。
 
-    EXHAUSTED：额度窗口滚动恢复（后台探测发现即回轮询），排队等待划算。
+    EXHAUSTED 且额度窗口未到期：额度分钟级滚动恢复，排队等待划算。
+    EXHAUSTED 但窗口已过期：不会自动重置，排队只会把连接吊到 CDN 边缘
+    ~100s 硬超时（HTTP 524），且会越过 30s early-flush 宽限期先发 200 ——
+    客户端据此把「额度耗尽」误判成成功（2026-10-08 实测：4 号全部窗口
+    过期时，请求排队 240s 后被 early-flush 成 HTTP 200 + SSE error）。
     COOLING 不排：5xx/风控冷却已知时长（300s 起、风控最长 24h），干等只会
-    把连接吊死到 CDN 边缘 ~100s 硬超时（HTTP 524），应快速 503 让客户端
-    自行重试；429 刚失败而仍 ACTIVE 的号秒级内也不会好转，同理不排队。
+    把连接吊死，应快速 503 让客户端自行重试；429 刚失败而仍 ACTIVE 的号
+    秒级内也不会好转，同理不排队。
     （2026-10-07 实测：对这两类排队会把单账号 429 用例拖成 240s+ 挂死、
     上游被无谓重打十几次。）
     """
+    now = now if now is not None else time.time()
     return any(
         a.enabled and a.status == Status.EXHAUSTED
+        and _quota_windows_live(a, now)
         for a in store.list_accounts(provider)
     )
 

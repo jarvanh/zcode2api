@@ -78,6 +78,52 @@ class TestQueueDisabledOrMeaningless:
         # queued 已达上限 → 不再追加等待
         assert await gateway._wait_for_account("r1", "zai", time.time(), 0, 240.0) is None
 
+    async def test_expired_quota_window_not_recoverable(self, fresh_app, monkeypatch, probe_calls):  # noqa: ARG002
+        """额度窗口已过期 → 不排队，快速 503（2026-10-08 线上实测回归）。
+
+        4 个账号全部 EXHAUSTED 且 expires_at 已过，排队只会把连接吊到
+        30s early-flush 宽限期之后，客户端拿到 HTTP 200 + SSE error，
+        把「额度耗尽」误判成成功。窗口过期不会自动重置，排队无意义。
+        """
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        acc = _exhaust(fresh_app)
+        now = time.time()
+        acc.quota = {
+            "GLM-5.3-Flash": {
+                "total": 100000000, "used": 100000000, "remaining": 0,
+                "expires_at": now - 3600,  # 窗口已过期
+            }
+        }
+        fresh_app.update_account(acc)
+
+        async def _fake_sleep(sec):  # 若真排队会被调用
+            raise AssertionError(f"窗口已过期不应排队，却 sleep({sec})")
+
+        monkeypatch.setattr(gateway, "_sleep", _fake_sleep)
+        assert await gateway._wait_for_account("r1", "zai", now, 0, 0.0) is None
+        assert not gateway._has_recoverable_account("zai", now)
+
+    async def test_live_quota_window_still_recoverable(self, fresh_app, monkeypatch, probe_calls):  # noqa: ARG002
+        """额度窗口未到期 → 保持原有排队行为（不得误伤自愈型故障）。"""
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        acc = _exhaust(fresh_app)
+        now = time.time()
+        acc.quota = {
+            "GLM-5.3-Flash": {
+                "total": 100000000, "used": 100000000, "remaining": 0,
+                "expires_at": now + 3600,  # 窗口未到期
+            }
+        }
+        fresh_app.update_account(acc)
+        assert gateway._has_recoverable_account("zai", now)
+
+    async def test_missing_quota_treated_as_recoverable(self, fresh_app, monkeypatch, probe_calls):  # noqa: ARG002
+        """额度数据缺失（未刷新/上游不提供）→ 按可恢复处理，不拿空数据判死。"""
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 240)
+        _exhaust(fresh_app)  # 无 quota
+        now = time.time()
+        assert gateway._has_recoverable_account("zai", now)
+
 
 class TestQueueWaiting:
     async def test_returns_waited_seconds_when_account_recovers(
