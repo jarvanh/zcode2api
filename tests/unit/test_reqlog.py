@@ -6,11 +6,18 @@ import time
 
 import pytest
 
-from app import reqlog
+from app import reqlog, settings
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(tmp_path, monkeypatch):
+    """内存 deque 清零 + DATA_DIR 隔离到 tmp。
+
+    两者缺一不可：只清内存不清 DATA_DIR 时，_persist() 会把测试行写进
+    真实的 data/reqlog-<日期>.jsonl —— 2026-10-08 实测污染了 7163 行
+    （model="m"、耗时微秒级、账号为空），监控页统计被虚高近 5 倍。
+    """
+    monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
     reqlog.clear()
     yield
     reqlog.clear()
