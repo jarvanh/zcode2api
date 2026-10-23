@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
-  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}-3" rel="stylesheet">
   <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
 </head>
 <body>
@@ -296,13 +296,17 @@ function notchColor(id){
 }
 function tierBadgeHtml(a){
   const p=a.plan||{};
-  const s=String(p.show_name||p.plan_id||'').toLowerCase();
-  let label=esc(p.show_name||p.plan_id||''),cls='other';
+  const raw=String(p.show_name||p.plan_id||'');
+  const s=raw.toLowerCase();
+  let label=raw,cls='other';
   if(s.includes('max')){label='Max';cls='max';}
   else if(s.includes('pro')&&!s.includes('preview')){label='Pro';cls='pro';}
   else if(s.includes('lite')){label='Lite';cls='lite';}
   else if(s.includes('start')||s.includes('trial')||s.includes('体验')){label='Trial';cls='trial';}
-  return label?`<span class="tier-b ${cls}">${label}</span>`:'';
+  else if(s.includes('resource-pack')||s.includes('pack')){label='Pack';cls='free';}
+  else if(label.length>10){label=label.slice(0,10)+'…';}
+  // 徽章只做辅助标识：长套餐名（如 bigmodel-resource-pack）会把账号名挤成「bi…」
+  return raw?`<span class="tier-b ${cls}" title="${esc(raw)}">${esc(label)}</span>`:'';
 }
 
 /* 上游真实身份 ID：账号名是人起的（bigmodel-131 / bigmodel-131-individual 这类
@@ -318,8 +322,11 @@ function credCell(a){
   // （userinfo 只认授权瞬间的 access_token，池内 JWT 打过去 401），有值才显示。
   const un=a.username?'<span class="uname-tag" title="上游用户名（OAuth 授权时抓取）">'+esc(a.username)+'</span>':'';
   const uid=a.uid?'<span class="uid-tag" onclick="copyUid(\''+esc(a.uid)+'\')" title="上游真实身份 ID（点击复制）：' + esc(a.uid) + '">' + esc(shortUid(a.uid)) + '</span>':'';
-  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}${un}${uid}</div>
-    <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>`;
+  const tags=`${tierBadgeHtml(a)}${un}${uid}`;
+  // 账号名独占一行：徽章/UID 再长也不会把名字挤成「bi…」
+  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name" title="${esc(a.name)}">${esc(a.name)}</span></div>
+    <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>
+    ${tags?`<div class="acct-tags">${tags}</div>`:''}`;
 }
 
 function statusCell(a){
