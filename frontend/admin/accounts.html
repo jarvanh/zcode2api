@@ -48,6 +48,7 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:var(--mint)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:var(--mint)">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:var(--purple)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:var(--purple)">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（可用剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">待生效额度</div><span class="stat-icon" style="color:var(--blue)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l2.5 2.5"/></svg></span></div><div class="stat-num" id="s-pending" style="color:var(--blue)">0</div></div>
   </div>
 
   <div class="section-head">
@@ -278,8 +279,11 @@ function allEntitlements(a){
 function bonusCoveredByBalance(a, e){
   const grant=Number(e.grant_units)||0;
   if(!grant)return false;
+  const now=Date.now()/1000;
   return Object.entries(a.quota||{}).some(([k,w])=>{
     if(k!==e.show_name)return false;
+    const exp=Number(w&&w.expires_at)||0;
+    if(exp>0&&exp<=now)return false; // 过期窗口是历史快照，不能证明赠送已并入余额
     return Number(w&&w.total)||0>=grant;
   });
 }
@@ -290,8 +294,9 @@ function renderStats(s){
   set('s-exhausted',s.exhausted||0);
   // 总额度（剩余）= 日窗口余额 + 已生效一次性活动赠送
   // （上游不暴露赠送池实际剩余，按授权量计入；悬停有说明）
+  // 待生效额度 = 已领取但 effective_at 在未来的一次性活动赠送，到点自动转正入上行
   const now=Date.now()/1000;
-  let totalRem=0;
+  let totalRem=0,pendingRem=0;
   allAccounts.forEach(a=>{
     Object.values(a.quota||{}).forEach(w=>{
       const exp=Number(w.expires_at)||0;
@@ -299,14 +304,19 @@ function renderStats(s){
       totalRem+=Number(w.remaining)||0;
     });
     allEntitlements(a).forEach(e=>{
+      if(e.period!=='one_time')return;
       const eff=Number(e.effective_at)||0;
       let ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;
-      if(e.period==='one_time'&&eff>0&&eff<=now&&(!ends||now<=ends)
-         &&!bonusCoveredByBalance(a,e))totalRem+=Number(e.grant_units)||0;
+      if(!eff||bonusCoveredByBalance(a,e))return;
+      if(eff<=now&&(!ends||now<=ends))totalRem+=Number(e.grant_units)||0;
+      else if(eff>now)pendingRem+=Number(e.grant_units)||0;
     });
   });
   set('s-quota',fmtNum(totalRem));
   document.getElementById('s-quota').title='仅统计未过期窗口的日余额 + 已生效一次性活动赠送（过期快照不计入；赠送池按授权量计入，上游不提供实际剩余）';
+  set('s-pending',fmtNum(pendingRem));
+  const pendEl=document.getElementById('s-pending');
+  if(pendEl)pendEl.title='已领取、尚未到生效时间的活动赠送额度；到点自动计入「总额度（可用剩余）」。各账号行内的斜纹条为对应明细';
 }
 
 function renderFilters(){
