@@ -184,6 +184,10 @@ RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
 # 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# 1113「无余额/无资源包」按模型冷却：同一账号可能只缺某个模型的包，
+# 不能整号禁用；冷却到期后由下一次请求探测，成功才恢复（指数退避封顶）。
+MODEL_NO_QUOTA_COOLDOWN_BASE = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_BASE", 1800)  # 30m
+MODEL_NO_QUOTA_COOLDOWN_MAX = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_MAX", 21600)   # 6h
 # 风控（3012/405「unusual activity」）指数退避冷却：实测为频道级瞬时频控
 #（同号同刻 billing 正常、数小时自愈），冷却自动恢复；累计 RISK_BAN_STRIKES
 # 次才升级为禁用（人工恢复）。冷却期零上游流量（is_cooling 全通道门禁）。

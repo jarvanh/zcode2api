@@ -279,14 +279,15 @@ class Store:
             return True
 
     # ── 轮询选择 ─────────────────────────────────────────────────────────────
-    def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+    def select(self, provider: str, skip_ids: set[str] | None = None,
+               model: str | None = None) -> Account | None:
+        """按 round-robin 选择下一个可用账号。用完 / 失效 / 该模型无额度冷却中自动跳过。"""
         skip_ids = skip_ids or set()
         now = time.time()
         with self._lock:
             pool = [
                 a for a in self._accounts.get(provider, [])
-                if a.is_selectable(now) and a.id not in skip_ids
+                if a.is_selectable(now, model=model) and a.id not in skip_ids
             ]
             if not pool:
                 return None

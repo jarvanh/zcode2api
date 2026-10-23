@@ -86,6 +86,9 @@ MODEL_NAME_MAP = {
     "glm-5.1": "GLM-5.1",
     "glm-4.7": "GLM-4.7",
 }
+# bigmodel 资源包模型：仅 OpenAI 兼容端点（/api/paas/v4/chat/completions）可用；
+# Anthropic 兼容端点受 Coding Plan 门禁（1309），不能走 _dispatch 的 Anthropic 通道。
+BIGMODEL_OPENAI_MODELS = ("glm-4.5-air", "glm-4.6v", "glm-4.7")
 # /v1/models 回退名单（capabilities 并集取不到时使用）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
 

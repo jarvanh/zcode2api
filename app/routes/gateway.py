@@ -227,14 +227,14 @@ def _rate_break(account) -> int:
     return cool
 
 
-def _has_other_selectable(account: Account) -> bool:
+def _has_other_selectable(account: Account, model: str | None = None) -> bool:
     """池内除该账号外是否还有其他可服务账号（供 429 换号优先判定）。
 
     只看「其他账号」，不把同账号的 API Key 回退通道当作换号目标 —— 回退
     通道由 force_fallback 单独处理，两者语义不同（换号 vs 换通道）。
     """
     try:
-        return store.select(account.provider, skip_ids={account.id}) is not None
+        return store.select(account.provider, skip_ids={account.id}, model=model) is not None
     except Exception:  # noqa: BLE001 - 判定失败按「无其他账号」兑底，走原有兜底
         return False
 
@@ -473,6 +473,15 @@ async def messages(request: Request):
         )
 
     incoming_headers = dict(request.headers)
+    requested_model = str(body.get("model") or "")
+    if requested_model.startswith("bigmodel/"):
+        model_name = requested_model.split("/", 1)[1].strip().lower()
+        if model_name in constants.BIGMODEL_OPENAI_MODELS:
+            return JSONResponse(
+                {"error": {"message": "该模型仅支持 OpenAI 兼容端点 /v1/chat/completions",
+                           "type": "unsupported_endpoint"}},
+                status_code=400,
+            )
     provider = _detect_provider(body, request.headers)
     if provider == "bigmodel" and not store.bigmodel_channel_enabled():
         # 回退通道默认关闭（欠费时上游 429 原地重试会挂起约 2 分钟），
@@ -485,7 +494,7 @@ async def messages(request: Request):
     body = _normalize_body(body)
     # 套餐外模型即时拒绝（上游 3006）：否则会去排队等一个绝无可能的账号，
     # 最终出「额度耗尽」误导性 503。必须在 _dispatch 之前。
-    if (rejected := _reject_model_not_allowed(str(body.get("model") or ""))) is not None:
+    if (rejected := _reject_model_not_allowed(requested_model)) is not None:
         return rejected
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
@@ -759,6 +768,103 @@ async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str
         await up.close()
 
 
+async def _bigmodel_openai_chat(payload: dict, requested_model: str):
+    """bigmodel 资源包模型的 OpenAI 直通路径。
+
+    这些模型在 Anthropic 兼容端点会被 Coding Plan 门禁拦（1309），
+    但 OpenAI 兼容端点可用；这里直接透传 OpenAI 请求，并按模型粒度
+    做 1113/1309 冷却与换号。
+    """
+    model_name = requested_model.split("/", 1)[1].strip().lower()
+    stream = bool(payload.get("stream"))
+    req_id = secrets.token_hex(8)
+    preview = ""
+    msgs = payload.get("messages")
+    if isinstance(msgs, list):
+        for m in reversed(msgs):
+            if isinstance(m, dict) and isinstance(m.get("content"), str):
+                preview = m["content"][:80]
+                break
+    logs.req(req_id, model_name, stream, preview)
+    reqlog.begin(req_id, "chat", model_name, stream, preview)
+    tried: set[str] = set()
+    last_error = ""
+    t0 = time.time()
+    for _ in range(MAX_ACCOUNT_ATTEMPTS):
+        account = store.select("bigmodel", skip_ids=tried, model=model_name)
+        if account is None:
+            break
+        tried.add(account.id)
+        if not account.api_key:
+            continue
+        body = {**payload, "model": model_name}
+        url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        headers = {"Authorization": f"Bearer {account.api_key}", "Content-Type": "application/json"}
+        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        try:
+            if stream:
+                req = client.build_request("POST", url, headers=headers, json=body)
+                resp = await client.send(req, stream=True)
+                if resp.status_code == 200:
+                    account.use_count += 1
+                    account.last_used_at = time.time()
+                    account.record_result(True, f"HTTP 200 · {model_name} · openai-stream")
+                    account.clear_model_cooling(model_name)
+                    store.update_account(account)
+
+                    async def gen():
+                        try:
+                            async for chunk in resp.aiter_raw():
+                                yield chunk
+                        finally:
+                            await resp.aclose()
+                            await client.aclose()
+
+                    return StreamingResponse(gen(), media_type="text/event-stream")
+                text = (await resp.aread()).decode("utf-8", "replace")
+                await resp.aclose()
+                await client.aclose()
+            else:
+                resp = await client.post(url, headers=headers, json=body)
+                text = resp.text
+                if resp.status_code == 200:
+                    data = resp.json()
+                    usage = data.get("usage") or {}
+                    account.use_count += 1
+                    account.last_used_at = time.time()
+                    account.record_result(True, f"HTTP 200 · {model_name} · openai")
+                    account.clear_model_cooling(model_name)
+                    store.update_account(account)
+                    reqlog.finish_ok(req_id, t_first=time.time() - t0, status=200,
+                                     input_tokens=usage.get("prompt_tokens"),
+                                     output_tokens=usage.get("completion_tokens"))
+                    record_usage(model_name, usage.get("prompt_tokens"), usage.get("completion_tokens"))
+                    await client.aclose()
+                    return JSONResponse(data)
+                await client.aclose()
+        except httpx.HTTPError as err:
+            await client.aclose()
+            last_error = f"连接失败: {err}"
+            account.record_result(False, last_error)
+            store.update_account(account)
+            continue
+        last_error = text[:300]
+        if resp.status_code == 429 and ("1113" in text or "1309" in text or "insufficient balance" in text.lower()):
+            until = account.cool_model(model_name, settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
+                                       settings.MODEL_NO_QUOTA_COOLDOWN_MAX)
+            account.record_result(False, f"{resp.status_code} 无资源包（{model_name} 冷却至 "
+                                        f"{time.strftime('%H:%M', time.localtime(until))}）")
+            store.update_account(account)
+            logs.warn(req_id, f"账号 {account.name} {model_name} 无资源包，冷却后换号")
+            continue
+        reqlog.finish_error(req_id, last_error, status=resp.status_code)
+        return JSONResponse({"error": {"message": last_error, "type": "upstream_error"}},
+                            status_code=resp.status_code)
+    reqlog.finish_error(req_id, last_error or "所有 bigmodel 账号均不可用", status=503)
+    return JSONResponse({"error": {"message": last_error or "所有 bigmodel 账号均不可用",
+                                   "type": "no_available_account"}}, status_code=503)
+
+
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
 async def chat_completions(request: Request):
     try:
@@ -767,6 +873,12 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
+
+    requested_model = str(payload.get("model") or "")
+    if requested_model.startswith("bigmodel/"):
+        model_name = requested_model.split("/", 1)[1].strip().lower()
+        if model_name in constants.BIGMODEL_OPENAI_MODELS:
+            return await _bigmodel_openai_chat(payload, requested_model)
 
     body, err = openai_to_anthropic(payload)
     if err or body is None:
@@ -785,7 +897,7 @@ async def chat_completions(request: Request):
     body = _normalize_body(body)
     # 套餐外模型即时拒绝（上游 3006）：否则会去排队等一个绝无可能的账号，
     # 最终出「额度耗尽」误导性 503。必须在 _dispatch 之前。
-    if (rejected := _reject_model_not_allowed(str(body.get("model") or ""))) is not None:
+    if (rejected := _reject_model_not_allowed(requested_model)) is not None:
         return rejected
     port = request.url.port or settings.PORT
     # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
@@ -929,6 +1041,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     """
     t0 = time.time()
     tried: set[str] = set()
+    model_key = str(body.get("model") or "")
     limit = _limit()
     attempts = 0
     queued = 0.0  # 已排队等待的秒数（选不到号时累计）
@@ -952,7 +1065,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                            "type": "no_available_account", "tried": sorted(tried)}},
                 status_code=503,
             )
-        account = store.select(provider, skip_ids=tried)
+        account = store.select(provider, skip_ids=tried, model=model_key)
         if account is None:
             # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
             # 返回 None 表示不排队（关闭 / 预算耗尽 / 空池）→ 走下方 503。
@@ -1431,13 +1544,45 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 原地等待重试毫无意义，只会把客户端吊死在 RETRY_429_TIMES×WAIT 里
                 # ——快速换号/失败。
                 if "1113" in text or "insufficient balance" in text.lower():
-                    account.record_result(False, "429 1113 无余额（Key 无资源包，永久态）")
-                    logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额，跳过等待重试")
+                    model_key = str(body.get("model") or "")
+                    until = account.cool_model(
+                        model_key,
+                        settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
+                        settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
+                    )
+                    account.record_result(
+                        False,
+                        f"429 1113 无余额（{model_key or '-'} 冷却至 "
+                        f"{time.strftime('%H:%M', time.localtime(until))}）",
+                    )
+                    store.update_account(account)
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 429 为 1113 无余额，{model_key} 冷却，跳过等待重试",
+                    )
                     if needs_captcha and account.has_apikey_fallback():
                         needs_captcha = False
                         force_fallback = True
                         retries_429 = 0
                         continue
+                    return _NEXT_ACCOUNT
+                if "1309" in text or "Coding Plan套餐已到期" in text:
+                    model_key = str(body.get("model") or "")
+                    until = account.cool_model(
+                        model_key,
+                        settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
+                        settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
+                    )
+                    account.record_result(
+                        False,
+                        f"429 1309 Coding Plan 到期（{model_key or '-'} 冷却至 "
+                        f"{time.strftime('%H:%M', time.localtime(until))}）",
+                    )
+                    store.update_account(account)
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 429 为 1309 Coding Plan 到期，{model_key} 冷却，跳过等待重试",
+                    )
                     return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
                 # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
@@ -1448,7 +1593,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 60s×2 轮即 120s 会撞穿 CDN 边缘 ~100s 硬超时（HTTP 524），且等待
                 # 期间零字节发给客户端（实测 183 次 429、67 次踩到第 2 轮以上）。
                 # 仅当全池都被限流（无号可换）时，才回退到下方原地等待兜底。
-                if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(account):
+                if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(
+                    account, str(body.get("model") or "")
+                ):
                     account.record_result(False, "429 频控，换号优先（不原地静默等待）")
                     logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号")
                     return _NEXT_ACCOUNT
@@ -1600,6 +1747,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account.cooling_until = None
                     if account.status in (Status.COOLING, Status.EXHAUSTED):
                         account.status = Status.ACTIVE
+                account.clear_model_cooling(str(body.get("model") or ""))
                 store.update_account(account)
                 _spawn_bg(_safe_refresh(account))
                 # 同步直通在此收口监控条目（含 tokens 与用量记账）：原先同步响应
@@ -1630,6 +1778,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             account.cooling_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):
                 account.status = Status.ACTIVE
+        account.clear_model_cooling(str(body.get("model") or ""))
         store.update_account(account)
         _spawn_bg(_safe_refresh(account))
 

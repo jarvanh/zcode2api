@@ -42,6 +42,11 @@ class Account:
     quota: dict = field(default_factory=dict)
     plan: dict = field(default_factory=dict)        # 当前激活方案（billing/current plans[0]，兼容保留）
     plans: list = field(default_factory=list)       # 全部方案（上游 plans 数组；多套餐时 entitlements 不丢）
+    # 按模型粒度的「无资源包」冷却：{model_key: until_epoch}
+    # 1113 是「账号 + 模型」组合的属性，不是整号故障；冷却到期后由下一次
+    # 请求探测，成功才清除，失败则指数退避延长（资源包补发/续期自动恢复）。
+    model_cooling: dict = field(default_factory=dict)
+    model_fail_count: dict = field(default_factory=dict)
     usage: dict = field(default_factory=dict)       # 近期用量原始数据
 
     use_count: int = 0
@@ -154,13 +159,48 @@ class Account:
         entry = {"ok": bool(ok), "at": time.time(), "detail": str(detail or ("成功" if ok else "失败"))}
         self.recent_results = (self.recent_results + [entry])[-keep:]
 
-    def is_selectable(self, now: float | None = None) -> bool:
+    @staticmethod
+    def model_key(model: str) -> str:
+        """模型冷却键：统一小写，避免 GLM-5.3-Flash / glm-5.3-flash 分家。"""
+        return (model or "").strip().lower()
+
+    def is_model_cooling(self, model: str, now: float | None = None) -> bool:
+        """该账号是否因「该模型无资源包」处于冷却期。"""
+        key = self.model_key(model)
+        if not key:
+            return False
+        until = float(self.model_cooling.get(key) or 0)
+        return until > (now or time.time())
+
+    def cool_model(self, model: str, base: float, cap: float) -> float:
+        """记录一次「该模型无额度」并按指数退避冷却，返回截止 epoch。"""
+        key = self.model_key(model)
+        if not key:
+            return 0.0
+        n = int(self.model_fail_count.get(key) or 0) + 1
+        self.model_fail_count[key] = n
+        seconds = min(float(base) * (2 ** (n - 1)), float(cap)) if base > 0 else float(cap)
+        until = time.time() + max(1.0, seconds)
+        self.model_cooling[key] = until
+        return until
+
+    def clear_model_cooling(self, model: str) -> None:
+        """探测成功：清除该模型的冷却与失败计数。"""
+        key = self.model_key(model)
+        if not key:
+            return
+        self.model_cooling.pop(key, None)
+        self.model_fail_count.pop(key, None)
+
+    def is_selectable(self, now: float | None = None, model: str | None = None) -> bool:
         """是否可被轮询选中。
 
         JWT 失效 / 风控禁用后，若同账号有 API Key，仍可选中并走回退通道；
-        手动 enabled=False 永远不选。
+        手动 enabled=False 永远不选。model 非空时同时检查该模型的冷却。
         """
         if not self.enabled:
+            return False
+        if model and self.is_model_cooling(model, now):
             return False
         if self.status == Status.EXHAUSTED:
             return False
@@ -218,6 +258,8 @@ class Account:
             "quota": self.quota,
             "plan": self.plan,
             "plans": self.plans,
+            "model_cooling": self.model_cooling,
+            "model_fail_count": self.model_fail_count,
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,
