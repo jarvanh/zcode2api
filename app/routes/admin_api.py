@@ -8,7 +8,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, logs, reqlog
+from .. import captcha_ledger, logs, reqlog, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -666,6 +666,12 @@ async def import_accounts(payload: dict = Body(...)):
 
 
 # ── 请求监控 ─────────────────────────────────────────────────────────────────
+@router.get("/usage/summary")
+async def usage_summary():
+    """今日/本周/本月/历史 token 用量汇总（不含探测请求）。"""
+    return usage_stats.summary()
+
+
 @router.get("/monitoring")
 async def monitoring():
     """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""

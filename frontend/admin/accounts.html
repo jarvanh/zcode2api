@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
-  <link href="/static/css/app.css?v={{APP_VERSION}}-4" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}-5" rel="stylesheet">
   <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
 </head>
 <body>
@@ -49,6 +49,12 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:var(--purple)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:var(--purple)">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（可用剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
   </div>
+
+  <div class="section-head">
+    <div class="section-title">使用统计</div>
+    <div class="section-meta" id="usage-range"></div>
+  </div>
+  <div class="usage-grid" id="usage-grid"></div>
 
   <div class="section-head">
     <div class="section-title">账户明细 <span class="section-count-badge" id="tbl-count">0</span></div>
@@ -189,7 +195,7 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
+let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null, _usageTimer=null;
 const refreshing=new Set(), claiming=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
@@ -200,7 +206,9 @@ const NOTCH_COLORS=['var(--notch-1)','var(--notch-2)','var(--notch-3)','var(--no
   const key=await adminKey.get();
   if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
   await load();
+  await loadUsage();
   startPolling();
+  startUsagePolling();
 })();
 
 function startPolling(){
@@ -218,6 +226,35 @@ async function load(silent){
     renderList();
     document.getElementById('last-updated').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){ if(!silent)showToast('加载失败: '+e.message,'error'); }
+}
+
+async function loadUsage(){
+  try{
+    const d=await api('GET','/usage/summary');
+    renderUsage(d);
+  }catch(e){/* 统计失败不影响账号列表 */}
+}
+function renderUsage(d){
+  const el=document.getElementById('usage-grid');
+  if(!el)return;
+  const defs=[['today','今日'],['week','本周'],['month','本月'],['all','历史']];
+  el.innerHTML=defs.map(([k,label])=>{
+    const u=d[k]||{};
+    const req=Number(u.requests)||0;
+    return `<div class="usage-card" title="总 token = 输入 + 输出；不含探测请求">
+      <div class="usage-label">${label}</div>
+      <div class="usage-total">${fmtNum(u.total||0)}</div>
+      <div class="usage-sub">输入 ${fmtNum(u.in||0)} · 输出 ${fmtNum(u.out||0)}</div>
+      <div class="usage-sub">${req.toLocaleString('zh-CN')} 次请求</div>
+    </div>`;
+  }).join('');
+  const r=d.range||{};
+  const meta=document.getElementById('usage-range');
+  if(meta)meta.textContent=r.from?`${r.from} ~ ${r.to} · 不含探测`:'暂无用量记录';
+}
+function startUsagePolling(){
+  if(_usageTimer)clearInterval(_usageTimer);
+  _usageTimer=setInterval(()=>{ if(!document.hidden && !anyModalOpen()) loadUsage(); },60000);
 }
 
 // 全量套餐（上游 plans 数组；旧数据回退单个 plan），entitlements 附带所属套餐信息

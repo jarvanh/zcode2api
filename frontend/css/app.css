@@ -158,6 +158,13 @@ select.input option{background:var(--panel);color:var(--ink)}
 .stat-icon svg{width:15px;height:15px;stroke:currentColor;fill:none}
 .stat-num{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;letter-spacing:-.02em;margin-top:auto}
 
+/* 使用统计卡片 */
+.usage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.usage-card{min-height:104px;padding:14px 16px;border-radius:12px;background:var(--panel);border:1px solid var(--hairline-soft);display:flex;flex-direction:column;gap:6px}
+.usage-label{font-size:11px;color:var(--ink-mute)}
+.usage-total{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1.1;letter-spacing:-.02em;color:var(--ink)}
+.usage-sub{font-size:11px;color:var(--ink-mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
 /* ── 账号池列表（CPA-Manager-Plus 风格 6 列表格：凭证/状态/最近请求/用量/额度/操作）── */
 .acct-scroll{overflow-x:auto}
 .acct-table{display:flex;flex-direction:column;gap:8px;min-width:1020px}
