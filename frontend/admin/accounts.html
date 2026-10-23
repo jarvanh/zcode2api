@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
-  <link href="/static/css/app.css?v={{APP_VERSION}}-3" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}-4" rel="stylesheet">
   <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
 </head>
 <body>
@@ -47,7 +47,7 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">账户总数</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:var(--mint)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:var(--mint)">0</div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:var(--purple)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:var(--purple)">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（可用剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
   </div>
 
   <div class="section-head">
@@ -256,7 +256,11 @@ function renderStats(s){
   const now=Date.now()/1000;
   let totalRem=0;
   allAccounts.forEach(a=>{
-    Object.values(a.quota||{}).forEach(w=>{totalRem+=Number(w.remaining)||0;});
+    Object.values(a.quota||{}).forEach(w=>{
+      const exp=Number(w.expires_at)||0;
+      if(exp>0&&exp<=now)return; // 过期窗口是历史快照，不能算作可用额度
+      totalRem+=Number(w.remaining)||0;
+    });
     allEntitlements(a).forEach(e=>{
       const eff=Number(e.effective_at)||0;
       let ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;
@@ -265,7 +269,7 @@ function renderStats(s){
     });
   });
   set('s-quota',fmtNum(totalRem));
-  document.getElementById('s-quota').title='日窗口余额 + 已生效一次性活动赠送（赠送池按授权量计入，上游不提供实际剩余）';
+  document.getElementById('s-quota').title='仅统计未过期窗口的日余额 + 已生效一次性活动赠送（过期快照不计入；赠送池按授权量计入，上游不提供实际剩余）';
 }
 
 function renderFilters(){
@@ -401,21 +405,22 @@ function rowHtml(a){
 function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
+  const now=Date.now()/1000;
   let rows=keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
-    const color=rem<=0?'var(--ink-mute)':(pct<15?'var(--amber)':'var(--mint)');
     const exp=Number(w.expires_at)||0;
-    return `<div class="quota-row">
+    const expired=exp>0&&exp<=now;
+    const color=expired?'var(--ink-mute)':(rem<=0?'var(--ink-mute)':(pct<15?'var(--amber)':'var(--mint)'));
+    return `<div class="quota-row${expired?' is-expired':''}">
       <span class="quota-row-name" title="${esc(k)}">${esc(shortModel(k))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp" title="本窗口额度到期时间">至 ${fmtDate(exp)}</span>`:''}</span>
+      <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp${expired?' is-expired':''}" title="${expired?'本窗口额度已于 '+fmtDate(exp)+' 到期，剩余数字为过期快照':'本窗口额度到期时间'}">${expired?'已过期 · '+fmtDate(exp):'至 '+fmtDate(exp)}</span>`:''}</span>
     </div>`;
   });
   // 活动额度（plan.entitlements）：
   // ① one_time 已生效 —— billing/balance 不体现这类一次性赠送，单独渲染「活动赠送」行
   // ② 待生效（effective_at 在未来）—— 斜纹流动条，过点自动转正
-  const now=Date.now()/1000;
   const ents=allEntitlements(a);
   ents.filter(e=>{
     const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;
