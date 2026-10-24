@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from . import body_transform, constants, settings
-from .identity import build_identity_headers, build_trace_headers
+from .identity import build_llm_identity_headers, build_trace_headers
 from .models import Account
 
 # 透传客户端 header 时需要剔除的字段
@@ -96,15 +96,15 @@ def build_request(
         raise RuntimeError(f"未知提供商: {provider}")
 
     if provider == "zai" and account.uses_plan_channel() and not force_fallback:
-        # JWT 通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
+        # JWT 通道：LLM 身份头（g6n，无 Device-Mid、UA 带 SDK 后缀）+ 追踪头
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
-        body = body_transform.transform_body(body, user_id, model)
+        body = body_transform.transform_body(body, user_id, model, account=account)
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
-            **build_identity_headers(account),
+            **build_llm_identity_headers(account),
             **build_trace_headers(),
         }
     else:

@@ -103,6 +103,46 @@ def build_identity_headers(account=None) -> dict[str, str]:
     return headers
 
 
+# anthropic SDK 身份合并进 UA（bundle Y2：`ai-sdk/anthropic/3.0.81`，3.16.3
+# bundle gjs 常量实测提取；真实 LLM 请求的 UA 形状）
+ANTHROPIC_SDK_UA = "ai-sdk/anthropic/3.0.81"
+
+
+def build_llm_identity_headers(account=None) -> dict[str, str]:
+    """LLM 请求头（bundle 3.12.3 g6n 源头构造器，与控制面 TV 头集的差异）：
+
+    - 无 X-Device-Mid（LLM 请求从不带）；
+    - X-Os-Category 始终发（CSs 绕过 printable 门）；
+    - 语言/时区始终发，缺失时回退 "unknown"（真实客户端形状）；
+    - X-ZCode-Agent 内联第 8 位（3.12.3 起不再由 x4i 包装器追加在末尾）。
+    字段顺序镜像 g6n：HTTP-Referer, User-Agent, [X-ZCode-App-Version],
+    X-Title, X-Client-Language, X-Client-Timezone, X-ZCode-Agent,
+    [X-Platform], X-Os-Category, [X-Os-Version]。
+    """
+    base = build_identity_headers(account)
+    llm: dict[str, str] = {
+        "HTTP-Referer": base["HTTP-Referer"],
+        "User-Agent": f"{base['User-Agent']} {ANTHROPIC_SDK_UA}",
+    }
+    if "X-ZCode-App-Version" in base:
+        llm["X-ZCode-App-Version"] = base["X-ZCode-App-Version"]
+    llm["X-Title"] = base["X-Title"]
+    llm["X-Client-Language"] = base.get("X-Client-Language", "unknown")
+    llm["X-Client-Timezone"] = base.get("X-Client-Timezone", "unknown")
+    llm["X-ZCode-Agent"] = base["X-ZCode-Agent"]
+    if "X-Platform" in base:
+        llm["X-Platform"] = base["X-Platform"]
+    if "X-Release-Channel" in base:
+        llm["X-Release-Channel"] = base["X-Release-Channel"]
+    # X-Os-Category 始终发（bundle CSs 绕过 printable 门）
+    plat = base.get("X-Platform", "").split("-")[0]
+    llm["X-Os-Category"] = base.get("X-Os-Category") or _os_category(plat or "darwin")
+    if "X-Os-Version" in base:
+        llm["X-Os-Version"] = base["X-Os-Version"]
+    # 无 X-Device-Mid：LLM 请求从不携带（bundle g6n 实证）
+    return llm
+
+
 def build_trace_headers(plan: str = "start-plan") -> dict[str, str]:
     """追踪头：每请求全新 UUID（对齐 zapi upstream.ts buildTraceHeaders）。
 

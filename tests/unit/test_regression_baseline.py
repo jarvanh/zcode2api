@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from app import identity as identity_module
 from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
@@ -213,7 +214,10 @@ class TestBuildRequest:
         # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
         assert headers["X-Title"] == "Z Code@electron"
         assert headers["X-Release-Channel"] == "stable"
-        assert "X-Device-Mid" in headers
+        # LLM 请求不带 X-Device-Mid（bundle g6n 实证，2026-10-24 形状修复）；
+        # UA 带 anthropic SDK 后缀（g6n/Y2 形状）
+        assert "X-Device-Mid" not in headers
+        assert headers["User-Agent"].endswith(identity_module.ANTHROPIC_SDK_UA)
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 
     def test_apikey_routes_to_fallback(self):
