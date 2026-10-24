@@ -9,8 +9,11 @@ assembleSystemMessages，2026-10-24 实弹验证；此前 10-12 起的 405/3012
   块3 全部 dynamic 段 \n\n 连接并带 "\n\n" 前缀（Dynamic Behavior /
       Environment Info（powered-by 行并入本段末行）/ Context
       Management），ephemeral。
-客户端自带 system（customSystemPrompt 语义，子代理形态）：恰好 2 块
-  [cli_prefix, "\n"+custom]，块2 ephemeral；默认链整体被抑制。
+客户端自带 system（customSystemPrompt 语义，子代理形态）：2026-10-24 实弹
+  对照（同号同刻）：官方 2 块形状 [cli_prefix, "\n"+custom] 被 WAF 405，
+  默认 3 块 200 —— 上游形状校验已收紧到只认默认链。修法：custom 本就是
+  官方语义里的 stable 段（bundle Oda cacheHint:"stable"），并入 stable
+  合并块尾部，线缆形状与已验证 200 的默认链同构，仅文本多一段。
 另注入 meta_user context_prefix（currentDate 的 <system-reminder> 首条
 user 消息，官方客户端始终携带）。
 
@@ -98,7 +101,7 @@ def _custom_system_text(system: object) -> str | None:
 
 
 def has_custom_system_prompt(system: object) -> bool:
-    """客户端 system 是否会走 customSystemPrompt（2 块子代理形状）路径。"""
+    """客户端 system 是否携带 customSystemPrompt（现并入 stable 块，不再走独立形状）。"""
     return _custom_system_text(system) is not None
 
 
@@ -136,7 +139,8 @@ def build_start_plan_system(
     provider: str | None = None,
     env: dict | None = None,
 ) -> list[dict]:
-    """镜像官方 assembleSystemMessages 的 3 块（默认）/ 2 块（custom）装配。
+    """镜像官方 assembleSystemMessages 的 3 块默认装配；custom system 并入
+    stable 合并块（2026-10-24 实弹：2 块子代理形状被 WAF 405，见模块头注释）。
 
     env 段值必须与身份头同源（platform/osVersion 与 X-Platform/X-Os-Version
     一致），混合组合是真实客户端不产生的形状。
@@ -145,13 +149,15 @@ def build_start_plan_system(
     if not sec:
         return []
     custom = _custom_system_text(existing_system)
-    if custom is not None:
-        return [
-            {"type": "text", "text": sec["cliPrefix"]},
-            {"type": "text", "text": f"\n{custom}", "cache_control": {"type": "ephemeral"}},
-        ]
     env = env or {}
     stable = "\n\n".join(["\n\n".join(sec["stableSections"]), build_desktop_context_section()])
+    if custom is not None:
+        # 2026-10-24 实弹：官方 2 块子代理形状（custom 独占 stable 块、dynamic 全
+        # 跳过）也被上游 WAF 405 —— 同号同刻对照，默认 3 块 200 / 2 块 custom 405。
+        # 上游校验已收紧到「只认默认链」。custom 在官方 bundle 本就是 stable 段
+        # （Oda cacheHint:"stable"，content="\n"+o），并入 stable 合并块尾部：
+        # 线缆 3 块与已验证 200 的默认形状同构，仅 stable 段文本多一段 custom。
+        stable = "\n\n".join([stable, f"\n{custom}"])
     dynamic = "\n\n".join([
         sec["dynamicSections"]["beforeEnvironment"],
         build_environment_section(env, model, provider),
