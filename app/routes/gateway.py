@@ -1065,6 +1065,21 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                            "type": "no_available_account", "tried": sorted(tried)}},
                 status_code=503,
             )
+        # 2026-10-25 防风控放大器（两账号确认制）：波次暂停期直接快速 503
+        # （不选号不试探；波次首请求最多烧 2 次 strike）。流式请求改 503 会丢
+        # early-flush 的 200 头 —— 仅当尚未收到任何上游流时走到这里，安全。
+        if settings.RISK_FAIL_FAST and _risk_wave_paused(provider):
+            remaining = int((_risk_wave_until_for(provider) or time.time()) - time.time()) + 1
+            logs.warn(req_id, f"风控波次暂停中（剩 ~{remaining}s），快速失败不试探账号（防 strike 放大）")
+            reqlog.finish_error(req_id, "风控波次暂停中", status=503)
+            return JSONResponse(
+                {"error": {
+                    "message": "上游风控波次暂停中（频道级封锁窗口），请稍后重试；窗口由 Plan 通道成功流量自动解除",
+                    "type": "risk_wave_paused",
+                }},
+                status_code=503,
+                headers={"Retry-After": str(max(remaining, 1))},
+            )
         account = store.select(provider, skip_ids=tried, model=model_key)
         if account is None:
             # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
@@ -1143,7 +1158,75 @@ def _park_slot(slot_box: list[str | None] | None) -> None:
     """等待（429/验证码/5xx）前释放并发槽，避免把账号冻住数分钟。"""
     if slot_box and slot_box[0] is not None:
         _release_slot(slot_box[0])
+    if slot_box is not None:
         slot_box[0] = None
+
+
+# ── 风控波次暂停（2026-10-25 防放大器，两账号确认制）────────────────────
+# 上游 405/3012 波次是「频道级」封锁（官方客户端同拦，zai-org/feedback
+# #716/#1185 实证家宽直连也拦）：波次窗口内换号必然同样 405，只会把池内
+# 账号挨个烧 strike（08:41 实测单请求烧 3 号至禁用）。判定：窗口内第 2 个
+# 不同账号也命中风控 → 确认频道级波次，全池短窗暂停（新请求入口快速
+# 503、不排队不试探，暂停指数延长）——波次首请求最多烧 2 次 strike。
+# 单账号命中只冷却自身，不影响其他账号 failover。解除：Plan 通道真实成功
+# 流量（Key 回退成功不算，api.z.ai 通道与被拦的 plan 通道无关）。
+_risk_wave_until: dict[str, float] = {}
+_risk_wave_hit: dict[str, tuple[str, float]] = {}  # provider → (首个命中账号 id, 时刻)
+_WAVE_HIT_TTL = 3600.0  # 命中记忆时效：超时视为全新单点事件，防陈旧记忆误确认波次
+
+
+def _risk_wave_until_for(provider: str) -> float | None:
+    """当前波次暂停截止时刻；未暂停返回 None（测试可注入未来时间戳）。"""
+    until = _risk_wave_until.get(provider)
+    if until is None or until <= time.time():
+        return None
+    return until
+
+
+def _risk_wave_paused(provider: str) -> bool:
+    return _risk_wave_until_for(provider) is not None
+
+
+def _risk_wave_confirm(provider: str, account_id: str) -> bool:
+    """风控命中时累计判定；返回 True 表示本次命中确认了频道级波次。
+
+    首个命中记录 (账号 id, 时刻)；不同账号在记忆时效内再次命中即确认波次，
+    暂停指数延长（2^n × RISK_WAVE_PAUSE，封顶 RISK_WAVE_PAUSE_MAX）。
+    """
+    if settings.RISK_WAVE_PAUSE <= 0:
+        return False
+    now = time.time()
+    first = _risk_wave_hit.get(provider)
+    if first is None or first[0] == account_id or now - first[1] > _WAVE_HIT_TTL:
+        _risk_wave_hit[provider] = (account_id, now)
+        return False
+    # 不同账号也命中 → 波次确认，指数延长
+    level = _risk_wave_level.get(provider, 0) + 1
+    _risk_wave_level[provider] = level
+    pause = min(settings.RISK_WAVE_PAUSE * (2 ** (level - 1)),
+                settings.RISK_WAVE_PAUSE_MAX)
+    new_until = time.time() + pause
+    cur = _risk_wave_until.get(provider)
+    if cur is None or new_until > cur:
+        _risk_wave_until[provider] = new_until
+    return True
+
+
+_risk_wave_level: dict[str, int] = {}
+
+
+def _risk_wave_clear(provider: str) -> None:
+    """Plan 通道真实成功流量到达时解除波次暂停与命中记忆（上游窗口已开）。"""
+    _risk_wave_until.pop(provider, None)
+    _risk_wave_hit.pop(provider, None)
+    _risk_wave_level.pop(provider, None)
+
+
+def _risk_wave_reset_for_tests() -> None:
+    """测试隔离钩子：清空全部波次状态。"""
+    _risk_wave_until.clear()
+    _risk_wave_hit.clear()
+    _risk_wave_level.clear()
 
 
 def _reacquire_slot(account: Account, slot_box: list[str | None] | None) -> bool:
@@ -1225,6 +1308,11 @@ async def _wait_for_account(req_id, provider: str, t0: float,
     # 单账号 429 用例被排队拖成 240s+ 挂死、上游被无谓重打十几次）。
     # 无可恢复账号 → 快速 503，让客户端自行重试。
     if not _has_recoverable_account(provider):
+        return None
+    # 2026-10-25 防风控放大器：波次暂停期是「频道级封锁」窗口，窗口内试探
+    # 必然再吃 405 再烧 strike —— 与 COOLING 同理不排队，快速 503 由客户端
+    # 自行重试（窗口由真实成功流量到期自然解除）。
+    if _risk_wave_paused(provider):
         return None
     remaining = max_wait - queued
     if remaining <= 0:
@@ -1414,7 +1502,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
       - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
         COOLING_SECONDS 并换下一个账号
       - 风控（3012/405「unusual activity」）：指数退避冷却（base 900s 起，封顶
-        24h），累计 RISK_BAN_STRIKES 次升级禁用（UI 展示），人工确认恢复
+        24h），累计 RISK_BAN_STRIKES 次升级禁用（UI 展示），人工确认恢复；
+        窗口内两个不同账号连中即确认频道级波次 → 全池暂停防 strike 放大
+        （2026-10-25，见 _risk_wave_confirm）
     """
     captcha_retries = 0
     retries_429 = 0
@@ -1492,6 +1582,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 penalty_note = _apply_risk_strike(
                     account, f"3012/unusual activity HTTP {status_code}", req_id,
                 )
+                # 2026-10-25 防放大器（两账号确认制）：首个命中只记名；窗口内
+                # 第 2 个不同账号也命中才确认波次。确认后本请求不再换号（下轮
+                # 入口拦截），API Key 回退除外（api.z.ai 通道与被拦的 plan 通道无关）。
+                wave_confirmed = _risk_wave_confirm(account.provider, account.id)
                 if needs_captcha and account.has_apikey_fallback():
                     logs.warn(
                         req_id,
@@ -1500,10 +1594,17 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     needs_captcha = False
                     force_fallback = True
                     continue
-                logs.warn(
-                    req_id,
-                    f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
-                )
+                if wave_confirmed:
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，"
+                        f"确认频道级波次（多账号连中），全池暂停 {settings.RISK_WAVE_PAUSE}s+，本请求不再换号",
+                    )
+                else:
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
+                    )
                 return _NEXT_ACCOUNT
 
             if _is_exhausted(status_code, text):
@@ -1700,6 +1801,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     if code_hit in _RISK_BIZ_CODES:
                         account.record_result(False, f"风控封禁（业务码 {code_hit}）")
                         penalty_note = _apply_risk_strike(account, f"业务码 {code_hit}", req_id)
+                        # 2026-10-25 防放大器：与 HTTP 405 分支同处置（两账号确认制）
+                        wave_confirmed = _risk_wave_confirm(account.provider, account.id)
                         if needs_captcha and account.has_apikey_fallback():
                             logs.warn(
                                 req_id,
@@ -1708,7 +1811,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                             needs_captcha = False
                             force_fallback = True
                             continue
-                        logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，切换下一个")
+                        if wave_confirmed:
+                            logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，确认频道级波次（多账号连中），全池暂停 {settings.RISK_WAVE_PAUSE}s+，本请求不再换号")
+                        else:
+                            logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，切换下一个")
                         return _NEXT_ACCOUNT
                     if code_hit in _QUOTA_BIZ_CODES:
                         account.record_result(False, f"额度用完（业务码 {code_hit}）")
@@ -1760,6 +1866,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                                  output_tokens=sync_usage.get("output_tokens"))
                 record_usage(model_name, sync_usage.get("input_tokens"),
                              sync_usage.get("output_tokens"))
+                # 2026-10-25 防放大器：Plan 通道真实成功 = 上游风控窗口已开，
+                # 解除波次暂停与命中记忆；Key 回退成功不算（api.z.ai 通道与
+                # 被拦的 plan 通道无关，不代表 Plan 线恢复）。同步直通在此收口。
+                if account.uses_plan_channel() and not force_fallback:
+                    _risk_wave_clear(account.provider)
                 return _Resp(content=text, status_code=status_code,
                              media_type=resp.headers.get("content-type") or "application/json")
 
@@ -1781,6 +1892,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         account.clear_model_cooling(str(body.get("model") or ""))
         store.update_account(account)
         _spawn_bg(_safe_refresh(account))
+
+        # 2026-10-25 防放大器：与同步直通出口同语义 —— Plan 通道真实成功才
+        # 解除波次暂停与命中记忆；Key 回退成功不算。
+        if account.uses_plan_channel() and not force_fallback:
+            _risk_wave_clear(account.provider)
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
                          account_name=account.name, mode=account.mode, model=model_name)

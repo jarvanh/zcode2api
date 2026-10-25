@@ -197,8 +197,20 @@ RISK_BAN_STRIKES = _int("ZCODE_RISK_BAN_STRIKES", 4)          # 窗口内累计�
 RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 # 距上次风控命中超过该窗口则 strikes 重新起算：跨月偶发命中不累积成禁用
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
+# 2026-10-25 防风控放大器：上游 405/3012 波次是「频道级」封锁（官方客户端同拦，
+# 社区 zai-org/feedback #716/#1185 实证家宽直连也拦），波次窗口内换号重试必然
+# 同样 405，只会把池内账号挨个烧 strike（08:41 实测：单请求触发 3 号 strikes
+# 4→5 全禁用）。判定制：单账号命中只冷却自身、请求内仍可换号/回退（保留
+# 健康号 failover）；窗口内第 2 个不同账号也命中 → 必然频道级波次，全池短窗
+# 暂停（新请求入口快速 503、不排队不试探，暂停指数延长），波次首请求最多
+# 烧 2 次 strike。请求内 API Key 回退不受影响（api.z.ai 通道与被拦的 plan
+# 通道无关）；Plan 通道真实成功流量解除暂停（Key 回退成功不算）。
+RISK_FAIL_FAST = _bool("ZCODE_RISK_FAIL_FAST", True)       # 防放大器总开关
+RISK_WAVE_PAUSE = _int("ZCODE_RISK_WAVE_PAUSE", 180)       # 波次暂停基础秒数（0 = 关闭）
+RISK_WAVE_PAUSE_MAX = _int("ZCODE_RISK_WAVE_PAUSE_MAX", 3600)  # 暂停指数延长上限
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
+RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍

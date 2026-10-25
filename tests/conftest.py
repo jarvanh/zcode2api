@@ -164,3 +164,17 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
 
 def seed_account(store, secret: str, name: str = "t"):
     return store.add_account("zai", name, secret)
+
+
+@pytest.fixture(autouse=True)
+def _reset_risk_wave_state():
+    """隔离网关模块级风控波次状态（2026-10-25 防放大器）。
+
+    命中记忆跨用例残留会把「单账号首中」误判为「第二账号连中」，
+    导致后续 failover 用例意外吃到全池暂停，必须每用例清零。
+    """
+    from app.routes import gateway as gw
+
+    gw._risk_wave_reset_for_tests()
+    yield
+    gw._risk_wave_reset_for_tests()

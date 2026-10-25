@@ -24,3 +24,4 @@ node_modules/
 # 秘钥 / 凭证导出
 *accounts*.json
 zcode-accounts*.json
+logs/

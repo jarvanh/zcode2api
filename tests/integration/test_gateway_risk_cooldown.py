@@ -6,6 +6,9 @@
   - 3012/405「unusual activity」：指数退避冷却（base 900s × 2^(strikes-1)，封顶 24h）；
     累计 4 次升级为 DISABLED（人工确认恢复），避免持续向上游产生流量
   - 冷却期内零上游流量：monitor 跳过、后台手动路径跳过、验证码池关门
+  - 2026-10-25 防放大器（两账号确认制）：窗口内两个不同账号连中风控 →
+    确认频道级波次，全池暂停（新请求快速 503 不试探、指数延长）；
+    Plan 通道成功解除，API Key 回退成功不算（见 TestRiskWavePause）
 """
 
 from __future__ import annotations
@@ -30,6 +33,133 @@ def _set_cooling(acc, seconds: float = 600.0) -> None:
     """直接置冷却态（5xx 耗尽 / 连接失败走的就是这条路）。"""
     acc.status = Status.COOLING
     acc.cooling_until = time.time() + seconds
+
+
+@pytest.mark.integration
+class TestRiskWavePause:
+    """2026-10-25 防风控放大器（两账号确认制）：
+
+    上游 405 波次是频道级封锁（官方客户端同拦，zai-org/feedback #716/#1185），
+    窗口内换号必然同样 405，只会挨个烧 strike（08:41 实测单请求烧 3 号至禁用）。
+    窗口内两个不同账号连中风控即确认波次 → 全池暂停（新请求快速 503 不试探、
+    指数延长）；单账号命中不牵连池内 failover；Plan 通道成功解除，Key 回退不算。
+    """
+
+    async def test_two_account_risk_confirms_wave_and_fails_fast(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _RISK_JWT, name="w-a")
+        b_jwt = "hWB.eyJzdWIiOiJ3YiJ9.sig"
+        c_jwt = "hWC.eyJzdWIiOiJ3YyJ9.sig"
+        seed_account(fresh_app, b_jwt, name="w-b")
+        seed_account(fresh_app, c_jwt, name="w-c")
+        # 轮转顺序不预设（select 跳号后指向不可控）：三号全命中，断言「烧 2 存 1」
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+        mock.state.sequences[b_jwt[:16]] = ["risk_control_3012"]
+        mock.state.sequences[c_jwt[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert res.json()["error"]["type"] == "risk_wave_paused"
+        accounts = fresh_app.list_accounts("zai")
+        strikes = sorted(x.risk_strikes for x in accounts)
+        assert strikes == [0, 1, 1]  # 波次首请求最多烧 2 次，第 3 号未被试探
+        assert gw._risk_wave_paused("zai") is True
+
+    async def test_wave_pause_blocks_next_request_without_probe(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _RISK_JWT, name="w-a")
+        b_jwt = "hWB.eyJzdWIiOiJ3YiJ9.sig"
+        c_jwt = "hWC.eyJzdWIiOiJ3YyJ9.sig"
+        seed_account(fresh_app, b_jwt, name="w-b")
+        seed_account(fresh_app, c_jwt, name="w-c")
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+        mock.state.sequences[b_jwt[:16]] = ["risk_control_3012"]
+        mock.state.sequences[c_jwt[:16]] = ["risk_control_3012"]
+        first = await client.post("/v1/messages", json=_MSG_BODY)
+        assert first.status_code == 503
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert res.json()["error"]["type"] == "risk_wave_paused"
+        assert len(mock.state.calls) == before  # 暂停期零上游流量
+        assert sum(x.risk_strikes for x in fresh_app.list_accounts("zai")) == 2
+
+    async def test_single_account_risk_keeps_failover_and_no_pause(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _RISK_JWT, name="w-a")
+        seed_account(fresh_app, _GOOD_JWT, name="w-good")
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200  # B 正常接住（既有 failover 语义不变）
+        assert gw._risk_wave_paused("zai") is False  # 单账号命中不牵连池
+
+    async def test_wave_reconfirm_after_expiry_extends_pause(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _RISK_JWT, name="w-a")
+        b_jwt = "hWB.eyJzdWIiOiJ3YiJ9.sig"
+        c_jwt = "hWC.eyJzdWIiOiJ3YyJ9.sig"
+        seed_account(fresh_app, b_jwt, name="w-b")
+        seed_account(fresh_app, c_jwt, name="w-c")
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+        mock.state.sequences[b_jwt[:16]] = ["risk_control_3012"]
+        mock.state.sequences[c_jwt[:16]] = ["risk_control_3012"]
+
+        first = await client.post("/v1/messages", json=_MSG_BODY)  # 首请求两号连中 → level 1
+        assert first.status_code == 503
+        # 模拟暂停到期但命中记忆仍在 → 下一发试探到剩余唯一可选号再连中 → level 2
+        gw._risk_wave_until["zai"] = time.time() - 1
+        second = await client.post("/v1/messages", json=_MSG_BODY)
+        assert second.status_code == 503
+        assert gw._risk_wave_level["zai"] == 2
+        remaining = gw._risk_wave_until_for("zai") - time.time()
+        assert 350 < remaining <= 360  # 180 × 2 指数延长
+        assert sum(x.risk_strikes for x in fresh_app.list_accounts("zai")) == 3  # 每轮试探只烧 1 次
+
+    async def test_plan_success_clears_wave_state(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="w-good")
+        # 预置：暂停已到期 + 命中记忆残留（真实时序：暂停到期后的试探请求）
+        gw._risk_wave_until["zai"] = time.time() - 1
+        gw._risk_wave_hit["zai"] = ("stale-id", time.time() - 30)
+        gw._risk_wave_level["zai"] = 1
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200
+        assert gw._risk_wave_hit.get("zai") is None  # Plan 成功清空命中记忆
+        assert gw._risk_wave_level.get("zai") is None
+
+    async def test_key_fallback_success_does_not_clear_wave_memory(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _RISK_JWT, name="w-key")
+        acc.api_key = "sk-wave-aaaa"  # 纯 ASCII：key 会进 HTTP 头，非 ASCII 会 500
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200  # Key 回退接住
+        hit = gw._risk_wave_hit.get("zai")
+        assert hit is not None and hit[0] == acc.id  # 记忆保留（Key 成功 ≠ Plan 解封）
+        assert gw._risk_wave_paused("zai") is False  # 单账号命中未确认波次
 
 
 @pytest.mark.integration
