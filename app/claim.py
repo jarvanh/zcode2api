@@ -366,6 +366,31 @@ def _claim_outcome(body: dict, plan_id: str, plan_name: str, grants: list) -> di
     }
 
 
+def _clear_cooling_after_claim(account: Account) -> None:
+    """领取成功后清空该账号全部模型级冷却并持久化（2026-10-28 整改）。
+
+    模型级冷却的唯一语义是「该模型无资源包/套餐」（1113/1309/无余额）；领取
+    成功即资源状态整体刷新。冷却若保留（指数退避上限 6h），新包到账后的产能
+    会在 is_selectable(model) 被白挡——夜间领包场景损失小时级可用窗口。清全部
+    而非猜测 plan→model 映射：误清代价只是下一次请求多一次真实探测，远小于
+    误留。只在真实成功（code==0）路径调用；1003 已领取过走失败分支不清，
+    避免「包已耗尽 + 旧冷却」被误洗后空打上游。收尾失败只记日志，不回滚领取。
+    """
+    from .store import store
+
+    try:
+        live = store.find(account.provider, account.id)
+        target = live if live is not None else account
+        if not (target.model_cooling or target.model_fail_count):
+            return
+        target.clear_all_model_cooling()
+        if live is not None:
+            store.update_account(live)
+        logs.ok("claim", f"账号 {account.name} 领取成功，已清空模型级冷却并持久化")
+    except Exception as err:  # noqa: BLE001 - 领取成功语义不受收尾失败影响
+        logs.warn("claim", f"账号 {account.name} 清模型冷却失败（不影响领取结果）: {err}")
+
+
 async def claim_with_captcha(
     account: Account,
     verify_param: str,
@@ -387,7 +412,9 @@ async def claim_with_captcha(
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id or None)
     headers = _claim_headers(account, verify_param.strip(), region)
     body = await _post_claim(account, headers, plan_id)
-    return _claim_outcome(body, plan_id, plan_name, grants)
+    outcome = _claim_outcome(body, plan_id, plan_name, grants)
+    _clear_cooling_after_claim(account)
+    return outcome
 
 
 async def claim(account: Account, plan_id: str | None = None) -> dict:
@@ -414,7 +441,9 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     )
     code = _business_code(body)
     if code == 0:
-        return _claim_outcome(body, plan_id, plan_name, grants)
+        outcome = _claim_outcome(body, plan_id, plan_name, grants)
+        _clear_cooling_after_claim(account)
+        return outcome
     if code == 3007:
         captcha_manager.invalidate()  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)

@@ -196,6 +196,11 @@ class Account:
         self.model_cooling.pop(key, None)
         self.model_fail_count.pop(key, None)
 
+    def clear_all_model_cooling(self) -> None:
+        """清空全部模型级冷却与失败计数（领取成功 = 资源状态整体刷新）。"""
+        self.model_cooling.clear()
+        self.model_fail_count.clear()
+
     def is_selectable(self, now: float | None = None, model: str | None = None) -> bool:
         """是否可被轮询选中。
 
