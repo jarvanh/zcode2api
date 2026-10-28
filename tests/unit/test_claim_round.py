@@ -29,7 +29,7 @@ class _FakeAccount:
         return self._billing
 
 
-def _fake_store(accounts):
+def _fake_store(accounts, *, stagger: int = 0):
     class _FakeStore:
         @staticmethod
         def list_accounts(_provider):
@@ -38,6 +38,10 @@ def _fake_store(accounts):
         @staticmethod
         def find(_provider, aid):
             return next(a for a in accounts if a.id == aid)
+
+        @staticmethod
+        def claim_round_stagger():
+            return stagger
 
     return _FakeStore()
 
@@ -377,3 +381,58 @@ async def test_auto_claim_skip_plan_ids_skips_claim_only(monkeypatch):
     assert claimed == ["p-new"], "退避中的套餐不得打 claim"
     assert [o["plan_id"] for o in outcomes] == ["p-new"]
     assert all(o["ok"] for o in outcomes)
+
+
+@pytest.mark.asyncio
+async def test_round_stagger_delays_between_accounts(monkeypatch):
+    """错峰：stagger>0 时相邻账号间随机延迟；首账号不等；停服可打断等待。"""
+    accounts = [_FakeAccount("a1", billing=True), _FakeAccount("a2", billing=True)]
+    sleeps: list[float] = []
+
+    async def fake_wait_for(fut, timeout):
+        sleeps.append(timeout)
+        fut.close()  # 模拟 TimeoutError 路径（stop 事件未置位）
+        raise TimeoutError()
+
+    import app.claim as claim_module
+
+    async def fake_auto_claim(acc, *, skip_plan_ids=None):
+        return []
+
+    async def fake_refresh(batch):
+        return {"ok": 0, "fail": 0}
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", fake_auto_claim)
+    monkeypatch.setattr("app.quota.refresh_accounts", fake_refresh)
+    monkeypatch.setattr(claim_module.secrets, "randbelow", lambda n: n - 1)
+    monkeypatch.setattr(claim_module.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr("app.store.store", _fake_store(accounts, stagger=90))
+
+    manager = ClaimRoundManager()
+    await manager._round()
+    assert sleeps == [90], "第二个账号前必须等待 0～stagger 的随机延迟"
+    assert claim_module.ClaimRoundManager() is not manager  # sanity: 实例独立
+
+
+@pytest.mark.asyncio
+async def test_round_stagger_zero_keeps_old_behavior(monkeypatch):
+    """stagger=0（默认）：无任何延迟，行为与旧版一致。"""
+    accounts = [_FakeAccount("a1", billing=True), _FakeAccount("a2", billing=True)]
+    visited: list[str] = []
+
+    import app.claim as claim_module
+
+    async def fake_auto_claim(acc, *, skip_plan_ids=None):
+        visited.append(acc.id)
+        return []
+
+    async def fake_refresh(batch):
+        return {"ok": 0, "fail": 0}
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", fake_auto_claim)
+    monkeypatch.setattr("app.quota.refresh_accounts", fake_refresh)
+    monkeypatch.setattr("app.store.store", _fake_store(accounts, stagger=0))
+
+    manager = ClaimRoundManager()
+    await manager._round()
+    assert visited == ["a1", "a2"], "stagger=0 必须逐个连续处理，无延迟"

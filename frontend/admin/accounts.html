@@ -145,6 +145,13 @@
     <div class="dialog-body">
       <div class="dialog-field"><span class="dialog-label">名称</span><input class="input" id="edit-name"></div>
       <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空则不修改"></div>
+      <div class="dialog-field"><span class="dialog-label">出口代理（仅对话上游）</span>
+        <input class="input" id="edit-proxy" placeholder="http(s):// 或 socks5://（留空 = 不修改）">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px;font-size:12px">
+          <input type="checkbox" id="edit-proxy-clear"> 清除代理（恢复直连）
+        </label>
+        <div class="hint">只作用于对话请求出口，额度/领取/验证码仍直连。billing 链路走代理曾被风控拒，勿填同一出口。</div>
+      </div>
     </div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-edit')" class="dialog-btn">取消</button>
@@ -196,7 +203,7 @@
 <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
-let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null, _usageTimer=null;
+let allAccounts=[], curFilter='all', _cb=null, _editId='', _editProxyMasked='', _timer=null, _usageTimer=null;
 const refreshing=new Set(), claiming=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
@@ -376,7 +383,7 @@ function credCell(a){
   const tags=`${tierBadgeHtml(a)}${un}${uid}`;
   // 账号名独占一行：徽章/UID 再长也不会把名字挤成「bi…」
   return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name" title="${esc(a.name)}">${esc(a.name)}</span></div>
-    <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>
+    <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span>${a.proxy?`<span>·</span><span title="出口代理（仅对话上游）">🔗 ${esc(a.proxy)}</span>`:''}</div>
     ${tags?`<div class="acct-tags">${tags}</div>`:''}`;
 }
 
@@ -616,13 +623,21 @@ function openEdit(id){
   _editId=id;
   document.getElementById('edit-name').value=a.name;
   document.getElementById('edit-token').value='';
+  _editProxyMasked=a.proxy||'';
+  document.getElementById('edit-proxy').value=_editProxyMasked;
+  document.getElementById('edit-proxy-clear').checked=false;
   openModal('modal-edit');
 }
 async function doEdit(){
   const name=document.getElementById('edit-name').value.trim();
   const token=document.getElementById('edit-token').value.trim();
+  const proxy=document.getElementById('edit-proxy').value.trim();
+  const proxyClear=document.getElementById('edit-proxy-clear').checked;
+  let proxyPayload={};
+  if(proxyClear) proxyPayload={proxy_url:''};
+  else if(proxy && proxy!==_editProxyMasked) proxyPayload={proxy_url:proxy};
   try{
-    await api('PUT','/accounts/'+_editId,{name,...(token&&{token})});
+    await api('PUT','/accounts/'+_editId,{name,...(token&&{token}),...proxyPayload});
     closeModal('modal-edit');showToast('已保存','success');load();
   }catch(e){showToast('保存失败: '+e.message,'error');}
 }

@@ -98,6 +98,7 @@ class Store:
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
             self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
             self._settings.setdefault("claim_round_interval", str(settings.CLAIM_ROUND_INTERVAL))
+            self._settings.setdefault("claim_round_stagger", str(settings.CLAIM_ROUND_STAGGER))
 
             self._accounts = {p: [] for p in PROVIDERS}
             rows = conn.execute(
@@ -187,6 +188,13 @@ class Store:
             return max(0, int(self.get_setting("claim_round_interval", settings.CLAIM_ROUND_INTERVAL)))
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
+
+    def claim_round_stagger(self) -> int:
+        """领取轮账号错峰上限秒数（0 = 关闭）。运行时可改（meta 表），下一轮生效。"""
+        try:
+            return max(0, int(self.get_setting("claim_round_stagger", settings.CLAIM_ROUND_STAGGER)))
+        except (TypeError, ValueError):
+            return settings.CLAIM_ROUND_STAGGER
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:

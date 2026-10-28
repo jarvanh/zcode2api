@@ -4,6 +4,7 @@ httpx>=0.27.0
 python-dotenv>=1.0.1
 cryptography>=42.0.0
 pyyaml>=6.0.0
+socksio>=1.0.0              # httpx socks5:// 代理支持（账号级出口代理）
 
 # dev / test（M0 起即要求全量安装，CI 同）
 pytest>=8.0.0

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import secrets
 import time
 
 import httpx
@@ -429,6 +430,8 @@ class ClaimRoundManager:
     （省 captcha 求解与上游写流量），preview 照常保留新套餐发现
     （docs/development/05「按服务端 next window 退避」语义落地）。
     轮间隔运行期读 meta 设置（0 = 关闭，仍周期回看便于随时启用）；
+    轮内相邻账号间可加 0～stagger 秒随机延迟（claim_round_stagger，打散
+    「同轮全池同拍打上游 billing」的行为聚类；0 = 关闭，首个账号不等）。
     单账号异常不中断整轮，后台任务异常全部自兜。
     """
 
@@ -443,6 +446,8 @@ class ClaimRoundManager:
         self._claim_holds: dict[str, dict[str, int]] = {}
         # 无可服务账号的告警只在状态变化时发（持续故障期不逐轮刷屏）
         self._empty_warned = False
+        # 错峰标记：本轮已处理过至少一个账号（首个账号不等，只错峰后续）
+        self._round_visited = False
 
     async def _round(self) -> None:
         from .quota import refresh_accounts
@@ -459,6 +464,8 @@ class ClaimRoundManager:
             return
         self._empty_warned = False
         now_ms = time.time() * 1000
+        # 错峰标记按轮重置：每轮首个账号不等，只错峰后续相邻账号
+        self._round_visited = False
         # 退避表先清过期项（next_at 已过的恢复本轮重试）
         holds = {
             aid: {pid: at for pid, at in pl.items() if at > now_ms}
@@ -466,7 +473,17 @@ class ClaimRoundManager:
         }
         self._claim_holds = holds
         claimed = 0
+        stagger = store.claim_round_stagger()  # 轮内相邻账号错峰上限（秒）
         for acc in accounts:
+            if self._round_visited and stagger > 0:
+                delay = secrets.randbelow(stagger + 1)  # 0～stagger 均匀分布，含端点
+                logs.info("claim", f"账号错峰等待 {delay}s 后处理 {acc.name}")
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                    return  # 等待期间收到停服信号，直接收尾
+                except TimeoutError:
+                    pass  # 正常路径：延迟到点，继续处理本账号
+            self._round_visited = True
             acc_holds = holds.get(acc.id, {})
             if acc_holds:
                 soon = max(0, (min(acc_holds.values()) - now_ms) / 1000)

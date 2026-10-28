@@ -220,6 +220,12 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 仅入池/手动触发。运行期可在后台设置改（meta 表即时生效）
 CLAIM_ROUND_INTERVAL = _int("ZCODE_CLAIM_ROUND_INTERVAL", 3600)
 
+# 领取轮账号错峰上限（秒）：轮内相邻账号间 0～该值的随机延迟，打散「同轮
+# 全池同拍打上游 billing」的请求簇（行为聚类是风控信号之一；zcode-proxy
+# 的「账号间防风控延迟」同思路）。0 = 关闭（默认，保持旧行为）。运行期
+# 可在后台设置改（meta 表即时生效，下一轮生效）。
+CLAIM_ROUND_STAGGER = _int("ZCODE_CLAIM_ROUND_STAGGER", 0)
+
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖
 UPSTREAM = {
@@ -238,7 +244,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.6.10"
+APP_VERSION = "2.7.0"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

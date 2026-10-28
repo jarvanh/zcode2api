@@ -22,7 +22,7 @@ from ..claim import (
     report_activation_events,
 )
 from ..claim import claim as do_claim
-from ..models import PROVIDERS, Status
+from ..models import PROVIDERS, Account, Status
 from ..oauth import ZaiAuthFlow, parse_userinfo
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
@@ -151,6 +151,12 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             acc.jwt_token = None
         acc.status = Status.ACTIVE
         acc.last_error = None
+    if "proxy_url" in payload:
+        # 账号级出口代理（空串 = 清除恢复直连）；非法协议在写入口拒绝，不落库
+        try:
+            acc.proxy_url = Account.normalize_proxy(payload.get("proxy_url"))
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from None
     store.update_account(acc)
     return {"ok": True}
 
@@ -603,6 +609,7 @@ async def get_settings():
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
+        "claim_round_stagger": store.claim_round_stagger(),
     }
 
 
@@ -643,6 +650,12 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "自动领取轮间隔必须是非负整数（0 = 关闭）") from None
         store.set_setting("claim_round_interval", str(interval))
+    if "claim_round_stagger" in payload:
+        try:
+            stagger = max(0, int(payload["claim_round_stagger"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "领取错峰间隔必须是非负整数（0 = 关闭）") from None
+        store.set_setting("claim_round_stagger", str(stagger))
     return {"ok": True}
 
 

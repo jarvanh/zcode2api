@@ -800,7 +800,9 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
         body = {**payload, "model": model_name}
         url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         headers = {"Authorization": f"Bearer {account.api_key}", "Content-Type": "application/json"}
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        # 账号级出口代理：proxy_kwargs() 未配置时返回 {}，行为与直连一致
+        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+                                   **account.proxy_kwargs())
         try:
             if stream:
                 req = client.build_request("POST", url, headers=headers, json=body)
@@ -1540,7 +1542,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        # 账号级出口代理（zai 主链路 + fallback 同 client）：未配置 = 直连不变。
+        # billing/claim/验证码不在此列（刻意直连，见 claim._billing_request）。
+        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+                                   **account.proxy_kwargs())
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()

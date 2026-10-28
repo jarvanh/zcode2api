@@ -65,6 +65,10 @@ class Account:
     # 安装身份：入池分配的稳定安装令牌（hub 内部，跨账号不重复，导出时剥离）
     install_id: str | None = None
     installed_at: float | None = None  # 按账号安装序完成时间；None = 未安装
+    # 账号级出口代理：仅作用于 chat 网关上游（每请求新建 client 时注入）。
+    # billing/claim/额度/验证码链路刻意直连（见 claim._billing_request 注释），
+    # 不得引用。None = 直连；socks5 需 socksio（requirements 已含）。
+    proxy_url: str | None = None
 
     @staticmethod
     def create(provider: str, name: str, secret: str) -> Account:
@@ -226,6 +230,46 @@ class Account:
         known = {f for f in Account.__dataclass_fields__}  # type: ignore[attr-defined]
         return Account(**{k: v for k, v in data.items() if k in known})
 
+    @staticmethod
+    def normalize_proxy(url: str | None) -> str | None:
+        """规整账号级代理 URL（后台写入口校验）：空白 → None，非法协议抛 ValueError。"""
+        text = (url or "").strip()
+        if not text:
+            return None
+        scheme = text.split("://", 1)[0].lower()
+        if scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"不支持的代理协议: {scheme or '(缺协议)'}（支持 http/https/socks5）")
+        return text
+
+    def proxy_kwargs(self) -> dict:
+        """httpx.AsyncClient 出口代理参数；未配置/非法配置均返回 {}（直连兜底）。
+
+        写入口已校验协议，此处仅防御历史脏数据，绝不抛异常（网关热路径）。
+        """
+        text = (self.proxy_url or "").strip()
+        if not text:
+            return {}
+        scheme = text.split("://", 1)[0].lower()
+        if scheme in ("http", "https", "socks5", "socks5h"):
+            return {"proxy": text}
+        return {}
+
+    def proxy_view(self) -> str | None:
+        """代理的对外形态（前端展示）：剥离 userinfo 凭据（user:pass@ → user:***@）。"""
+        text = (self.proxy_url or "").strip()
+        if not text:
+            return None
+        if "://" in text:
+            scheme, rest = text.split("://", 1)
+        else:
+            scheme, rest = "", text
+        if "@" in rest:
+            cred, _, host = rest.rpartition("@")
+            user = cred.split(":", 1)[0]
+            prefix = f"{scheme}://" if scheme else ""
+            return f"{prefix}{user}:***@{host}"
+        return text
+
     def fingerprint_view(self) -> dict | None:
         """指纹的对外形态（dict）；未分配/半初始化返回 None。"""
         from .fingerprint import DeviceProfile
@@ -253,6 +297,7 @@ class Account:
             "provider": self.provider,
             "mode": self.mode,
             "token_masked": masked,
+            "proxy": self.proxy_view(),
             "enabled": self.enabled,
             "status": self.effective_status(),
             "quota": self.quota,
