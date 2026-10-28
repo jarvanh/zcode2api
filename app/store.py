@@ -304,6 +304,23 @@ class Store:
             self._rotation[provider] = (idx + 1) % len(pool)
             return account
 
+    def next_model_uncooldown_at(self, provider: str, model: str) -> float | None:
+        """池内该模型最早解除冷却的 epoch；无任何模型级冷却时返回 None。
+
+        用于把「全部账号都因缺资源包而不可承接」的可预期等待，换算成准确的
+        Retry-After 时刻（2026-10-28 报错语义整改）。
+        """
+        key = Account.model_key(model)
+        if not key:
+            return None
+        now = time.time()
+        soonest: float | None = None
+        for acc in self.list_accounts(provider):
+            until = float(acc.model_cooling.get(key) or 0)
+            if until > now and (soonest is None or until < soonest):
+                soonest = until
+        return soonest
+
     # ── 导入 / 导出 ─────────────────────────────────────────────────────────
     def export(self) -> dict:
         with self._lock:

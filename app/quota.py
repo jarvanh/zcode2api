@@ -285,3 +285,102 @@ class QuotaMonitor:
 
 
 monitor = QuotaMonitor()
+
+
+class ModelProbeMonitor:
+    """定时探测「模型级冷却中」的账号模型（2026-10-28 领包回血探测轮）。
+
+    背景：模型冷却指数退避上限 6h，语义是「该模型无资源包/套餐」；资源包
+    不定期到账，若只能等下一次真实请求才探测，新包产能会被白挡数小时。
+    本轮定期挑一个可探测组合发最小真实请求，成功即清该账号该模型冷却
+    （与请求路径的 clear_model_cooling 同语义）；失败仅记录，不重置退避。
+    节流：每轮最多 1 个探测，且仅当冷却剩余 < probe_window 秒时才打上游
+    ——冷却刚建立（还剩几小时）时不浪费上游写流量，冷却接近尾段时
+    主动把「也许已回血」变成确定态。interval=0 关闭。
+    """
+
+    PROBE_MAX_TOKENS = 8
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    def _probe_window(self) -> int:
+        return min(120, max(30, settings.MODEL_PROBE_INTERVAL))
+
+    async def _probe_one(self, acc, model: str) -> bool:
+        from .store import store
+
+        url = f"{constants.BIGMODEL_ORIGIN}/api/paas/v4/chat/completions"
+        headers = {"Authorization": f"Bearer {acc.api_key}", "Content-Type": "application/json"}
+        body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": self.PROBE_MAX_TOKENS, "stream": False}
+        try:
+            async with httpx.AsyncClient(timeout=30, **acc.proxy_kwargs()) as client:
+                resp = await client.post(url, headers=headers, json=body)
+        except httpx.HTTPError as err:
+            logs.warn("probe", f"账号 {acc.name} 探测 {model} 连接失败（保持冷却）: {err}")
+            return False
+        if resp.status_code == 200:
+            acc.clear_model_cooling(model)
+            store.update_account(acc)
+            logs.ok("probe", f"账号 {acc.name} 探测 {model} 200 —— 包已到账，冷却已清")
+            return True
+        if resp.status_code == 429 and ("1113" in resp.text or "insufficient balance" in resp.text.lower()):
+            logs.info("probe", f"账号 {acc.name} 探测 {model} 仍无资源包（保持冷却）")
+            return False
+        logs.info("probe", f"账号 {acc.name} 探测 {model} HTTP {resp.status_code}（保持冷却，不打扰退避）")
+        return False
+
+    async def _round(self) -> int:
+        from .store import store
+
+        now = time.time()
+        window = self._probe_window()
+        candidates = []
+        for acc in store.list_accounts("bigmodel"):
+            if not acc.enabled or not (acc.api_key or "").strip() or acc.is_cooling():
+                continue  # 整号冷却/停用/无 Key 不探测（is_cooling 全通道门禁不变量）
+            for model, until in (acc.model_cooling or {}).items():
+                if until > now and (until - now) <= window:
+                    candidates.append((until, acc, model))
+        if not candidates:
+            return 0
+        candidates.sort()  # 最早到期的先探
+        _, acc, model = candidates[0]
+        return 1 if await self._probe_one(acc, model) else 0
+
+    async def _loop(self) -> None:
+        from .store import store
+
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=30)
+            return
+        except TimeoutError:
+            pass
+        while not self._stop.is_set():
+            interval = settings.MODEL_PROBE_INTERVAL  # 运行期读环境快照；改后重启生效
+            if interval > 0:
+                try:
+                    await self._round()
+                except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
+                    logs.err("probe", f"探测轮异常: {err}")
+            wait = interval if interval > 0 else 60
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+            except TimeoutError:
+                continue
+
+    def start(self) -> None:
+        if self._task is None:
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+
+
+model_probe = ModelProbeMonitor()

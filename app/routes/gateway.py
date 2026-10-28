@@ -768,6 +768,30 @@ async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str
         await up.close()
 
 
+def _no_quota_response(req_id: str, model: str, message: str, wait: float | None) -> JSONResponse:
+    """按模型冷却给出可预期等待时，用 429 + Retry-After 表达（2026-10-28 语义整改）。
+
+    503 不带 Retry-After 会被上游网关（OmniRoute）当「服务坏了」计入 node 级
+    熔断失败并激进重试，造成同节点健康模型连坐；429 + Retry-After 则进入其
+    useUpstreamRetryHints 定向退避，等到期再试，包到账即产能。无冷却信息
+    （纯无号/并发满/队列超时）仍回 503 no_available_account，语义不变。
+    """
+    if wait and wait > time.time():
+        retry_after = max(1, int(wait - time.time() + 0.999))
+        return JSONResponse(
+            {"error": {"message": message, "type": "model_no_quota",
+                       "code": "no_quota_for_model", "model": model,
+                       "next_available_at": round(wait)},
+             "retry_after": retry_after},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    return JSONResponse(
+        {"error": {"message": message, "type": "no_available_account"}},
+        status_code=503,
+    )
+
+
 async def _bigmodel_openai_chat(payload: dict, requested_model: str):
     """bigmodel 资源包模型的 OpenAI 直通路径。
 
@@ -862,9 +886,10 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
         reqlog.finish_error(req_id, last_error, status=resp.status_code)
         return JSONResponse({"error": {"message": last_error, "type": "upstream_error"}},
                             status_code=resp.status_code)
-    reqlog.finish_error(req_id, last_error or "所有 bigmodel 账号均不可用", status=503)
-    return JSONResponse({"error": {"message": last_error or "所有 bigmodel 账号均不可用",
-                                   "type": "no_available_account"}}, status_code=503)
+    wait = store.next_model_uncooldown_at("bigmodel", model_name)
+    reqlog.finish_error(req_id, last_error or "所有 bigmodel 账号均不可用",
+                        status=429 if wait else 503)
+    return _no_quota_response(req_id, model_name, last_error or "所有 bigmodel 账号均不可用", wait)
 
 
 @router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
@@ -1130,9 +1155,23 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
 
     if queued:
         logs.req_err(req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队等待 {queued:.0f}s）")
+        wait = store.next_model_uncooldown_at(provider, model_key)
         reqlog.finish_error(
-            req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）", status=503,
+            req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）",
+            status=429 if wait else 503,
         )
+        if wait and wait > time.time():
+            retry_after = max(1, int(wait - time.time() + 0.999))
+            return JSONResponse(
+                {"error": {
+                    "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
+                    "type": "model_no_quota", "code": "no_quota_for_model",
+                    "model": model_key, "queued_seconds": round(queued),
+                    "next_available_at": round(wait),
+                 }, "retry_after": retry_after},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
         return JSONResponse(
             {"error": {
                 "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
@@ -1141,7 +1180,19 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             status_code=503,
         )
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
-    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
+    wait = store.next_model_uncooldown_at(provider, model_key)
+    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=429 if wait else 503)
+    if wait and wait > time.time():
+        retry_after = max(1, int(wait - time.time() + 0.999))
+        return JSONResponse(
+            {"error": {
+                "message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态",
+                "type": "model_no_quota", "code": "no_quota_for_model",
+                "model": model_key, "next_available_at": round(wait),
+             }, "retry_after": retry_after},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
     return JSONResponse(
         {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,

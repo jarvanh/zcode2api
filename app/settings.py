@@ -188,6 +188,10 @@ COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 # 不能整号禁用；冷却到期后由下一次请求探测，成功才恢复（指数退避封顶）。
 MODEL_NO_QUOTA_COOLDOWN_BASE = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_BASE", 1800)  # 30m
 MODEL_NO_QUOTA_COOLDOWN_MAX = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_MAX", 21600)   # 6h
+# 领包回血探测轮（2026-10-28）：定时探测「模型级冷却中」的账号模型，包到账即
+# 消冷却恢复产能（不定期到账下，等下一次真实请求才探测会白摆数小时产能）。
+# 0 = 关闭；默认 600s。探测成功只清该账号该模型冷却，失败不打扰冷却退避。
+MODEL_PROBE_INTERVAL = _int("ZCODE_MODEL_PROBE_INTERVAL", 600)
 # 风控（3012/405「unusual activity」）指数退避冷却：实测为频道级瞬时频控
 #（同号同刻 billing 正常、数小时自愈），冷却自动恢复；累计 RISK_BAN_STRIKES
 # 次才升级为禁用（人工恢复）。冷却期零上游流量（is_cooling 全通道门禁）。

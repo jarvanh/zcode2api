@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from . import logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
-from .quota import monitor
+from .quota import model_probe, monitor
 from .routes import admin_api, gateway, pages
 
 # 修正 Windows 中文控制台可能出现的乱码
@@ -112,6 +112,7 @@ async def lifespan(app: FastAPI):
     if installed:
         logs.ok("install", f"存量账号补配安装身份 ×{installed}")
     monitor.start()
+    model_probe.start()       # 模型冷却探测轮（领包回血，0 = 关闭）
     captcha_manager.start()   # 验证码预解池后台补充
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
     _run_install_sequence_on_start()
@@ -125,6 +126,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await monitor.stop()
+        await model_probe.stop()
         await claim_round.stop()
         await captcha_manager.close()
 
