@@ -259,7 +259,7 @@ def _quota_windows_live(account, now: float) -> bool:
 
 
 def _has_recoverable_account(provider: str, now: float | None = None) -> bool:
-    """池内是否存在「额度耗尽、预期分钟级自动恢复」的账号 —— 排队只对它有意义。
+    """池内是否存在「预期自动恢复、排队等待划算」的账号。
 
     EXHAUSTED 且额度窗口未到期：额度分钟级滚动恢复，排队等待划算。
     EXHAUSTED 但窗口已过期：不会自动重置，排队只会把连接吊到 CDN 边缘
@@ -271,11 +271,23 @@ def _has_recoverable_account(provider: str, now: float | None = None) -> bool:
     秒级内也不会好转，同理不排队。
     （2026-10-07 实测：对这两类排队会把单账号 429 用例拖成 240s+ 挂死、
     上游被无谓重打十几次。）
+    ACTIVE 但并发占满：槽位随在途流结束必然释放（秒级到分钟级），且排队
+    轮询只做本地选号（满号被 skip，不进 _try_account、不重带重试梯），
+    对上游零压力 —— 排队等槽远优于秒回 503（2026-10-30 实测：openclaw
+    多会话把全部 ACTIVE 号打满，原逻辑直接 503，被 OmniRoute 一次 503
+    锁模型 12min，放大成持续故障）。
     """
     now = now if now is not None else time.time()
-    return any(
+    if any(
         a.enabled and a.status == Status.EXHAUSTED
         and _quota_windows_live(a, now)
+        for a in store.list_accounts(provider)
+    ):
+        return True
+    limit = _limit()
+    return limit > 0 and any(
+        a.enabled and a.status == Status.ACTIVE
+        and _inflight.get(a.id, 0) >= limit
         for a in store.list_accounts(provider)
     )
 
@@ -1455,10 +1467,11 @@ async def _wait_for_account(req_id, provider: str, t0: float,
     if not store.list_accounts(provider):
         return None
     # 排队只对「预期自动恢复」的故障有意义：EXHAUSTED 额度分钟级滚动恢复、
-    # COOLING 到期自动回轮询。429/5xx 刚失败而仍 ACTIVE 的号秒级内不会好转
-    # —— 对它们排队只会反复重打同一账号（每轮重带满额重试梯），放大上游
-    # 压力并把 TTFB 拖过 CDN 边缘 ~100s 硬超时（HTTP 524；2026-10-07 实测
-    # 单账号 429 用例被排队拖成 240s+ 挂死、上游被无谓重打十几次）。
+    # ACTIVE 满号等在途流释放槽位（轮询仅本地选号，零上游压力）。
+    # 429/5xx 刚失败而仍 ACTIVE 的号秒级内不会好转——对它们排队只会反复
+    # 重打同一账号（每轮重带满额重试梯），放大上游压力并把 TTFB 拖过 CDN
+    # 边缘 ~100s 硬超时（HTTP 524；2026-10-07 实测单账号 429 用例被排队
+    # 拖成 240s+ 挂死、上游被无谓重打十几次）。
     # 无可恢复账号 → 快速 503，让客户端自行重试。
     if not _has_recoverable_account(provider):
         return None

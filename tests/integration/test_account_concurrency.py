@@ -42,7 +42,11 @@ class TestAccountConcurrency:
         mock.state.conc_max = {}
 
     async def test_single_account_limits_to_two(self, gateway_client, fresh_app):
-        """单账号 4 并发：恰 2 成功，其余 503；单号 max_concurrent ≤ 2。"""
+        """单账号 4 并发：全部成功（超限者排队等槽释放）；单号 max_concurrent ≤ 2。
+
+        2026-10-30 起满号不再秒回 503：排队轮询只做本地选号，等在途流
+        释放槽位（bounded by QUEUE_WAIT_SYNC）。
+        """
         client, mock = gateway_client
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc")
 
@@ -50,7 +54,7 @@ class TestAccountConcurrency:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
                      for _ in range(4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 200, 503, 503]
+        assert statuses == [200, 200, 200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
     async def test_two_accounts_all_succeed(self, gateway_client, fresh_app):
@@ -93,7 +97,7 @@ class TestAccountConcurrency:
         assert _per_key_max(mock, acc.jwt_token[:16]) > 2
 
     async def test_runtime_setting_changes_limit(self, gateway_client, fresh_app):
-        """后台改 limit=1 即生效：第 3 个并发请求被拒（单号 4 并发只成 1）。"""
+        """后台改 limit=1 即生效：单号同时刻在飞 ≤ 1（超限者排队而非 503）。"""
         client, mock = gateway_client
         fresh_app.set_setting("account_concurrency", "1")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-one")
@@ -102,7 +106,7 @@ class TestAccountConcurrency:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
                      for _ in range(2)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 503]
+        assert statuses == [200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
 
     def test_env_default_is_two(self):
