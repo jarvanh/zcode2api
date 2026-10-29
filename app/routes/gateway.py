@@ -1722,7 +1722,18 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     or account.has_lane_cooling()):
                 store.update_account(account)
             else:
-                _mark(account, Status.COOLING, f"连接失败: {err}")
+                # 连接失败与上游风控分开计数（2026-10-30）：请求未达上游、零风控
+                # 代价，走独立 net_strikes 短退避（base×2 递进、cap 封顶），不进
+                # risk_strikes/lane 冷却——死节点不再把账号烧向风控禁用。
+                until = account.net_fail_penalty(
+                    settings.NET_COOLING_BASE, settings.NET_COOLING_CAP,
+                    settings.RISK_STRIKE_DECAY_SECONDS)
+                account.status = Status.COOLING
+                account.cooling_until = until
+                account.last_error = (
+                    f"连接失败（第 {account.net_strikes} 次，冷却至 "
+                    f"{time.strftime('%H:%M', time.localtime(until))}）: {err}")
+                store.update_account(account)
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
             return _NEXT_ACCOUNT
 
@@ -2036,6 +2047,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account.risk_strikes = 0
                     account.last_risk_at = None
                     account.rate_strikes = 0
+                    account.net_strikes = 0
+                    account.net_last_at = None
                     account.last_error = None
                     account.cooling_until = None
                     if account.status in (Status.COOLING, Status.EXHAUSTED):
@@ -2076,6 +2089,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             account.risk_strikes = 0
             account.last_risk_at = None
             account.rate_strikes = 0
+            account.net_strikes = 0
+            account.net_last_at = None
             account.last_error = None
             account.cooling_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):

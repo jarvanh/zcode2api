@@ -182,8 +182,13 @@ EARLY_FLUSH_BEAT = _int("ZCODE_EARLY_FLUSH_BEAT", 15)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
-# 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
+# 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# 连接失败（网络层）独立退避（2026-10-30，与上游风控分开计数）：请求未达上游、
+# 零风控代价，故起步短、快速恢复；×2 递进仅针对持续失联的坏节点（cap 封顶），
+# 不再共用 COOLING_SECONDS 的 300s 整号一刀切。
+NET_COOLING_BASE = _int("ZCODE_NET_COOLING_BASE", 60)
+NET_COOLING_CAP = _int("ZCODE_NET_COOLING_CAP", 600)
 # 1113「无余额/无资源包」按模型冷却：同一账号可能只缺某个模型的包，
 # 不能整号禁用；冷却到期后由下一次请求探测，成功才恢复（指数退避封顶）。
 MODEL_NO_QUOTA_COOLDOWN_BASE = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_BASE", 1800)  # 30m

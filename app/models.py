@@ -74,6 +74,12 @@ class Account:
     rotate_count: int = 0
     last_rotate_at: float | None = None
     rate_strikes: int = 0  # 连续 429 重试梯耗尽次数（自动熔断）；成功即清零
+    # ── 连接失败独立计数（2026-10-30，与上游风控分开）──
+    # 网络层失败发生在本地/出口链路，请求未达上游、对风控评分零影响，故
+    # 不进 risk_strikes/lane 冷却（那会像旧版那样被死节点烧到禁用）；走
+    # 独立短退避（见 net_fail_penalty），成功即清零。
+    net_strikes: int = 0
+    net_last_at: float | None = None  # 最近一次连接失败 epoch（衰减窗口基准）
     recent_results: list = field(default_factory=list)  # 最近请求结果 tick（True 成功/False 失败），最新在末尾
     last_used_at: float | None = None
     last_checked_at: float | None = None
@@ -253,6 +259,24 @@ class Account:
             "banned": banned,
             "all_blocked": self.lanes_all_blocked(now),
         }
+
+    def net_fail_penalty(self, base: float, cap: float,
+                         decay_seconds: float) -> float:
+        """连接失败（网络层）独立退避：返回 cooling_until epoch。
+
+        与 risk_lane_penalty 平行但完全独立：只动 net_strikes/net_last_at，
+        不碰 risk_strikes/lane 冷却/状态位（置 COOLING 与 cooling_until 由
+        调用方负责）。失败发生在本地/出口链路、请求未达上游，零风控代价，
+        故起步短（base）、×2 递进只针对持续失联的坏节点（cap 封顶）——节点
+        被 watchdog 自愈或瞬时抖动过去后快速回池；衰减窗口内无新失败则
+        重新起算。
+        """
+        now = time.time()
+        if self.net_last_at and now - self.net_last_at > decay_seconds:
+            self.net_strikes = 0
+        self.net_strikes += 1
+        self.net_last_at = now
+        return now + max(1.0, min(base * (2 ** (self.net_strikes - 1)), cap))
 
     def lanes_all_blocked(self, now: float | None = None) -> bool:
         """该号全部可用服务通道是否都在风控冷却中。
@@ -583,6 +607,8 @@ class Account:
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,
             "rate_strikes": self.rate_strikes,
+            "net_strikes": self.net_strikes,
+            "net_last_at": self.net_last_at,
             "recent_results": self.recent_results,
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
