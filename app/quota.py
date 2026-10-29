@@ -384,3 +384,128 @@ class ModelProbeMonitor:
 
 
 model_probe = ModelProbeMonitor()
+
+
+class RiskLaneProbeMonitor:
+    """plan-lane 风控冷却探测轮（2026-10-29 lane-scoped 配套，修 P5）。
+
+    lane 长冷（累计 4 次 → 6h）若只等到期，恢复带宽被压到最差；本轮在冷却
+    尾段主动发一个最小 messages 请求验证 plan 通道是否已解封——3012 封锁与
+    grant/billing 无关，billing 200 证明不了对话腿恢复，必须用对话请求本身
+    验证。成功即清该 lane；失败不追加惩罚、不清退避（探测流量不得延长封锁）。
+
+    节流（抄 ModelProbeMonitor 形状）：每轮最多 1 个探测；仅探剩余
+    < probe_window 的 lane（刚建立的冷却不浪费上游写流量）；只探 plan 腿；
+    跳过人工停用/失效账号。RISK_LANE_PROBE=False 或 MODEL_PROBE_INTERVAL=0
+    关闭。探测轮是「冷却期零上游流量」不变量的唯一例外（仅限本 lane 尾段）。
+    """
+
+    PROBE_MAX_TOKENS = 8
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    def _probe_window(self) -> int:
+        return min(300, max(30, settings.MODEL_PROBE_INTERVAL // 2))
+
+    @staticmethod
+    def _risk_signal(status_code: int, text: str) -> bool:
+        """复刻 gateway._is_risk_control 判定（不 import 防循环依赖）。"""
+        if status_code in constants.RISK_CONTROL_HTTP_STATUSES:
+            return True
+        return any(marker in text for marker in constants.RISK_CONTROL_MARKERS)
+
+    async def _probe_one(self, acc: Account, lane: str) -> bool:
+        from .agent import build_request
+        from .captcha import captcha_manager
+
+        model = lane.split(":", 1)[1]
+        body = {"model": model or "GLM-5.2", "stream": False,
+                "max_tokens": self.PROBE_MAX_TOKENS,
+                "messages": [{"role": "user", "content": "hi"}]}
+        try:
+            verify_param, _ = await captcha_manager.get_verify_param(settings.PORT)
+        except Exception:  # noqa: BLE001 - 验证码池不可用不阻塞探测
+            verify_param = None
+        try:
+            url, headers, payload = build_request(acc, body, verify_param, force_plan=True)
+        except Exception as err:  # noqa: BLE001
+            logs.warn("risk-probe", f"账号 {acc.name} 构建 plan 探测请求失败: {err}")
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30, **acc.proxy_kwargs()) as client:
+                resp = await client.post(url, headers=headers, content=payload)
+        except httpx.HTTPError as err:
+            logs.info("risk-probe", f"账号 {acc.name} plan 探测连接失败（保持冷却）: {err}")
+            return False
+        text = resp.text or ""
+        if resp.status_code == 200 and not self._risk_signal(resp.status_code, text):
+            was_downgrade = (acc.status == Status.COOLING
+                             and (acc.last_error or "").startswith("命中风控"))
+            acc.clear_lane_cooling(lane)
+            if was_downgrade and acc.worst_lane_until() is None:
+                # 整号 COOLING 若是全腿封锁的退化形态（「命中风控」可证），lane
+                # 全清后恢复 ACTIVE；真 5xx 冷却（last_error 不同形）不动。
+                acc.status = Status.ACTIVE
+                acc.cooling_until = None
+                acc.last_error = None
+            store.update_account(acc)
+            logs.ok("risk-probe", f"账号 {acc.name} plan 探测 200 —— lane {lane} 已解封")
+            return True
+        logs.info("risk-probe",
+                  f"账号 {acc.name} plan 探测 HTTP {resp.status_code}（保持冷却，不追加惩罚）")
+        return False
+
+    async def _round(self) -> int:
+        now = time.time()
+        window = self._probe_window()
+        candidates: list[tuple[float, Account, str]] = []
+        for acc in store.list_accounts("zai"):
+            if not acc.enabled or acc.status in (Status.INVALID, Status.DISABLED):
+                continue  # 人工停用/失效不探测
+            for lane, until in (acc.risk_lane_cooling or {}).items():
+                if not lane.startswith("plan:"):
+                    continue  # 只探 plan 腿
+                if not acc.is_lane_cooling(lane, now):
+                    continue
+                if (until - now) <= window:
+                    candidates.append((until, acc, lane))
+        if not candidates:
+            return 0
+        candidates.sort()  # 最早到期的先探
+        _, acc, lane = candidates[0]
+        return 1 if await self._probe_one(acc, lane) else 0
+
+    async def _loop(self) -> None:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=30)
+            return
+        except TimeoutError:
+            pass
+        while not self._stop.is_set():
+            interval = settings.MODEL_PROBE_INTERVAL if settings.RISK_LANE_PROBE else 0
+            if interval > 0:
+                try:
+                    await self._round()
+                except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
+                    logs.err("risk-probe", f"plan-lane 探测轮异常: {err}")
+            wait = interval if interval > 0 else 60
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+            except TimeoutError:
+                continue
+
+    def start(self) -> None:
+        if self._task is None:
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+
+
+risk_lane_probe = RiskLaneProbeMonitor()

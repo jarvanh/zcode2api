@@ -198,8 +198,32 @@ MODEL_PROBE_INTERVAL = _int("ZCODE_MODEL_PROBE_INTERVAL", 600)
 RISK_COOLDOWN_BASE = _int("ZCODE_RISK_COOLDOWN_BASE", 900)    # 首次冷却秒数
 RISK_COOLDOWN_MAX = _int("ZCODE_RISK_COOLDOWN_MAX", 86400)    # 冷却上限（24h）
 RISK_BAN_STRIKES = _int("ZCODE_RISK_BAN_STRIKES", 4)          # 窗口内累计命中达到即禁用
-RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
-# 距上次风控命中超过该窗口则 strikes 重新起算：跨月偶发命中不累积成禁用
+RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 12 * 3600)
+# 距上次风控命中超过该窗口则 strikes 重新起算。2026-10-29 lane 整改由 7d → 12h：
+# #716 形态是小时级封锁，7 天窗口意味着一个坏夜晚污染整周 strikes；窗口按
+# lane 独立计时（models.risk_lane_penalty），整号计数仅存审计展示
+# ── 通道级（lane-scoped）风控处罚（2026-10-29 整改，总开关）────────────────
+# 依据：zai-org/feedback #716 实证 3012 是「通道级」封锁（同账号同机器付费
+# Coding Plan 腿 0 拦截、只有 zcode-plan grant 腿被拦；billing 全程正常），
+# 自家代码也以 RISK_WAVE_* 按 provider 判波次 —— 检测知道是通道级，旧处罚却
+# 按整号执行：封顶即 DISABLED，连带杀死健康回退腿、自动领包轮与额度刷新。
+# 开启后风控只冷却真正被打的那条腿，整号 DISABLED 回归「人工停用」单一语义。
+# 0/关 = 维持旧整号曲线（灰度回退用）。
+RISK_LANE_SCOPED = _bool("ZCODE_RISK_LANE_SCOPED", True)
+RISK_LANE_COOLDOWN = _int("ZCODE_RISK_LANE_COOLDOWN", 900)          # 首次 lane 冷却秒数
+RISK_LANE_COOLDOWN_MAX = _int("ZCODE_RISK_LANE_COOLDOWN_MAX", 7200)  # 阶梯上限（2h）
+RISK_LANE_BAN_STRIKES = _int("ZCODE_RISK_LANE_BAN_STRIKES", 4)      # 该 lane 累计达即长冷
+RISK_LANE_BAN_COOLDOWN = _int("ZCODE_RISK_LANE_BAN_COOLDOWN", 21600)  # 长冷 6h（到期自愈）
+# strikes 衰减窗口沿用 RISK_STRIKE_DECAY_SECONDS，但按 lane 独立计时（旧实现按
+# 整号：只要打击持续到来，旧 strike 永不衰减，这正是跨天累积成禁用的机制）。
+# plan-lane 回血探测轮（复用 MODEL_PROBE_INTERVAL 节流周期）：冷却尾段主动发
+# 一个最小请求探 plan 通道是否已解封，成功即清该 lane；旧 DISABLED 零探测、
+# 永久等人工。
+RISK_LANE_PROBE = _bool("ZCODE_RISK_LANE_PROBE", True)
+# 风控禁用自动换发指纹的频控（修身份抖动循环：禁用→换机→启用（不清 strikes）
+# →一发即再封→再换机，每周期烧一套设备身份，上游看到同号频繁换机）。lane 模式
+# 下本就极少走到换机；整号模式下同账号该间隔内只换一次，超限只冷却不换机。
+RISK_ROTATE_MIN_INTERVAL = _int("ZCODE_RISK_ROTATE_MIN_INTERVAL", 86400)
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 2026-10-25 防风控放大器：上游 405/3012 波次是「频道级」封锁（官方客户端同拦，
 # 社区 zai-org/feedback #716/#1185 实证家宽直连也拦），波次窗口内换号重试必然

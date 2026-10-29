@@ -6,6 +6,13 @@ import secrets
 import time
 from dataclasses import asdict, dataclass, field
 
+from . import settings
+
+
+def _risk_lane_enabled() -> bool:
+    """通道级风控总开关（运行期读，便于测试 monkeypatch / 灰度回退）。"""
+    return bool(getattr(settings, "RISK_LANE_SCOPED", False))
+
 PROVIDERS = ("zai", "bigmodel")
 
 
@@ -53,6 +60,19 @@ class Account:
     fail_count: int = 0
     risk_strikes: int = 0  # 当前风控退避周期内累计命中次数；成功或跨衰减窗口即清零
     last_risk_at: float | None = None  # 最近一次风控命中时间（strikes 衰减窗口基准）
+    # ── 通道级风控冷却（2026-10-29 lane-scoped 整改，开关 settings.RISK_LANE_SCOPED）──
+    # 依据：zai-org/feedback #716 与自家实测都表明 3012/unusual activity 是
+    # 「通道级」封锁（同一账号付费 Coding Plan 腿 0 拦截，只有 zcode-plan
+    # grant 腿被拦；同号同刻 billing 全正常）。旧实现按整号计数并置 DISABLED，
+    # 连带把健康的回退腿、billing/claim、额度刷新一起杀死。现按 lane 冷却。
+    # lane_key = "plan:<model>" | "apikey:***"（见 lane_key）。
+    risk_lane_cooling: dict = field(default_factory=dict)   # lane_key -> until_epoch
+    risk_lane_strikes: dict = field(default_factory=dict)   # lane_key -> 窗口内命中次数
+    risk_lane_last_at: dict = field(default_factory=dict)   # lane_key -> 上次命中 epoch（衰减基准）
+    risk_last_lane: str | None = None                       # 最近命中的 lane（日志/后台展示）
+    # 设备指纹换发频控（修「禁用→换机→启用→一发即封→再换机」的身份抖动循环）
+    rotate_count: int = 0
+    last_rotate_at: float | None = None
     rate_strikes: int = 0  # 连续 429 重试梯耗尽次数（自动熔断）；成功即清零
     recent_results: list = field(default_factory=list)  # 最近请求结果 tick（True 成功/False 失败），最新在末尾
     last_used_at: float | None = None
@@ -151,8 +171,253 @@ class Account:
         return self.status not in (Status.INVALID, Status.DISABLED)
 
     def allows_billing(self, now: float | None = None) -> bool:
-        """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。"""
+        """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。
+
+        通道级风控冷却**不**在此门禁内：#716 与自家实测均证实 3012 期间
+        billing 完全正常（有额度但对话腿被拦），冷却对话腿不该顺带禁掉
+        领包/刷额度——旧实现靠整号 DISABLED 连带停了自动领包轮与额度刷新
+        （领不到新包、后台「账面」停在冻结快照）。仍受整号 COOLING 约束。
+        """
         return self.uses_plan_channel() and not self.is_cooling(now)
+
+    # ── 通道级风控（lane-scoped penalty）─────────────────────────────────────
+    @staticmethod
+    def lane_key(channel: str, model: str) -> str:
+        """风控通道键：channel(plan|apikey) + 归一模型名；无模型用 "-" 占位。"""
+        ch = (channel or "plan").strip().lower()
+        return f"{ch}:{Account.model_key(model) or '-'}"
+
+    def is_lane_cooling(self, lane: str, now: float | None = None) -> bool:
+        """该通道是否在风控冷却期。到期自动失效，无需人工。
+
+        总开关 RISK_LANE_SCOPED 关闭时一律视为未封锁：运行期改回旧曲线后，
+        存量 lane 记录自动失去效力（不删数据，回开即恢复语义）。
+        """
+        if not lane or not _risk_lane_enabled():
+            return False
+        until = float(self.risk_lane_cooling.get(lane) or 0)
+        return until > (now or time.time())
+
+    def lane_cooling_until(self, lane: str) -> float:
+        return float(self.risk_lane_cooling.get(lane) or 0)
+
+    def next_lane_uncooldown_at(self, channel: str | None = None) -> float | None:
+        """本账号最早解除风控冷却的 epoch（channel 为空 = 全部通道）。"""
+        now = time.time()
+        soonest: float | None = None
+        for lane, until in (self.risk_lane_cooling or {}).items():
+            if channel and lane.split(":", 1)[0] != channel:
+                continue
+            u = float(until or 0)
+            if u > now and (soonest is None or u < soonest):
+                soonest = u
+        return soonest
+
+    def risk_lane_penalty(self, lane: str, cooldown: float, cap: float,
+                          ban_strikes: int, ban_cooldown: float,
+                          decay_seconds: float) -> dict:
+        """通道级风控打击：只冷却命中的那条 lane，不动整号 status。
+
+        返回 {lane, strikes, seconds, until, banned, all_blocked}。衰减按 lane
+        独立计时（距该 lane 上次命中超 decay_seconds 重新起算）——旧实现按整号
+        计数且禁用不清零，一个坏夜晚就能把号永久钉死在 DISABLED。
+        """
+        now = time.time()
+        n = int(self.risk_lane_strikes.get(lane) or 0)
+        last = float(self.risk_lane_last_at.get(lane) or 0)
+        if last and now - last > decay_seconds:
+            n = 0
+        n += 1
+        self.risk_lane_strikes[lane] = n
+        self.risk_lane_last_at[lane] = now
+        self.risk_last_lane = lane
+        banned = n >= ban_strikes
+        if banned:
+            seconds = float(ban_cooldown)
+        elif cooldown > 0:
+            seconds = min(float(cooldown) * (2 ** (n - 1)), float(cap))
+        else:
+            seconds = float(cap)
+        seconds = max(1.0, seconds)
+        until = now + seconds
+        self.risk_lane_cooling[lane] = until
+        # 整号计数保留只做展示/审计（不再驱动状态位；DISABLED 回归「人工停用」
+        # 单一语义），并同步刷新衰减窗口基准供后台显示。
+        self.risk_strikes = int(self.risk_strikes or 0) + 1
+        self.last_risk_at = now
+        return {
+            "lane": lane,
+            "strikes": n,
+            "seconds": seconds,
+            "until": until,
+            "banned": banned,
+            "all_blocked": self.lanes_all_blocked(now),
+        }
+
+    def lanes_all_blocked(self, now: float | None = None) -> bool:
+        """该号全部可用服务通道是否都在风控冷却中。
+
+        只看实际存在的通道：纯 Key 号唯一服务通道是 apikey；JWT 号看 plan，
+        有回退 Key 时需两条腿都冷却才算。
+        """
+        now = now or time.time()
+        channels: list[str] = []
+        if self.uses_plan_channel():
+            channels.append("plan")
+        if self.mode == "apiKey" or (self.uses_plan_channel() and self.has_apikey_fallback()):
+            channels.append("apikey")
+        if not channels:
+            return False
+        return all(self.channel_blocked(c, now) for c in channels)
+
+    def has_lane_cooling(self, now: float | None = None) -> bool:
+        """是否有任何风控 lane 冷却在场（不管哪条通道）。
+
+        供 5xx/连接失败等瞬态处置判断：场上有风控退避时不得用通用冷却覆盖
+        last_error，否则运维看到的是「5xx 冷却」而真因（风控 lane）被洗掉。
+        """
+        now = now or time.time()
+        return any(
+            float(until or 0) > now
+            for until in (self.risk_lane_cooling or {}).values()
+        )
+
+    def worst_lane_until(self, now: float | None = None) -> float | None:
+        """当前生效中最迟解除的风控冷却 epoch。"""
+        now = now or time.time()
+        vals = [float(u or 0) for u in (self.risk_lane_cooling or {}).values()
+                if float(u or 0) > now]
+        return max(vals) if vals else None
+
+    def lane_unblock_at(self, model: str, now: float | None = None) -> float | None:
+        """该模型因风控封锁时、最早可重新被选中的 epoch（未封锁返回 None）。
+
+        两条腿都在冷却时要等**较晚**那条解除才能服务（max）；只有一条腿时等
+        它自己到期。供 Retry-After 与探测轮选型。
+        """
+        now = now or time.time()
+        if self.mode == "apiKey" and not self.uses_plan_channel():
+            # 纯 Key 号：唯一服务通道就是 apikey，封锁看它而非 plan
+            if not self.channel_blocked("apikey", now):
+                return None
+            return max(
+                (float(u or 0) for lane, u in (self.risk_lane_cooling or {}).items()
+                 if lane.startswith("apikey:") and float(u or 0) > now),
+                default=0.0,
+            ) or None
+        if not self.channel_blocked("plan", now):
+            return None
+        plan_until = max(
+            (float(u or 0) for lane, u in (self.risk_lane_cooling or {}).items()
+             if lane.startswith("plan:") and float(u or 0) > now), default=0.0)
+        if not self.has_apikey_fallback():
+            return plan_until or None
+        if not self.channel_blocked("apikey", now):
+            return None
+        key_until = max(
+            (float(u or 0) for lane, u in (self.risk_lane_cooling or {}).items()
+             if lane.startswith("apikey:") and float(u or 0) > now), default=0.0)
+        return max(plan_until, key_until) or None
+
+    def migrate_legacy_risk_ban(self, ban_cooldown: float, floor_seconds: float,
+                                decay_seconds: float) -> bool:
+        """旧「风控升级禁用」→ 通道级有界冷却（一次性迁移，返回是否改动）。
+
+        存量库里那批 status=disabled + enabled=True + 「风控封禁…」的号，是被
+        旧语义错定为终态的通道级封锁（修 P1/P4/P5）。迁移后：整号回 ACTIVE，
+        封锁记在 plan 通道上，冷却到点自动回轮询（不再等人工启用，也避开
+        「启用→一发即封→再换机」循环）。
+
+        冷却长度：以 RISK_LANE_BAN_COOLDOWN 从**上次命中**起算，扣去已经过的
+        时间，并夹在 [floor_seconds, ban_cooldown] 内——既不拿陈年命中当新伤，
+        也不把几分钟前刚被拦的号直接放行。
+        """
+        if self.status != Status.DISABLED or not self.enabled:
+            return False
+        if not (self.last_error or "").startswith("风控封禁"):
+            return False
+        now = time.time()
+        last = float(self.last_risk_at or 0) or now
+        if now - last > decay_seconds:
+            remaining = float(floor_seconds)
+        else:
+            remaining = float(ban_cooldown) - (now - last)
+        remaining = min(max(remaining, floor_seconds), ban_cooldown)
+        lane = self.lane_key("plan", "")
+        self.risk_lane_cooling[lane] = now + remaining
+        self.risk_lane_strikes[lane] = max(1, int(self.risk_strikes or 0))
+        self.risk_lane_last_at[lane] = last
+        self.risk_last_lane = lane
+        self.status = Status.ACTIVE
+        self.cooling_until = None
+        self.last_error = None
+        # 整号计数保留作历史审计（不再驱动状态），不归零——归零会把「这个号
+        # 被打过」的信息一并抹掉。
+        return True
+
+    def clear_lane_cooling(self, lane: str) -> None:
+        """该通道已恢复（真实成功或探测 200）：清冷却与命中计数。"""
+        self.risk_lane_cooling.pop(lane, None)
+        self.risk_lane_strikes.pop(lane, None)
+        self.risk_lane_last_at.pop(lane, None)
+
+    def clear_channel_cooling(self, channel: str) -> None:
+        """该通道真实成功：清掉 channel 下全部 lane。
+
+        封锁按通道聚合，解封也按通道聚合；逐模型分别等到期会把一次故障拆成
+        N 条惩罚尾巴。
+        """
+        pref = f"{(channel or 'plan').strip().lower()}:"
+        for lane in [l for l in list(self.risk_lane_cooling or {}) if l.startswith(pref)]:
+            self.clear_lane_cooling(lane)
+
+    def clear_all_risk_lanes(self) -> None:
+        """人工确认恢复：清掉全部通道级风控记录（与清 strikes 同语义）。"""
+        self.risk_lane_cooling.clear()
+        self.risk_lane_strikes.clear()
+        self.risk_lane_last_at.clear()
+        self.risk_last_lane = None
+
+    def channel_blocked(self, channel: str, now: float | None = None) -> bool:
+        """该通道（plan|apikey）是否有任何 lane 处于风控冷却中。"""
+        now = now or time.time()
+        pref = f"{(channel or 'plan').strip().lower()}:"
+        return any(
+            lane.startswith(pref) and float(until or 0) > now
+            for lane, until in (self.risk_lane_cooling or {}).items()
+        )
+
+    def lane_blocked_for_model(self, model: str, now: float | None = None) -> bool:
+        """该模型的服务通道是否全被风控冷却（选号门禁）。
+
+        封锁**按通道聚合**：3012 是通道级封锁（#716：同账号同机器付费 Plan 腿
+        0 拦截、zcode-plan grant 腿 100% 拦），与具体模型无关。因此任一
+        plan:* lane 在冷却即视为 plan 通道不可用；否则换另一个模型重试会把
+        同一封锁拆成多个 lane、逐个重踩一次。
+        """
+        now = now or time.time()
+        if not self.uses_plan_channel():
+            # 纯 Key 号：唯一服务通道就是 apikey，封锁看它而非 plan
+            return self.mode == "apiKey" and self.channel_blocked("apikey", now)
+        if not self.channel_blocked("plan", now):
+            return False
+        if not self.has_apikey_fallback():
+            return True
+        return self.channel_blocked("apikey", now)
+
+    def plan_lane_available(self, model: str, now: float | None = None) -> bool:
+        """该模型的 Plan 腿是否可用（路由选择的唯一判据）。
+
+        选号能选中≠ Plan 腿可打：该腿可能正在风控冷却而靠 Key 腿服务。
+        build_request 与 needs_captcha 共用本判定，避免两处推导不一致。
+        无 Key 回退时仍返回 True（不能因封锁丢掉唯一凭证），交给上游定成败。
+        """
+        if not self.uses_plan_channel():
+            return False
+        if not self.channel_blocked("plan", now):
+            return True
+        # plan 被封且无可用回退腿：仍维持 plan（否则本号直接无通道）
+        return not self.has_apikey_fallback()
 
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
@@ -210,6 +475,10 @@ class Account:
         if not self.enabled:
             return False
         if model and self.is_model_cooling(model, now):
+            return False
+        if model and self.lane_blocked_for_model(model, now):
+            # 通道级风控：该模型的服务通道全在冷却中 → 跳过该号（其余模型、其余
+            # 账号仍可用；不再因一条 grant 腿被拦而整号退出轮询）
             return False
         if self.status == Status.EXHAUSTED:
             return False

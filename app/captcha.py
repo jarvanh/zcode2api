@@ -278,7 +278,7 @@ class CaptchaManager:
         账号冷却状态随 store 落库，重启后全冷却期间此门保持关闭。
         """
         return any(
-            a.allows_billing() and a.is_selectable()
+            a.allows_billing() and a.is_selectable() and not a.channel_blocked("plan")
             for a in store.list_accounts("zai")
         )
 

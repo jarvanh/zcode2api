@@ -112,6 +112,37 @@ class Store:
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
 
+            # 存量「风控升级禁用」一次性迁移为通道级有界冷却（修 P1/P4/P5）：
+            # 这批号是被旧语义错定为终态的通道级封锁（#716：billing 全程正常、
+            # 只有 grant 腿被拦），旧状态既等不到人工、又连带停掉自动领包轮与
+            # 额度刷新。迁移后封锁记在 plan 通道上，到点自动回轮询。
+            if settings.RISK_LANE_SCOPED:
+                migrated = []
+                for accounts in self._accounts.values():
+                    for account in accounts:
+                        if account.migrate_legacy_risk_ban(
+                            settings.RISK_LANE_BAN_COOLDOWN,
+                            settings.RISK_LANE_COOLDOWN,
+                            settings.RISK_STRIKE_DECAY_SECONDS,
+                        ):
+                            migrated.append(account)
+                for account in migrated:
+                    conn.execute(
+                        f"""INSERT OR REPLACE INTO {_TBL}
+                            (id, provider, name, mode, status, enabled, created_at, data)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                        (
+                            account.id, account.provider, account.name, account.mode,
+                            account.status, 1 if account.enabled else 0,
+                            account.created_at,
+                            json.dumps(account.to_dict(), ensure_ascii=False),
+                        ),
+                    )
+                if migrated:
+                    conn.commit()
+                    print(f"[risk-lane] 存量风控禁用已转通道级冷却 ×{len(migrated)}: "
+                          f"{', '.join(a.name for a in migrated)}")
+
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
@@ -283,6 +314,15 @@ class Store:
                 #（风控退避本就是自动恢复语义，人工提前放行同样成立）
                 account.status = Status.ACTIVE
                 account.cooling_until = None
+            if enabled:
+                # 人工确认恢复即全新起算。旧实现只洗状态不清计数，而禁用是
+                # 「strike 达标」的直接后果 → 启用后下一次命中立即再达标（零冷却
+                # 缓冲），形成「启用→一发即封→再自动换指纹」的身份抖动循环（P3/P4.5）。
+                account.risk_strikes = 0
+                account.last_risk_at = None
+                account.clear_all_risk_lanes()
+                if (account.last_error or "").startswith(("风控封禁", "命中风控")):
+                    account.last_error = None
             self._persist_account(account)
             return True
 
@@ -303,6 +343,28 @@ class Store:
             account = pool[idx]
             self._rotation[provider] = (idx + 1) % len(pool)
             return account
+
+    def next_lane_uncooldown_at(self, provider: str, model: str) -> float | None:
+        """池内因风控封锁而最早可重新承接该模型的时刻；无封锁返回 None。
+
+        取所有候选账号里**最早**解封的那个（排队/Retry-After 关心的是何时
+        有人能接，不是最晚）。与 next_model_uncooldown_at 分立：前者是「该模型
+        无包」，后者是「该通道被风控」，语义不同不能共字段。整号冷却（含全腿
+        哑火降级态）沿用既有 503 语义，不在此重复计数。
+        """
+        now = time.time()
+        soonest: float | None = None
+        for acc in self.list_accounts(provider):
+            if not acc.enabled or acc.status in (Status.INVALID, Status.DISABLED):
+                continue
+            until = acc.lane_unblock_at(model, now)
+            if acc.is_cooling() and acc.cooling_until:
+                # 全腿退化 COOLING 的号也在等同一批 lane 解封；按 is_cooling
+                # 跳过会让 Retry-After 变成无等待的 503。与既有整号冷却取较晚。
+                until = max(until or 0.0, acc.cooling_until)
+            if until and until > now and (soonest is None or until < soonest):
+                soonest = until
+        return soonest
 
     def next_model_uncooldown_at(self, provider: str, model: str) -> float | None:
         """池内该模型最早解除冷却的 epoch；无任何模型级冷却时返回 None。

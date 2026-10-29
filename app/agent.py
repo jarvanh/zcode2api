@@ -67,6 +67,7 @@ def build_request(
     incoming_headers: dict | None = None,
     verify_region: str | None = None,
     force_fallback: bool = False,
+    force_plan: bool = False,
 ) -> tuple[str, dict, bytes]:
     """返回 (目标 URL, 请求头, 序列化后的请求体)。
 
@@ -75,11 +76,23 @@ def build_request(
 
     force_fallback：强制走 API Key 回退通道（Plan 通道瞬态失败如 429 时，
     账号 status 保持 ACTIVE，不能靠状态推导路由，须显式指定）。
+
+    force_plan：反向例外，**仅供 plan-lane 探测轮使用**。它要测的正是「这条
+    被冷却的腿通了没」，必须顶过自己的 lane 门禁把请求发到 Plan 通道；真实
+    流量禁止传该标志（否则「冷却期零上游流量」不变量会被热路径踩穿）。
     """
     provider = account.provider
 
+    use_plan = provider == "zai" and account.uses_plan_channel() and not force_fallback
+    if provider == "zai" and use_plan and not force_plan:
+        # 通道级风控：Plan 腿正在冷却且有可用回退 Key 时，本请求直接路由到
+        # Key 通道（否则会把封锁拆开重踩，且选号能选中≠Plan 腿可打）。
+        use_plan = account.plan_lane_available(
+            body.get("model") if isinstance(body.get("model"), str) else ""
+        )
+
     if provider == "zai":
-        if account.uses_plan_channel() and not force_fallback:
+        if use_plan:
             target_url = settings.UPSTREAM["zai"]
             auth = {"Authorization": f"Bearer {account.jwt_token}"}
         elif account.api_key:
@@ -95,7 +108,7 @@ def build_request(
     else:
         raise RuntimeError(f"未知提供商: {provider}")
 
-    if provider == "zai" and account.uses_plan_channel() and not force_fallback:
+    if provider == "zai" and use_plan:
         # JWT 通道：LLM 身份头（g6n，无 Device-Mid、UA 带 SDK 后缀）+ 追踪头
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None

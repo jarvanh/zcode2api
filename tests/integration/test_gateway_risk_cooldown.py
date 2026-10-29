@@ -265,10 +265,12 @@ class TestRiskControlBan:
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
-        assert acc.status == Status.COOLING
-        assert acc.risk_strikes == 1
-        assert acc.is_selectable() is False  # 冷却中不可选，但已在本次请求中
-        assert acc.cooling_until is not None
+        # lane 语义：风控只冷却 plan 腿，整号状态位不动（Key 回退腿照常服务）
+        assert acc.status == Status.ACTIVE
+        assert acc.is_cooling() is False
+        assert acc.risk_strikes == 1  # 整号计数保留作审计展示
+        assert (acc.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
+        assert acc.is_selectable() is True  # Key 回退腿仍可被选中
         paths = [c[1] for c in mock.state.calls if c[1].endswith("/messages")]
         assert "/api/v1/zcode-plan/anthropic/v1/messages" in paths
         assert "/api/anthropic/v1/messages" in paths
@@ -329,8 +331,10 @@ class TestRiskControlBan:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
         after = fresh_app.find("zai", acc.id)
-        assert after.status == Status.COOLING
+        # lane 语义：业务码 3012 与 HTTP 405 同形，只冷却 plan 腿
+        assert after.status == Status.ACTIVE
         assert after.risk_strikes == 1
+        assert (after.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
         paths = [c[1] for c in mock.state.calls[before:] if c[1].endswith("/messages")]
         assert "/api/v1/zcode-plan/anthropic/v1/messages" in paths
         assert "/api/anthropic/v1/messages" in paths
@@ -363,14 +367,18 @@ class TestRiskControlBan:
 
         accounts = {a.name: a for a in fresh_app.list_accounts("zai")}
         risk = accounts["a-risk"]
+        # 无回退腿的 JWT 号：plan 腿被拦 = 全部服务通道冷却 → 整号退化 COOLING
+        #（到期自愈，不等人工），冷却时长 = lane 首罚 900s
         assert risk.status == Status.COOLING
         assert risk.enabled is True
         assert risk.risk_strikes == 1
         assert risk.cooling_until is not None
         assert 890 < risk.cooling_until - time.time() <= 905  # ≈ 900s
-        assert "指数退避" in (risk.last_error or "")
+        assert "命中风控" in (risk.last_error or "")
+        assert "plan:glm-5.2" in (risk.last_error or "")
         assert risk.is_selectable() is False
         assert risk.is_cooling() is True  # 冷却中有恢复倒计时
+        assert (risk.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
 
     async def test_fallback_5xx_preserves_risk_cooldown(self, gateway_client, fresh_app, monkeypatch):
         """风控冷却中回退 Key 5xx 耗尽：不得用 300s 普通冷却覆盖 900s 风控退避
@@ -388,12 +396,14 @@ class TestRiskControlBan:
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 503  # 回退通道也 5xx 耗尽
-        assert acc.status == Status.COOLING
-        # 风控退避（900s）未被普通冷却（300s）覆盖
-        assert acc.cooling_until - time.time() > 500
+        # lane 退避在场：300s 普通冷却不得覆盖（status 保持 ACTIVE —— Key 腿
+        # 失败不代表 plan 腿死亡，整号未降级）
+        assert acc.status == Status.ACTIVE
+        assert acc.cooling_until is None
         assert "命中风控" in (acc.last_error or "")
         assert "5xx" not in (acc.last_error or "")
         assert acc.risk_strikes == 1
+        assert (acc.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
 
     async def test_risk_disable_auto_rotates_fingerprint(self, gateway_client, fresh_app, monkeypatch):
         """风控升级禁用时自动换发设备指纹（2.6.8：「风控后换设备重生」自动化），
@@ -402,6 +412,7 @@ class TestRiskControlBan:
         from app.fingerprint import profile_for
         from tests.conftest import seed_account
 
+        monkeypatch.setattr(settings, "RISK_LANE_SCOPED", False)  # 旧整号曲线路径
         monkeypatch.setattr(settings, "RISK_BAN_STRIKES", 1)
         acc = seed_account(fresh_app, _RISK_JWT, name="a-rot")
         old_mid = profile_for(acc).device_mid
@@ -419,6 +430,7 @@ class TestRiskControlBan:
         from app.fingerprint import profile_for
         from tests.conftest import seed_account
 
+        monkeypatch.setattr(settings, "RISK_LANE_SCOPED", False)  # 旧整号曲线路径
         monkeypatch.setattr(settings, "RISK_BAN_STRIKES", 1)
         monkeypatch.setattr(settings, "RISK_AUTO_ROTATE", False)
         acc = seed_account(fresh_app, _RISK_JWT, name="a-norot")
@@ -446,16 +458,20 @@ class TestRiskControlBan:
         fresh_app.set_enabled("zai", acc.id, True)  # 人工确认恢复后启用
         assert acc.status == Status.ACTIVE
         assert acc.is_selectable() is True
-        assert acc.risk_strikes == 1  # 人工启用不清 strikes（仅成功请求清零）
+        # 人工启用 = 确认恢复：清 strikes 与 lane，断「一发即再封」循环（P3）
+        assert acc.risk_strikes == 0
+        assert acc.risk_lane_cooling == {}
 
-        # 冷却窗口结束后清除状态模拟自然恢复，再次请求应成功
-        acc.risk_strikes = 0
-        fresh_app.update_account(acc)
         mock.state.sequences[_RISK_JWT[:16]] = ["ok"]
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
         assert res2.status_code == 200
 
     async def test_repeated_bans_accumulate(self, gateway_client, fresh_app):
+        """同一衰减窗口内连续命中：lane strikes 累积（1→2），第 2 次仍冷却非长冷。
+
+        人工启用会清 strikes（新契约，P3）——累积前提是窗口内连续命中，
+        故直接等 lane 到期后再触发第二次，不经启用循环。
+        """
         client, mock = gateway_client
         from tests.conftest import seed_account
 
@@ -464,11 +480,93 @@ class TestRiskControlBan:
 
         await client.post("/v1/messages", json=_MSG_BODY)
         assert acc.risk_strikes == 1
-        fresh_app.set_enabled("zai", acc.id, True)
+        assert acc.risk_lane_strikes["plan:glm-5.2"] == 1
+        # 模拟 lane 冷却到期后再次命中（不经人工启用，保留累积语义）
+        acc.cooling_until = time.time() - 1
+        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() - 1
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
         await client.post("/v1/messages", json=_MSG_BODY)
         assert acc.risk_strikes == 2
+        assert acc.risk_lane_strikes["plan:glm-5.2"] == 2
         assert "第 2 次" in (acc.last_error or "")
-        assert "指数退避" in (acc.last_error or "")  # 第 2 次仍未升级禁用
+        assert "指数退避" not in (acc.last_error or "")  # lane 曲线无整号退避文案@pytest.mark.integration
+class TestRiskLaneScoped:
+    """lane-scoped 风控（2026-10-29 整改）的行为面：
+
+    - 命中只冷却被打通道（lane_key = channel:model），整号状态位不动；
+    - 无回退腿号全通道冷却 → 整号退化 COOLING，到期自愈不等人工；
+    - 存量「风控封禁」DISABLED 启动迁移为 plan lane 有界冷却；
+    - plan-lane 探测轮在冷却尾段主动验证，200 即清 lane。
+    """
+
+    async def test_lane_expiry_self_heals_without_manual_action(self, gateway_client, fresh_app):
+        """lane 到期自动回轮询：无需人工 enable（旧 DISABLED 语义的核心差异）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-lane")
+        mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 唯一号被打：无回退腿 → 全通道退化 COOLING
+        assert acc.status == Status.COOLING
+        assert acc.is_selectable(model="GLM-5.2") is False
+
+        # lane 到期：自动回轮询，无需任何人工动作
+        acc.cooling_until = time.time() - 1
+        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() - 1
+        fresh_app.update_account(acc)
+        assert acc.is_selectable(model="GLM-5.2") is True
+
+        mock.state.sequences[_RISK_JWT[:16]] = ["ok"]
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 200
+
+    async def test_legacy_ban_migrates_to_lane_cooling_on_load(self, gateway_client, fresh_app):
+        """存量「风控封禁」DISABLED 在 Store 装载时迁移为 plan lane 有界冷却。"""
+        from app.store import Store
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-mig")
+        acc.status = Status.DISABLED
+        acc.enabled = True
+        acc.risk_strikes = 4
+        acc.last_risk_at = time.time() - 3600
+        acc.last_error = ("风控封禁 (3012/unusual activity) HTTP 405，"
+                          "确认恢复后请在后台手动启用（第 4 次）")
+        fresh_app.update_account(acc)
+
+        reloaded = Store()  # 迁移发生在装载期：重开一个 Store 读同一份 tmp 库
+        mig = reloaded.find("zai", acc.id)
+        assert mig.status == Status.ACTIVE
+        until = mig.risk_lane_cooling.get("plan:-")
+        assert until and 17000 < until - time.time() <= 18000  # 6h − 已经过的 1h
+        assert mig.is_selectable(model="GLM-5.2") is False  # plan lane 冷却中
+
+    async def test_probe_round_clears_tail_lane(self, gateway_client, fresh_app, monkeypatch,
+                                                stub_captcha):
+        """plan-lane 探测轮：尾段 lane 主动验证，200 即清 lane（修 P5 自愈）。
+
+        gateway_client 自带 mock 上游与验证码桩：探测请求打 mock（"ok" 序列），
+        绝不触真网。_probe_one 运行期 from .captcha import captcha_manager，
+        需补 patch captcha 模块属性（gateway_client 只 patch 了 gateway/claim）。
+        """
+        from app import captcha as captcha_module
+        from app.quota import risk_lane_probe
+        from tests.conftest import seed_account
+
+        client, mock = gateway_client
+        monkeypatch.setattr(captcha_module, "captcha_manager", stub_captcha)
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-probe")
+        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() + 30  # 尾段（window=300）
+        fresh_app.update_account(acc)
+        mock.state.sequences[_RISK_JWT[:16]] = ["ok"]
+
+        n = await risk_lane_probe._round()
+        assert n == 1
+        after = fresh_app.find("zai", acc.id)
+        assert "plan:glm-5.2" not in after.risk_lane_cooling
 
 
 @pytest.mark.integration

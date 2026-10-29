@@ -314,13 +314,48 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     store.update_account(account)
 
 
-def _apply_risk_strike(account: Account, signal: str, req_id: str) -> str:
+def _apply_risk_strike(account: Account, signal: str, req_id: str,
+                       model: str | None = None,
+                       channel: str | None = None) -> str:
     """风控打击落地（405/3012 与 HTTP 200 内嵌业务码 3012 共用）。
 
-    指数退避冷却自动恢复，累计 RISK_BAN_STRIKES 次升级禁用（人工恢复）；
-    升级禁用且 RISK_AUTO_ROTATE 开启时自动换发全新设备指纹并补跑安装序。
+    两种曲线，由 RISK_LANE_SCOPED 切换（关闭即完全回到旧行为，灰度用）：
+
+    - 通道级（默认）：只冷却真正被打的那条 lane（plan/apikey × 模型归一键），
+      不动整号 status。依据 zai-org/feedback #716：3012 是通道级封锁（同账号
+      付费 Coding Plan 腿 0 拦截、billing 全程正常），旧整号罚会把健康回退腿、
+      自动领包轮、额度刷新一起杀死。指数 15min→2h 封顶，累计 4 次该 lane
+      长冷 6h，到期自动回轮询（探测轮可提前复活）。
+    - 旧整号曲线：指数退避冷却自动恢复，累计 RISK_BAN_STRIKES 次升级禁用
+      （人工恢复）；升级禁用且 RISK_AUTO_ROTATE 开启时自动换发全新设备指纹
+      并补跑安装序。
+
+    channel：命中请求实际走的通道（按实际 URL 判定，见调用点）。
     返回 penalty_note 供调用方日志。
     """
+    if settings.RISK_LANE_SCOPED:
+        lane = account.lane_key(channel or "plan", model or "")
+        res = account.risk_lane_penalty(
+            lane, settings.RISK_LANE_COOLDOWN, settings.RISK_LANE_COOLDOWN_MAX,
+            settings.RISK_LANE_BAN_STRIKES, settings.RISK_LANE_BAN_COOLDOWN,
+            settings.RISK_STRIKE_DECAY_SECONDS,
+        )
+        until_str = time.strftime("%H:%M", time.localtime(res["until"]))
+        account.last_error = (
+            f"命中风控 ({signal})，通道 {lane} 冷却至 {until_str}"
+            f"（第 {res['strikes']} 次"
+            f"{'，全部服务通道均在冷却，等到期自动恢复' if res['all_blocked'] else ''}）"
+        )
+        if res["all_blocked"] and account.status not in (Status.INVALID, Status.DISABLED):
+            # 全部服务通道都在冷却 → 整号退化 COOLING（到期自愈，不等人工），
+            # 状态位与 lane 字典保持一致；「命中风控」前缀的 last_error 是
+            # 探测轮识别此形态（区别于 5xx 普通冷却）的标记。
+            account.status = Status.COOLING
+            account.cooling_until = account.worst_lane_until() or res["until"]
+        store.update_account(account)
+        return (f"通道 {lane} 冷却至 {until_str}（第 {res['strikes']} 次"
+                f"{'，整号全部服务通道均已冷却' if res['all_blocked'] else '，其余通道不受影响'}）")
+
     account.risk_penalty(
         settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
         settings.RISK_BAN_STRIKES, settings.RISK_STRIKE_DECAY_SECONDS,
@@ -331,7 +366,7 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str) -> str:
             f"（第 {account.risk_strikes} 次）"
         )
         note = f"已升级禁用（第 {account.risk_strikes} 次）"
-        if settings.RISK_AUTO_ROTATE:
+        if settings.RISK_AUTO_ROTATE and _rotate_allowed(account):
             # 「风控后换设备重生」自动化：升级禁用即换发全新设备
             # （新 SKU + 新 device_mid），后台补跑安装序；账号重新
             # 启用时已是全新身份（billing/claim 头同源跟随档案）
@@ -341,11 +376,22 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str) -> str:
             old_mid = profile_for(account).device_mid[:8]
             rotate(account)
             account.installed_at = None
+            account.rotate_count = int(account.rotate_count or 0) + 1
+            account.last_rotate_at = time.time()
             schedule_install(account)
             logs.warn(
                 req_id,
                 f"账号 {account.name} 风控禁用，已自动换发设备指纹"
-                f"（旧 mid {old_mid}）",
+                f"（旧 mid {old_mid}，累计第 {account.rotate_count} 次）",
+            )
+        elif settings.RISK_AUTO_ROTATE:
+            # 换机频控护栏（修身份抖动循环）：间隔内的再次禁用不再换机，
+            # 上游看到的设备身份保持稳定（换机过频本身就是风控信号）
+            since_min = int((time.time() - float(account.last_rotate_at or 0)) // 60)
+            logs.warn(
+                req_id,
+                f"账号 {account.name} 风控禁用，距上次换指纹仅 {since_min} 分钟，"
+                f"按频控（≥{settings.RISK_ROTATE_MIN_INTERVAL // 3600}h）不换机",
             )
     else:
         cool_until = time.strftime(
@@ -357,6 +403,35 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str) -> str:
         note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
     store.update_account(account)
     return note
+
+
+def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
+    """池内最早能重新承接该模型的时刻与来源（kind, wait）。
+
+    kind "model" = 该模型无资源包（429 model_no_quota 语义）；"lane" = 服务
+    通道被风控冷却（503 no_available_account 语义，携带 Retry-After）。两类
+    冷却字段分立、不能共用错误类型：把风控封锁报成 model_no_quota 会误导
+    客户端换模型重试（封锁按通道，换啥模型都没用）。
+    """
+    model_wait = store.next_model_uncooldown_at(provider, model_key)
+    lane_wait = store.next_lane_uncooldown_at(provider, model_key)
+    if model_wait and (not lane_wait or model_wait <= lane_wait):
+        return "model", model_wait
+    if lane_wait:
+        return "lane", lane_wait
+    return None, None
+
+
+def _rotate_allowed(account: Account) -> bool:
+    """风控自动换指纹频控：距上次换发满 RISK_ROTATE_MIN_INTERVAL 才允许再换。
+
+    last_rotate_at 为空 = 从未自动换过，放行。lane 曲线下极少触达（基本不再
+    升级禁用），主要保护仍走旧整号曲线的灰度场景与存量身份抖动循环。
+    """
+    last = float(account.last_rotate_at or 0)
+    if last <= 0:
+        return True
+    return time.time() - last >= settings.RISK_ROTATE_MIN_INTERVAL
 
 
 def _last_user_text(body: dict) -> str:
@@ -1122,7 +1197,11 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
             continue
         attempts += 1
-        needs_captcha = provider == "zai" and account.uses_plan_channel()
+        # needs_captcha 同时代表「本请求走 Plan 腿」：该腿正在风控冷却且有可用
+        # 回退 Key 时，build_request 会直接路由到 Key 通道，这里必须跟着变，
+        # 否则验证码流程与实际通道错配（风控 strike 也会记到错误的 lane）。
+        needs_captcha = (provider == "zai" and account.uses_plan_channel()
+                         and account.plan_lane_available(model_key))
 
         slot_box: list[str | None] = [None]
         if limit > 0:
@@ -1155,21 +1234,32 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
 
     if queued:
         logs.req_err(req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队等待 {queued:.0f}s）")
-        wait = store.next_model_uncooldown_at(provider, model_key)
+        kind, wait = _recovery(provider, model_key)
         reqlog.finish_error(
             req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）",
-            status=429 if wait else 503,
+            status=429 if (kind == "model" and wait) else 503,
         )
         if wait and wait > time.time():
             retry_after = max(1, int(wait - time.time() + 0.999))
+            if kind == "model":
+                return JSONResponse(
+                    {"error": {
+                        "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
+                        "type": "model_no_quota", "code": "no_quota_for_model",
+                        "model": model_key, "queued_seconds": round(queued),
+                        "next_available_at": round(wait),
+                     }, "retry_after": retry_after},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            # 风控通道冷却：封锁按通道，换模型无济于事 → 503 而非 429 语义
             return JSONResponse(
                 {"error": {
-                    "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
-                    "type": "model_no_quota", "code": "no_quota_for_model",
-                    "model": model_key, "queued_seconds": round(queued),
+                    "message": f"全部服务通道均在风控冷却中（已排队等待 {queued:.0f}s），冷却到期自动恢复",
+                    "type": "no_available_account", "queued_seconds": round(queued),
                     "next_available_at": round(wait),
-                 }, "retry_after": retry_after},
-                status_code=429,
+                }, "retry_after": retry_after},
+                status_code=503,
                 headers={"Retry-After": str(retry_after)},
             )
         return JSONResponse(
@@ -1180,17 +1270,27 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             status_code=503,
         )
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
-    wait = store.next_model_uncooldown_at(provider, model_key)
-    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=429 if wait else 503)
+    kind, wait = _recovery(provider, model_key)
+    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
+                        status=429 if (kind == "model" and wait) else 503)
     if wait and wait > time.time():
         retry_after = max(1, int(wait - time.time() + 0.999))
+        if kind == "model":
+            return JSONResponse(
+                {"error": {
+                    "message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态",
+                    "type": "model_no_quota", "code": "no_quota_for_model",
+                    "model": model_key, "next_available_at": round(wait),
+                 }, "retry_after": retry_after},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
         return JSONResponse(
             {"error": {
-                "message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态",
-                "type": "model_no_quota", "code": "no_quota_for_model",
-                "model": model_key, "next_available_at": round(wait),
-             }, "retry_after": retry_after},
-            status_code=429,
+                "message": "全部服务通道均在风控冷却中，冷却到期自动恢复（封锁按通道，换模型无济于事）",
+                "type": "no_available_account", "next_available_at": round(wait),
+            }, "retry_after": retry_after},
+            status_code=503,
             headers={"Retry-After": str(retry_after)},
         )
     return JSONResponse(
@@ -1603,8 +1703,10 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         except httpx.HTTPError as err:
             await client.aclose()
             account.record_result(False, f"连接失败: {err}")
-            # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
-            if account.status in (Status.INVALID, Status.DISABLED):
+            # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan；
+            # 通道级风控退避在场时同理（连接失败不得覆盖风控退避文案与计数）
+            if (account.status in (Status.INVALID, Status.DISABLED)
+                    or account.has_lane_cooling()):
                 store.update_account(account)
             else:
                 _mark(account, Status.COOLING, f"连接失败: {err}")
@@ -1637,6 +1739,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
                 penalty_note = _apply_risk_strike(
                     account, f"3012/unusual activity HTTP {status_code}", req_id,
+                    model=str(body.get("model") or ""),
+                    channel="plan" if "/zcode-plan/" in url else "apikey",
                 )
                 # 2026-10-25 防放大器（两账号确认制）：首个命中只记名；窗口内
                 # 第 2 个不同账号也命中才确认波次。确认后本请求不再换号（下轮
@@ -1810,9 +1914,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         return _NEXT_ACCOUNT
                     continue
                 account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
-                if account.status in (Status.INVALID, Status.DISABLED) or account.is_cooling():
+                if (account.status in (Status.INVALID, Status.DISABLED)
+                        or account.is_cooling() or account.has_lane_cooling()):
                     # Key 回退 5xx 不得覆盖废 JWT / 风控禁用，否则冷却结束会重开 Plan；
-                    # 风控冷却同理（冷却期不覆盖，避免缩短风控退避）
+                    # 风控退避同理：整号冷却或通道级 lane 退避在场时，不得用通用
+                    # 300s 冷却与文案覆盖真因（lane 退避更长，覆盖=提前重打）
                     store.update_account(account)
                     logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，Plan 已停用，切换下一个")
                 else:
@@ -1856,7 +1962,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     await client.aclose()
                     if code_hit in _RISK_BIZ_CODES:
                         account.record_result(False, f"风控封禁（业务码 {code_hit}）")
-                        penalty_note = _apply_risk_strike(account, f"业务码 {code_hit}", req_id)
+                        penalty_note = _apply_risk_strike(
+                            account, f"业务码 {code_hit}", req_id,
+                            model=str(body.get("model") or ""),
+                            channel="plan" if "/zcode-plan/" in url else "apikey",
+                        )
                         # 2026-10-25 防放大器：与 HTTP 405 分支同处置（两账号确认制）
                         wave_confirmed = _risk_wave_confirm(account.provider, account.id)
                         if needs_captcha and account.has_apikey_fallback():
@@ -1901,7 +2011,15 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控
                 # 计数；风控冷却未到期同样不洗（与下方流式路径同一守卫语义，
                 # 否则 3012 后同请求走 Key 回退成功会把冷却洗掉，立刻重打 Plan）
-                if account.status not in (Status.INVALID, Status.DISABLED) and not account.is_cooling():
+                account.clear_model_cooling(str(body.get("model") or ""))
+                # 真实成功按实际通道聚合解封（url 判通道：内部 lane 重路由时
+                # force_fallback 仍为 False，不能用请求参数猜通道）
+                channel_used = "plan" if "/zcode-plan/" in url else "apikey"
+                account.clear_channel_cooling(channel_used)
+                # 计数清洗要求整号无任何在场风控退避：lane 冷却中成功（如走回退腿）
+                # 保留 last_error 与 strikes 审计；lane 清空后的 plan 成功才全量清洗
+                if (account.status not in (Status.INVALID, Status.DISABLED)
+                        and not account.is_cooling() and not account.has_lane_cooling()):
                     account.risk_strikes = 0
                     account.last_risk_at = None
                     account.rate_strikes = 0
@@ -1909,7 +2027,6 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account.cooling_until = None
                     if account.status in (Status.COOLING, Status.EXHAUSTED):
                         account.status = Status.ACTIVE
-                account.clear_model_cooling(str(body.get("model") or ""))
                 store.update_account(account)
                 _spawn_bg(_safe_refresh(account))
                 # 同步直通在此收口监控条目（含 tokens 与用量记账）：原先同步响应
@@ -1925,7 +2042,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 2026-10-25 防放大器：Plan 通道真实成功 = 上游风控窗口已开，
                 # 解除波次暂停与命中记忆；Key 回退成功不算（api.z.ai 通道与
                 # 被拦的 plan 通道无关，不代表 Plan 线恢复）。同步直通在此收口。
-                if account.uses_plan_channel() and not force_fallback:
+                if channel_used == "plan":
                     _risk_wave_clear(account.provider)
                 return _Resp(content=text, status_code=status_code,
                              media_type=resp.headers.get("content-type") or "application/json")
@@ -1937,7 +2054,12 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # 风控冷却未到期同样不洗（上游风控标记为小时级粘性，回退通道成功不代表
         # Plan 通道已解除，洗掉会立刻重打 Plan 并累加计数）。冷却已过期后的
         # Plan 通道成功即证明恢复，全量清理（清风控计数）。
-        if account.status not in (Status.INVALID, Status.DISABLED) and not account.is_cooling():
+        account.clear_model_cooling(str(body.get("model") or ""))
+        # 真实成功按实际通道聚合解封（url 判通道，见同步直通出口注释）
+        channel_used = "plan" if "/zcode-plan/" in url else "apikey"
+        account.clear_channel_cooling(channel_used)
+        if (account.status not in (Status.INVALID, Status.DISABLED)
+                and not account.is_cooling() and not account.has_lane_cooling()):
             account.risk_strikes = 0
             account.last_risk_at = None
             account.rate_strikes = 0
@@ -1945,13 +2067,12 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             account.cooling_until = None
             if account.status in (Status.COOLING, Status.EXHAUSTED):
                 account.status = Status.ACTIVE
-        account.clear_model_cooling(str(body.get("model") or ""))
         store.update_account(account)
         _spawn_bg(_safe_refresh(account))
 
         # 2026-10-25 防放大器：与同步直通出口同语义 —— Plan 通道真实成功才
         # 解除波次暂停与命中记忆；Key 回退成功不算。
-        if account.uses_plan_channel() and not force_fallback:
+        if channel_used == "plan":
             _risk_wave_clear(account.provider)
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
