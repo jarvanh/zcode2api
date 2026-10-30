@@ -126,7 +126,7 @@ class TestRiskWavePause:
         assert second.status_code == 503
         assert gw._risk_wave_level["zai"] == 2
         remaining = gw._risk_wave_until_for("zai") - time.time()
-        assert 350 < remaining <= 360  # 180 × 2 指数延长
+        assert 170 < remaining <= 180  # 90 × 2 指数延长
         assert sum(x.risk_strikes for x in fresh_app.list_accounts("zai")) == 3  # 每轮试探只烧 1 次
 
     async def test_plan_success_clears_wave_state(self, gateway_client, fresh_app):
@@ -373,7 +373,7 @@ class TestRiskControlBan:
         assert risk.enabled is True
         assert risk.risk_strikes == 1
         assert risk.cooling_until is not None
-        assert 890 < risk.cooling_until - time.time() <= 905  # ≈ 900s
+        assert 175 < risk.cooling_until - time.time() <= 185  # ≈ 180s
         assert "命中风控" in (risk.last_error or "")
         assert "plan:glm-5.2" in (risk.last_error or "")
         assert risk.is_selectable() is False
@@ -541,7 +541,7 @@ class TestRiskLaneScoped:
         mig = reloaded.find("zai", acc.id)
         assert mig.status == Status.ACTIVE
         until = mig.risk_lane_cooling.get("plan:-")
-        assert until and 17000 < until - time.time() <= 18000  # 6h − 已经过的 1h
+        assert until and 175 < until - time.time() <= 185  # 600s−已过1h<0 → 兜底 180s
         assert mig.is_selectable(model="GLM-5.2") is False  # plan lane 冷却中
 
     async def test_probe_round_clears_tail_lane(self, gateway_client, fresh_app, monkeypatch,

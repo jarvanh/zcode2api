@@ -204,6 +204,11 @@ RISK_COOLDOWN_BASE = _int("ZCODE_RISK_COOLDOWN_BASE", 900)    # 首次冷却秒�
 RISK_COOLDOWN_MAX = _int("ZCODE_RISK_COOLDOWN_MAX", 86400)    # 冷却上限（24h）
 RISK_BAN_STRIKES = _int("ZCODE_RISK_BAN_STRIKES", 4)          # 窗口内累计命中达到即禁用
 RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 12 * 3600)
+# strikes 指数半衰（2026-10-30）：计分随时间连续消退——lane 30min 减半、
+# net 15min 减半，不再「满额挂满 12h 硬窗口后一次性清零」。硬窗口
+# （RISK_STRIKE_DECAY_SECONDS）保留作兜底。0 = 关闭半衰（回退旧行为）。
+RISK_STRIKE_HALF_LIFE = _int("ZCODE_RISK_STRIKE_HALF_LIFE", 1800)
+NET_STRIKE_HALF_LIFE = _int("ZCODE_NET_STRIKE_HALF_LIFE", 900)
 # 距上次风控命中超过该窗口则 strikes 重新起算。2026-10-29 lane 整改由 7d → 12h：
 # #716 形态是小时级封锁，7 天窗口意味着一个坏夜晚污染整周 strikes；窗口按
 # lane 独立计时（models.risk_lane_penalty），整号计数仅存审计展示

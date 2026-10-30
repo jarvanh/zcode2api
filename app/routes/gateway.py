@@ -377,9 +377,9 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
     if account.status == Status.DISABLED:
         account.last_error = (
             f"风控封禁 ({signal})，确认恢复后请在后台手动启用"
-            f"（第 {account.risk_strikes} 次）"
+            f"（第 {account.risk_strikes:.0f} 次）"
         )
-        note = f"已升级禁用（第 {account.risk_strikes} 次）"
+        note = f"已升级禁用（第 {account.risk_strikes:.0f} 次）"
         if settings.RISK_AUTO_ROTATE and _rotate_allowed(account):
             # 「风控后换设备重生」自动化：升级禁用即换发全新设备
             # （新 SKU + 新 device_mid），后台补跑安装序；账号重新
@@ -412,9 +412,9 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
             "%H:%M", time.localtime(account.cooling_until)
         ) if account.cooling_until else "?"
         account.last_error = (
-            f"命中风控 ({signal})，指数退避冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+            f"命中风控 ({signal})，指数退避冷却至 {cool_until}（第 {account.risk_strikes:.0f} 次）"
         )
-        note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+        note = f"冷却至 {cool_until}（第 {account.risk_strikes:.0f} 次）"
     riskmetrics.record("risk", account.name, signal=signal, lane="account",
                        strikes=account.risk_strikes, model=model or "")
     store.update_account(account)
@@ -1738,7 +1738,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 account.status = Status.COOLING
                 account.cooling_until = until
                 account.last_error = (
-                    f"连接失败（第 {account.net_strikes} 次，冷却至 "
+                    f"连接失败（第 {account.net_strikes:.0f} 次，冷却至 "
                     f"{time.strftime('%H:%M', time.localtime(until))}）: {err}")
                 store.update_account(account)
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")

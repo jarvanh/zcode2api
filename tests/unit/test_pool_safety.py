@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.models import Account, Status
 from app.store import Store
 
@@ -59,7 +61,7 @@ class TestPureApiKeyRiskCooldown:
         acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
         acc.last_risk_at = _time.time() - 60  # 窗口内（1 分钟前）
         acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
-        assert acc.risk_strikes == 2  # 窗口内累计
+        assert acc.risk_strikes == pytest.approx(2, abs=0.05)  # 窗口内累计（半衰 60s ≈ 1.98）
 
     def test_risk_strikes_decay_after_window(self):
         import time as _time

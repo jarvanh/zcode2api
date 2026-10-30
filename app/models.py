@@ -130,6 +130,25 @@ class Account:
             return key.split(".", 1)[0] or None
         return None
 
+    @staticmethod
+    def _decay_strikes(stored: float, last_at: float | None, now: float,
+                       half_life: float, hard_window: float) -> float:
+        """命中计分的指数半衰（2026-10-30）：随时间连续消退，不再「满额挂满
+        整个硬窗口后一次性清零」。
+
+        n_eff = stored × 0.5^(Δt/half_life)；距上次命中超过硬窗口（无任何
+        命中）直接清零兜底；尾数 <0.1 视为 0。half_life ≤0 = 关闭半衰（回退
+        纯硬窗口旧行为）。
+        """
+        n = float(stored or 0)
+        if last_at and last_at > 0:
+            dt = max(0.0, now - float(last_at))
+            if dt > hard_window:
+                return 0.0
+            if half_life > 0:
+                n *= 0.5 ** (dt / half_life)
+        return 0.0 if n < 0.1 else n
+
     def risk_penalty(self, base: float, cap: float, ban_strikes: int,
                      decay_seconds: float) -> None:
         """命中风控（3012/405「unusual activity」）：指数退避冷却，累计
@@ -145,9 +164,9 @@ class Account:
         成功分支）或窗口衰减都会清零。
         """
         now = time.time()
-        if self.last_risk_at and now - self.last_risk_at > decay_seconds:
-            self.risk_strikes = 0
-        self.risk_strikes += 1
+        self.risk_strikes = round(self._decay_strikes(
+            self.risk_strikes, self.last_risk_at, now,
+            settings.RISK_STRIKE_HALF_LIFE, decay_seconds) + 1, 2)
         self.last_risk_at = now
         if self.risk_strikes >= ban_strikes:
             self.status = Status.DISABLED
@@ -229,11 +248,10 @@ class Account:
         计数且禁用不清零，一个坏夜晚就能把号永久钉死在 DISABLED。
         """
         now = time.time()
-        n = int(self.risk_lane_strikes.get(lane) or 0)
-        last = float(self.risk_lane_last_at.get(lane) or 0)
-        if last and now - last > decay_seconds:
-            n = 0
-        n += 1
+        n = self._decay_strikes(
+            self.risk_lane_strikes.get(lane), self.risk_lane_last_at.get(lane),
+            now, settings.RISK_STRIKE_HALF_LIFE, decay_seconds)
+        n = round(n + 1, 2)
         self.risk_lane_strikes[lane] = n
         self.risk_lane_last_at[lane] = now
         self.risk_last_lane = lane
@@ -253,7 +271,7 @@ class Account:
         self.last_risk_at = now
         return {
             "lane": lane,
-            "strikes": n,
+            "strikes": round(n),  # 展示用取整；内部计分/秒数曲线用浮点 n
             "seconds": seconds,
             "until": until,
             "banned": banned,
@@ -272,9 +290,10 @@ class Account:
         重新起算。
         """
         now = time.time()
-        if self.net_last_at and now - self.net_last_at > decay_seconds:
-            self.net_strikes = 0
-        self.net_strikes += 1
+        n = round(self._decay_strikes(
+            self.net_strikes, self.net_last_at, now,
+            settings.NET_STRIKE_HALF_LIFE, decay_seconds) + 1, 2)
+        self.net_strikes = n
         self.net_last_at = now
         return now + max(1.0, min(base * (2 ** (self.net_strikes - 1)), cap))
 
