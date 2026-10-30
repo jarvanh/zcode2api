@@ -215,10 +215,13 @@ RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 12 * 3600)
 # 开启后风控只冷却真正被打的那条腿，整号 DISABLED 回归「人工停用」单一语义。
 # 0/关 = 维持旧整号曲线（灰度回退用）。
 RISK_LANE_SCOPED = _bool("ZCODE_RISK_LANE_SCOPED", True)
-RISK_LANE_COOLDOWN = _int("ZCODE_RISK_LANE_COOLDOWN", 900)          # 首次 lane 冷却秒数
-RISK_LANE_COOLDOWN_MAX = _int("ZCODE_RISK_LANE_COOLDOWN_MAX", 7200)  # 阶梯上限（2h）
+# 2026-10-30 冷却曲线整体下调（900/7200/21600 → 180/1800/3600）：探测轮试探
+# 不烧 strike（实测「保持冷却，不追加惩罚」），短名义冷却 + 免费探测 = 自动
+# 调参——上游还在封锁就继续冷却、解封了 ≤3min 回池，不再动辄 15min/2h/6h。
+RISK_LANE_COOLDOWN = _int("ZCODE_RISK_LANE_COOLDOWN", 180)          # 首次 lane 冷却秒数
+RISK_LANE_COOLDOWN_MAX = _int("ZCODE_RISK_LANE_COOLDOWN_MAX", 1800)  # 阶梯上限（30min）
 RISK_LANE_BAN_STRIKES = _int("ZCODE_RISK_LANE_BAN_STRIKES", 4)      # 该 lane 累计达即长冷
-RISK_LANE_BAN_COOLDOWN = _int("ZCODE_RISK_LANE_BAN_COOLDOWN", 21600)  # 长冷 6h（到期自愈）
+RISK_LANE_BAN_COOLDOWN = _int("ZCODE_RISK_LANE_BAN_COOLDOWN", 3600)  # 长冷 1h（到期自愈）
 # strikes 衰减窗口沿用 RISK_STRIKE_DECAY_SECONDS，但按 lane 独立计时（旧实现按
 # 整号：只要打击持续到来，旧 strike 永不衰减，这正是跨天累积成禁用的机制）。
 # plan-lane 回血探测轮（复用 MODEL_PROBE_INTERVAL 节流周期）：冷却尾段主动发
@@ -239,8 +242,10 @@ RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 烧 2 次 strike。请求内 API Key 回退不受影响（api.z.ai 通道与被拦的 plan
 # 通道无关）；Plan 通道真实成功流量解除暂停（Key 回退成功不算）。
 RISK_FAIL_FAST = _bool("ZCODE_RISK_FAIL_FAST", True)       # 防放大器总开关
-RISK_WAVE_PAUSE = _int("ZCODE_RISK_WAVE_PAUSE", 180)       # 波次暂停基础秒数（0 = 关闭）
-RISK_WAVE_PAUSE_MAX = _int("ZCODE_RISK_WAVE_PAUSE_MAX", 3600)  # 暂停指数延长上限
+# 波次暂停同步下调（180/3600 → 90/900，2026-10-30）：暂停窗口内全池快速 503，
+# 是 openclaw 感知「持续报错」的直接来源；探测轮会兜住解封检测。
+RISK_WAVE_PAUSE = _int("ZCODE_RISK_WAVE_PAUSE", 90)        # 波次暂停基础秒数（0 = 关闭）
+RISK_WAVE_PAUSE_MAX = _int("ZCODE_RISK_WAVE_PAUSE_MAX", 900)  # 暂停指数延长上限
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
