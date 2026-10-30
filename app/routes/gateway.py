@@ -19,7 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, reqlog, settings
+from .. import constants, logs, reqlog, riskmetrics, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -365,6 +365,8 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
             account.status = Status.COOLING
             account.cooling_until = account.worst_lane_until() or res["until"]
         store.update_account(account)
+        riskmetrics.record("risk", account.name, signal=signal, lane=res["lane"],
+                           strikes=res["strikes"], model=model or "")
         return (f"通道 {lane} 冷却至 {until_str}（第 {res['strikes']} 次"
                 f"{'，整号全部服务通道均已冷却' if res['all_blocked'] else '，其余通道不受影响'}）")
 
@@ -413,6 +415,8 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
             f"命中风控 ({signal})，指数退避冷却至 {cool_until}（第 {account.risk_strikes} 次）"
         )
         note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
+    riskmetrics.record("risk", account.name, signal=signal, lane="account",
+                       strikes=account.risk_strikes, model=model or "")
     store.update_account(account)
     return note
 
@@ -1374,6 +1378,8 @@ def _risk_wave_confirm(provider: str, account_id: str) -> bool:
     cur = _risk_wave_until.get(provider)
     if cur is None or new_until > cur:
         _risk_wave_until[provider] = new_until
+    riskmetrics.record("wave", account_id, provider=provider,
+                       pause=int(pause), level=level)
     return True
 
 
@@ -1716,6 +1722,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         except httpx.HTTPError as err:
             await client.aclose()
             account.record_result(False, f"连接失败: {err}")
+            riskmetrics.record("net", account.name, err=str(err))
             # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan；
             # 通道级风控退避在场时同理（连接失败不得覆盖风控退避文案与计数）
             if (account.status in (Status.INVALID, Status.DISABLED)
@@ -1882,6 +1889,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     account, str(body.get("model") or "")
                 ):
                     account.record_result(False, "429 频控，换号优先（不原地静默等待）")
+                    riskmetrics.record("rate", account.name, model=str(body.get("model") or ""))
                     logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号")
                     return _NEXT_ACCOUNT
                 if retries_429 < settings.RETRY_429_TIMES:

@@ -8,7 +8,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, logs, reqlog, usage_stats
+from .. import captcha_ledger, logs, reqlog, riskmetrics, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -83,6 +83,13 @@ async def status_info():
             for p in PROVIDERS
         },
     }
+
+
+# ── 风控指标（2026-10-30）───────────────────────────────────────────────────
+# 405/3012 命中、429 限流、连接失败、波次确认的按天聚合；days 上限 90。
+@router.get("/risk-metrics")
+async def risk_metrics(days: int = 7):
+    return riskmetrics.aggregate(days)
 
 
 # ── 新增账号 ─────────────────────────────────────────────────────────────────
