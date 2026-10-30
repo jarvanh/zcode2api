@@ -26,9 +26,6 @@ class _FakeStore:
     def next_lane_uncooldown_at(self, provider, model):
         return None
 
-    def next_claim_round_at(self):
-        return time.time() + 600
-
 
 def _exhausted_account(expiry: float) -> Account:
     acc = Account.create("zai", "t", "hC.a.b")
@@ -38,27 +35,42 @@ def _exhausted_account(expiry: float) -> Account:
     return acc
 
 
-def test_recovery_quota_reports_min_of_window_and_claim(monkeypatch):
-    """全部号额度耗尽 → kind=quota，wait=min(窗口到期, 下一轮领包)。"""
-    expiry = time.time() + 3600
+def test_recovery_quota_defaults_to_23bjon(monkeypatch):
+    """无待生效套餐 → wait=当天北京 23:00（额度重置运营兜底时点）。"""
     monkeypatch.setattr("app.routes.gateway.store",
-                        _FakeStore([_exhausted_account(expiry)]))
+                        _FakeStore([_exhausted_account(time.time() + 86400)]))
     kind, wait = _recovery("zai", "GLM-5.3-Flash")
     assert kind == "quota"
     assert wait is not None
-    # 领包（600s）早于窗口（3600s）→ 取领包时刻
-    assert 595 <= wait - time.time() <= 605
+    from datetime import datetime, timedelta, timezone
+    bj = timezone(timedelta(hours=8))
+    local = datetime.fromtimestamp(wait, bj)
+    assert (local.hour, local.minute) == (23, 0)   # 落在北京 23:00
+    assert wait - time.time() <= 86400             # 不会超过一天
 
 
-def test_recovery_quota_prefers_earlier_claim_round(monkeypatch):
-    """窗口还远、下一轮领包更近 → wait 取领包时刻。"""
-    expiry = time.time() + 86400
-    monkeypatch.setattr("app.routes.gateway.store",
-                        _FakeStore([_exhausted_account(expiry)]))
+def test_recovery_quota_prefers_pending_plan_grant(monkeypatch):
+    """有待生效套餐（未来 starts_at）且早于 23:00 → 用生效时刻。"""
+    acc = _exhausted_account(time.time() + 86400)
+    acc.plan = {"entitlements": [{"starts_at": time.time() + 900}]}
+    monkeypatch.setattr("app.routes.gateway.store", _FakeStore([acc]))
     kind, wait = _recovery("zai", "GLM-5.3-Flash")
     assert kind == "quota"
     assert wait is not None
-    assert wait - time.time() <= 605  # ≤ claim 间隔 600s + 余量
+    assert 890 <= wait - time.time() <= 910        # 取套餐生效时刻
+
+
+def test_recovery_quota_ignores_pending_later_than_reset(monkeypatch):
+    """待生效套餐晚于今天 23:00 → 仍用 23:00（不推迟承诺）。"""
+    acc = _exhausted_account(time.time() + 86400)
+    acc.plan = {"entitlements": [{"starts_at": time.time() + 90000}]}  # 25h 后
+    monkeypatch.setattr("app.routes.gateway.store", _FakeStore([acc]))
+    kind, wait = _recovery("zai", "GLM-5.3-Flash")
+    assert kind == "quota"
+    assert wait is not None
+    from datetime import datetime, timedelta, timezone
+    bj = timezone(timedelta(hours=8))
+    assert datetime.fromtimestamp(wait, bj).hour == 23
 
 
 def test_recovery_quota_skipped_when_lane_cooling_dominates(monkeypatch):

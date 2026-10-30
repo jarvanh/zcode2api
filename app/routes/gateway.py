@@ -431,9 +431,14 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
 
     "quota"（2026-10-30）= 池内全部号额度耗尽（EXHAUSTED）。同样报 429
     model_no_quota 语义而非 503：额度耗尽对下游网关（OmniRoute）是「定向
-    等 reset / 等领包」，503 会被当 node 故障熔断连坐健康模型。恢复时刻取
-    min(最早额度窗口到期, 下一轮领包)——窗口到期即日额度重置点，领包轮则
-    可能更早带回新套餐。
+    等 reset / 等领包」，503 会被当 node 故障熔断连坐健康模型。
+
+    恢复时刻（quota）：默认**当天 23:00（北京时区）**——实测上游 balance
+    窗口的 expires_at 不可信（余额 2.8 亿仍报额度耗尽，grant 腿与 balance
+    是两套账），23:00 是日套餐重置的运营兜底时点；池内若有**待生效套餐**
+    （plans 的 entitlements 带未来 starts_at，已领未生效/预约下发），取最早
+    生效时刻（早于 23:00 才采用）。下一轮自动领取轮也可能带回新套餐，但
+    领取是「尽力而为」（名额可能用完），不作为承诺时刻。
     """
     model_wait = store.next_model_uncooldown_at(provider, model_key)
     lane_wait = store.next_lane_uncooldown_at(provider, model_key)
@@ -444,14 +449,7 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
                  and not a.has_lane_cooling() and not a.is_cooling()]
     if exhausted and not any(
             a.is_selectable(model=model_key) for a in store.list_accounts(provider)):
-        windows = [w.get("expires_at") for a in exhausted
-                   for w in (a.quota or {}).values()
-                   if isinstance(w, dict) and (w.get("expires_at") or 0) > now]
-        candidates = [w for w in windows if w] or []
-        claim_at = store.next_claim_round_at()
-        if claim_at and claim_at > now:
-            candidates.append(claim_at)
-        quota_wait = min(candidates) if candidates else None
+        quota_wait = _quota_reset_at(exhausted, now)
     if model_wait and (not lane_wait or model_wait <= lane_wait):
         return "model", model_wait
     if quota_wait and (not lane_wait or quota_wait <= lane_wait):
@@ -459,6 +457,35 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
     if lane_wait:
         return "lane", lane_wait
     return None, None
+
+
+def _quota_reset_at(accounts: list, now: float) -> float:
+    """额度耗尽后的承诺恢复时刻：默认当天 23:00（北京），待生效套餐更早则用之。
+
+    待生效 = plans[].entitlements[] 里 starts_at（或 effective_at）在未来的
+    条目（已领取/预约但尚未开始发放的套餐授权）。
+    """
+    pending: list[float] = []
+    for a in accounts:
+        for plan in ([a.plan] if isinstance(a.plan, dict) and a.plan else []) \
+                + list(a.plans or []):
+            for ent in (plan or {}).get("entitlements") or []:
+                start = ent.get("starts_at") or ent.get("effective_at") or 0
+                # 上游秒/毫秒都可能下发（claim 载荷即做了 ms 归一），统一到秒
+                start = start / 1000 if start > 1e12 else start
+                if start > now:
+                    pending.append(float(start))
+    today_reset = _bj_today_at(23, 0, now)
+    return min(pending) if pending and min(pending) < today_reset else today_reset
+
+
+def _bj_today_at(hour: int, minute: int, now: float) -> float:
+    """北京时区当天 hour:minute 的 epoch。"""
+    from datetime import datetime, timedelta, timezone
+    bj = timezone(timedelta(hours=8))
+    local = datetime.fromtimestamp(now, bj)
+    target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return target.timestamp() if target.timestamp() > now else target.timestamp() + 86400
 
 
 def _rotate_allowed(account: Account) -> bool:
