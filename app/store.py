@@ -220,6 +220,19 @@ class Store:
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
 
+    def next_claim_round_at(self) -> float | None:
+        """下一轮套餐自动领取的预估时刻（epoch）；轮关闭返回 None。
+
+        保守下界估计：领取轮每 interval 一轮（_round 结束后再等 interval），
+        进程外无法知道上一轮的精确完成时刻，用 interval 直接外推——最坏比
+        实际晚一个周期，用于 Retry-After 足够（额度恢复通常取「窗口重置 /
+        领包」较早者，领包最多等一个周期）。
+        """
+        interval = self.claim_round_interval()
+        if interval <= 0:
+            return None
+        return time.time() + interval
+
     def claim_round_stagger(self) -> int:
         """领取轮账号错峰上限秒数（0 = 关闭）。运行时可改（meta 表），下一轮生效。"""
         try:

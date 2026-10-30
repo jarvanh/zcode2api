@@ -428,11 +428,34 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
     通道被风控冷却（503 no_available_account 语义，携带 Retry-After）。两类
     冷却字段分立、不能共用错误类型：把风控封锁报成 model_no_quota 会误导
     客户端换模型重试（封锁按通道，换啥模型都没用）。
+
+    "quota"（2026-10-30）= 池内全部号额度耗尽（EXHAUSTED）。同样报 429
+    model_no_quota 语义而非 503：额度耗尽对下游网关（OmniRoute）是「定向
+    等 reset / 等领包」，503 会被当 node 故障熔断连坐健康模型。恢复时刻取
+    min(最早额度窗口到期, 下一轮领包)——窗口到期即日额度重置点，领包轮则
+    可能更早带回新套餐。
     """
     model_wait = store.next_model_uncooldown_at(provider, model_key)
     lane_wait = store.next_lane_uncooldown_at(provider, model_key)
+    now = time.time()
+    quota_wait: float | None = None
+    exhausted = [a for a in store.list_accounts(provider)
+                 if a.enabled and a.status == Status.EXHAUSTED
+                 and not a.has_lane_cooling() and not a.is_cooling()]
+    if exhausted and not any(
+            a.is_selectable(model=model_key) for a in store.list_accounts(provider)):
+        windows = [w.get("expires_at") for a in exhausted
+                   for w in (a.quota or {}).values()
+                   if isinstance(w, dict) and (w.get("expires_at") or 0) > now]
+        candidates = [w for w in windows if w] or []
+        claim_at = store.next_claim_round_at()
+        if claim_at and claim_at > now:
+            candidates.append(claim_at)
+        quota_wait = min(candidates) if candidates else None
     if model_wait and (not lane_wait or model_wait <= lane_wait):
         return "model", model_wait
+    if quota_wait and (not lane_wait or quota_wait <= lane_wait):
+        return "quota", quota_wait
     if lane_wait:
         return "lane", lane_wait
     return None, None
@@ -1187,13 +1210,17 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         # （不选号不试探；波次首请求最多烧 2 次 strike）。流式请求改 503 会丢
         # early-flush 的 200 头 —— 仅当尚未收到任何上游流时走到这里，安全。
         if settings.RISK_FAIL_FAST and _risk_wave_paused(provider):
-            remaining = int((_risk_wave_until_for(provider) or time.time()) - time.time()) + 1
+            until = _risk_wave_until_for(provider) or time.time()
+            remaining = int(until - time.time()) + 1
             logs.warn(req_id, f"风控波次暂停中（剩 ~{remaining}s），快速失败不试探账号（防 strike 放大）")
             reqlog.finish_error(req_id, "风控波次暂停中", status=503)
             return JSONResponse(
                 {"error": {
-                    "message": "上游风控波次暂停中（频道级封锁窗口），请稍后重试；窗口由 Plan 通道成功流量自动解除",
-                    "type": "risk_wave_paused",
+                    "message": (f"上游风控波次暂停中（频道级封锁窗口），"
+                                f"预计 {time.strftime('%H:%M', time.localtime(until))} 恢复；"
+                                "窗口由 Plan 通道成功流量自动解除"),
+                    "type": "risk_wave_paused", "code": "channel_cooling",
+                    "next_available_at": round(until),
                 }},
                 status_code=503,
                 headers={"Retry-After": str(max(remaining, 1))},
@@ -1268,11 +1295,25 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                     status_code=429,
                     headers={"Retry-After": str(retry_after)},
                 )
+            if kind == "quota":
+                # 同排队路径：额度耗尽走 429 语义（等窗口重置/领包）
+                return JSONResponse(
+                    {"error": {
+                        "message": "所有账号套餐额度已用尽，等待窗口重置或自动领取新套餐",
+                        "type": "model_no_quota", "code": "no_quota_for_model",
+                        "model": model_key, "queued_seconds": round(queued),
+                        "next_available_at": round(wait),
+                     }, "retry_after": retry_after},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
             # 风控通道冷却：封锁按通道，换模型无济于事 → 503 而非 429 语义
             return JSONResponse(
                 {"error": {
-                    "message": f"全部服务通道均在风控冷却中（已排队等待 {queued:.0f}s），冷却到期自动恢复",
-                    "type": "no_available_account", "queued_seconds": round(queued),
+                    "message": (f"全部服务通道均在风控冷却中（已排队等待 {queued:.0f}s），"
+                                f"预计 {time.strftime('%H:%M', time.localtime(wait))} 恢复"),
+                    "type": "no_available_account", "code": "channel_cooling",
+                    "queued_seconds": round(queued),
                     "next_available_at": round(wait),
                 }, "retry_after": retry_after},
                 status_code=503,
@@ -1301,10 +1342,24 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 status_code=429,
                 headers={"Retry-After": str(retry_after)},
             )
+        if kind == "quota":
+            # 同排队路径：额度耗尽走 429 语义（等窗口重置/领包），不带排队秒数
+            return JSONResponse(
+                {"error": {
+                    "message": "所有账号套餐额度已用尽，等待窗口重置或自动领取新套餐",
+                    "type": "model_no_quota", "code": "no_quota_for_model",
+                    "model": model_key, "next_available_at": round(wait),
+                 }, "retry_after": retry_after},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
         return JSONResponse(
             {"error": {
-                "message": "全部服务通道均在风控冷却中，冷却到期自动恢复（封锁按通道，换模型无济于事）",
-                "type": "no_available_account", "next_available_at": round(wait),
+                "message": (f"全部服务通道均在风控冷却中，"
+                            f"预计 {time.strftime('%H:%M', time.localtime(wait))} 恢复"
+                            "（封锁按通道，换模型无济于事）"),
+                "type": "no_available_account", "code": "channel_cooling",
+                "next_available_at": round(wait),
             }, "retry_after": retry_after},
             status_code=503,
             headers={"Retry-After": str(retry_after)},
