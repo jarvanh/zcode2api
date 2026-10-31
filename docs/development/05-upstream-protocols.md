@@ -107,8 +107,14 @@ API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证
 ## 5. 领取（活动套餐）
 
 ```
-GET  billing/preview   → data.previews[]: ClaimPlan{plan_id,name,description,priority,grants,grant_items[{name,units,period}]}
-                          （活动未上线时 404 —— 属正常态，静默跳过）
+GET  billing/preview   → data.plans[]: ClaimPlan{plan_id,name,description,priority,grants,grant_items[{name,units,period}]}
+                          （键名订正 2026-10-31：旧文档写 data.previews[] 有误，官方
+                          server-core.js getManualClaimPlanPreviews 读的是 data.plans，
+                          且对 **缺 data** 直接抛 manual_claim_preview_missing_data）
+                          投放空窗形态（实测 2026-10-31）：HTTP 200 {"code":0,"msg":"","logid":...}
+                          ——**无 data 字段**（不是 data.plans=[]）。注意：空 preview 不等于
+                          「无可领」——同一时刻带明确 plan_id 打 claim 仍可 code=0 发放；
+                          网关因此做 plan_id 收割 + 空窗兜底领取（见 app/claim.py 兜底注释）
                           查询参数: app_version 必带；platform 参数 preview 容忍、client/configs 拒绝（3001）
 POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCode-App-Version + X-Platform
                           （实测缺版本/平台头即使验证码有效也 3007 —— asar claimManualPlan 头形态）; body: {plan_id}
@@ -117,10 +123,13 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.14.4"`（官方客户端
-现行版实证：ZCode.exe 注册表 DisplayVersion 3.14.4（2026-10-02 本机实测；前值 3.14.3.7762，构建 2026-09-22）；
-zcode-switch Windows 路径读注册表本机真实版同值。**活动投放按最低客户端版本门槛
-（见上「前置」行），官方升版后钉旧版会 preview 恒空 ineligible——升版先改此常量**）；
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.17.1"`（官方客户端
+现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.17.1（2026-10-31 实测；
+前值 3.16.3 为 2026-10-23 实测）；zcode-switch Windows 路径读注册表本机真实版同源。
+**升版先改此常量**；网关启动时比对本机 current.json 并在落伍时告警
+（app/main.py `_warn_version_drift`）。
+订正 2026-10-31：同一号分别用 3.16.3 / 3.17.1 打 preview 结果一致（都无 data），
+且用 3.16.3 带 plan_id 能领取成功——版本门槛**不是**本次「领不到」的根因）；
 无账号路径的 `CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`）。
 有账号时 `X-Platform` / preview `platform` 跟该号 DeviceProfile 走（成套桌面 SKU，一号一台），禁止再盖成全局 darwin-arm64。
 `USER_AGENT` / `X-ZCode-App-Version` / configs 查询串全部引用版本常量。

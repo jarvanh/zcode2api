@@ -261,6 +261,10 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        if getattr(app.state, "billing_current_scenario", None) == "no_data":
+            # 上游投放空窗形态（2026-10-31 实测）：code=0 但**无 data 字段**
+            return Response(json.dumps({"code": 0, "msg": "", "logid": "mock"}),
+                            media_type="application/json")
         return Response(json.dumps({
             "data": {"plans": [{
                 "plan_id": "start", "show_name": "Start Plan",
@@ -275,16 +279,24 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
-        return Response(json.dumps({
-            "data": {"balances": [
-                {"model": "GLM-5.3", "show_name": "GLM-5.3",
-                 "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
-                 "expires_at": "2099-01-01T00:00:00Z"},
-                {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
-                 "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
-                 "expires_at": "2099-01-01T00:00:00Z"},
-            ]},
-        }), media_type="application/json")
+        payload = {"data": {"balances": [
+            {"model": "GLM-5.3", "show_name": "GLM-5.3",
+             "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
+             "expires_at": "2099-01-01T00:00:00Z"},
+            {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
+             "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
+             "expires_at": "2099-01-01T00:00:00Z"},
+        ]}}
+        # 测试协议：app.state.billing_balance_plans 设列表时，balance 附带已生效
+        # plans[]（真上游形态：current 空窗而 balance 带套餐，2026-10-31 实证）；
+        # app.state.billing_balance_windows 设列表时整体替换日窗（构造全耗尽场景）
+        windows = getattr(app.state, "billing_balance_windows", None)
+        if windows is not None:
+            payload["data"]["balances"] = list(windows)
+        plans = getattr(app.state, "billing_balance_plans", None)
+        if plans is not None:
+            payload["data"]["plans"] = list(plans)
+        return Response(json.dumps(payload), media_type="application/json")
 
     async def _usage(request: Request) -> Response:
         _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
@@ -327,6 +339,11 @@ def build_app() -> FastAPI:
         scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
         if scenario == "claim_none":
             plans: list = []
+        elif scenario == "claim_no_data":
+            # 上游投放空窗真实形态（2026-10-31 实测）：code=0 且**无 data 字段**，
+            # 但带明确 plan_id 打 claim 仍能 code=0 发放
+            return Response(json.dumps({"code": 0, "msg": "", "logid": "mock-logid"}),
+                            media_type="application/json")
         elif scenario == "claim_claimed":
             return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
                             media_type="application/json")

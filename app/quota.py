@@ -85,7 +85,10 @@ def _bonus_active(plan: dict, now: float) -> bool:
     for e in (plan or {}).get("entitlements") or []:
         if e.get("period") != "one_time":
             continue
-        eff = e.get("effective_at") or 0
+        # 上游实测键名是 starts_at（billing/balance plans[].entitlements[]），
+        # effective_at 是 zcode-switch 侧口径；只认后者会恒判「无赠送池」，
+        # 日窗用完但 5 亿一次性池仍在的账号被误标 exhausted（2026-10-31 实证）
+        eff = e.get("effective_at") or e.get("starts_at") or 0
         ends = e.get("ends_at") or e.get("expires_at") or 0
         if eff and eff <= now and (not ends or now <= ends):
             return True
@@ -149,14 +152,31 @@ async def fetch_quota(account: Account) -> dict:
             store.update_account(account)
             return {"error": account.last_error}
 
+    # plans[] 归并（plan_id 去重）：current 在投放空窗会返回 code=0 且**无 data**
+    # （plans 恒空），而 balance 一直带着已生效套餐。旧实现只认 current 且直接
+    # 赋值，等于每次刷新都把 account.plans 清成 []，_bonus_active 从此永不命中
+    # ——赠送池账号被误标 exhausted、面板停在旧窗口读数（2026-10-31 实证）。
+    plans_by_id: dict[str, dict] = {}
+    plans_source_ok = False
+
+    def _collect_plans(payload: dict) -> bool:
+        # 返回「本次响应含 data 对象」（即权威 plans 源）。缺 data 的响应不得
+        # 当作「plans 为空」的依据——上游投放空窗就是 code=0 无 data（官方客户端
+        # 对此直接抛 manual_claim_preview_missing_data，口径对齐）。
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return False
+        for p in data.get("plans") or []:
+            pid = str(p.get("plan_id") or "").strip()
+            if pid and pid not in plans_by_id:
+                plans_by_id[pid] = p
+        return True
+
     if billing_res is not None and billing_res.status_code == 200:
         try:
             data = billing_res.json()
             result["billing"] = data
-            plans = (data.get("data") or {}).get("plans") or []
-            # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个
-            account.plans = plans
-            account.plan = plans[0] if plans else {}
+            plans_source_ok = _collect_plans(data) or plans_source_ok
         except (ValueError, KeyError):
             pass
 
@@ -182,8 +202,22 @@ async def fetch_quota(account: Account) -> dict:
                     logs.warn("quota", f"balance 同名窗口 {name} 已合并")
                 else:
                     quota_map[name] = window
+            plans_source_ok = _collect_plans(data) or plans_source_ok
         except (ValueError, KeyError):
             pass
+
+    if plans_source_ok:
+        # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个。
+        # 两侧都拿不到 plans 数据时保持原值，不用空列表覆盖历史事实。
+        account.plans = list(plans_by_id.values())
+        account.plan = account.plans[0] if account.plans else {}
+        # 投放 id 收割：上游会绕过 preview 直接把套餐入账（10-30 周末套餐实证），
+        # 这些 id 只能从已入账号的 balance/current 里看到。入池后自动领取轮的
+        # 空窗兜底（_probe_unlisted_plans）靠它给其它号领取同一活动。
+        if plans_by_id:
+            from .claim import remember_plan_ids
+
+            remember_plan_ids(list(plans_by_id))
 
     if usage_res is not None and usage_res.status_code == 200:
         try:

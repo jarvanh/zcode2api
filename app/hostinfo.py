@@ -24,6 +24,7 @@ host_profile / 运维对照，禁止再当作多账号共用的上游身份。
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
@@ -139,6 +140,21 @@ def _host_os_version() -> str:
         if kernel:
             return kernel
     return platform.release() or "0.0"
+
+
+def local_client_version() -> str | None:
+    """本机官方 ZCode 客户端版本（~/.zcode/server/current.json 的 appVersion）。
+
+    zcode-switch 在 Windows 读注册表取本机真实版，Linux 无注册表，改读本机
+    current.json。文件缺失/解析失败一律返 None（不抛），只用于升版漂移告警。
+    """
+    path = Path.home() / ".zcode" / "server" / "current.json"
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    ver = data.get("appVersion") or data.get("version")
+    return ver.strip() if isinstance(ver, str) and ver.strip() else None
 
 
 def host_profile_cls():

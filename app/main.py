@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import logs, settings
+from . import constants, hostinfo, logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import model_probe, monitor, risk_lane_probe
@@ -21,6 +21,27 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001
         pass
+
+
+def _warn_version_drift() -> None:
+    """钉死的 billing 版本 vs 本机官方客户端真实版 → 落伍就告警。
+
+    hub 跟 zcode-switch 不同（后者 Windows 读注册表自动跟随本机真实版），
+    只能钉常量。上游随时可按客户端版本拉高投放门槛，而 preview 空窗在日志里
+    只表现为「无投放套餐」——没这道告警就得人工重新怀疑一轮（2026-10-31 走过）。
+    本机无官方客户端（检测不到）时静默跳过。
+    """
+    local = hostinfo.local_client_version()
+    if not local:
+        return
+    if local != constants.BILLING_APP_VERSION:
+        logs.warn(
+            "version",
+            f"钉定的客户端版本 {constants.BILLING_APP_VERSION} 落后于本机官方 "
+            f"{local}：改 app/constants.py 的 BILLING_APP_VERSION/CLIENT_APP_VERSION",
+        )
+    else:
+        logs.info("version", f"客户端版本对齐官方 {local}")
 
 
 def _display_host() -> str:
@@ -117,6 +138,7 @@ async def lifespan(app: FastAPI):
     captcha_manager.start()   # 验证码预解池后台补充
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
     _run_install_sequence_on_start()
+    _warn_version_drift()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",

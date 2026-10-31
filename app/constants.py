@@ -45,7 +45,7 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源：官方客户端 3.16.3，2026-10-23 跟进）────────────────
+# ── 客户端版本（单一真相源：官方客户端 3.17.1，2026-10-31 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
 # 出处：本机官方 ZCode Server current.json（appVersion=3.16.3，2026-10-23 实测；
 # 前值 3.14.4 为 2026-10-02 注册表实测），Linux 无注册表改读 current.json。
@@ -53,7 +53,12 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
 # ⚠️ 上游疑似按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空，
 # 跟进官方现行版后恢复——发现 preview 为空时优先核对此常量是否落后于官方。
-CLIENT_APP_VERSION = "3.16.3"
+# 2026-10-31 复测订正：版本门槛**不是**本次「领不到」的根因（同一号用 3.16.3
+# 与 3.17.1 打 preview 结果一致（都无 data），且带 plan_id 用 3.16.3 能领取成功）；
+# 真正根因是 preview 空窗与套餐发现渠道（见 claim.py 空窗兜底）。但钉旧版仍是
+# 长期隐患（上游随时可拉高门槛），官方升版照跟；启动时会比对本机
+# ~/.zcode/server/current.json 并在落伍时告警（main.py lifespan）。
+CLIENT_APP_VERSION = "3.17.1"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
@@ -61,7 +66,7 @@ CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.16.3"
+BILLING_APP_VERSION = "3.17.1"
 BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
 BILLING_RELEASE_CHANNEL = "stable"
 # 官方客户端每日活跃事件：POST /api/v1/event/report（不在 zcode-plan 下、无

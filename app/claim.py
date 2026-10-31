@@ -204,6 +204,142 @@ async def report_activation_events(account: Account) -> str | None:
 # preview 端点不走此门（用户触发 = zcode-switch claim_refresh 语义）。
 _ACTIVATION_REPORTED: dict[str, str] = {}
 
+# ── preview 空窗兜底（投放发现）────────────────────────────────────
+# 2026-10-31 实证：三个号的 billing/preview 返回 {"code":0,"msg":"","logid":...}
+# ——连 data 字段都没有——但带明确 plan_id 打 billing/claim 返回 code=0 真实发放。
+# 即「preview 空」不等于「无可领套餐」（官方客户端也不当空：server-core.js
+# getManualClaimPlanPreviews 对缺 data 直接抛 manual_claim_preview_missing_data）。
+# 旧实现把空 preview 一律记「上游无投放套餐，跳过领取」，活动投放从此永远看不
+# 到——这就是主人手动领到、网关领不到的根因。
+# 兜底候选源（只认这两个，两者都是「上游真发过」的 id）：
+#   1. preview 列出过的（remember_plan_ids）；
+#   2. 任一池内账号已入账的 plans[]（quota.fetch_quota 收割）——上游绕过
+#      preview 直接发放时，这是唯一的发现渠道（10-30 周末套餐就只在 131 的
+#      balance 里出现过）。
+# 公开 client/configs 的 startPlanPreview 不作为候选源：实测它只列基座套餐
+# （zcode-v3-start-plan），对活动 id（…-1030-wk）零信息，打过去只能吃 1003，
+# 每天白白消耗验证码求解与风控分数。
+# 候选跳过账号已持有的（1003 确定），每号每天限次（防候选长期不变打爆码池）。
+_KNOWN_PLANS_META = "claim_known_plan_ids"
+_PROBE_META = "claim_probe_tried"
+_PROBE_DAILY_BUDGET = 2
+
+
+def known_plan_ids() -> list[str]:
+    """历史发现过的可领套餐 id（meta 持久化，重启不丢）。"""
+    from .store import store
+
+    try:
+        arr = json.loads(str(store.get_setting(_KNOWN_PLANS_META, "") or "[]"))
+    except ValueError:
+        return []
+    return [x for x in arr if isinstance(x, str) and x.strip()] if isinstance(arr, list) else []
+
+
+def remember_plan_ids(plan_ids: list[str]) -> None:
+    """并集入库（只增不减；失效 id 由 _forget_plan_id 按上游 1001 剔除）。"""
+    from .store import store
+
+    clean = [p for p in plan_ids if p and p.strip()]
+    if not clean:
+        return
+    known = known_plan_ids()
+    merged = list(dict.fromkeys(known + clean))
+    if merged != known:
+        store.set_setting(_KNOWN_PLANS_META, json.dumps(merged))
+
+
+def _forget_plan_id(plan_id: str) -> None:
+    from .store import store
+
+    known = known_plan_ids()
+    if plan_id in known:
+        store.set_setting(_KNOWN_PLANS_META, json.dumps([p for p in known if p != plan_id]))
+
+
+def _probe_state() -> tuple[str, dict]:
+    """(当日 key, 账号 id → 当日已试过的候选 plan_id)。跨重启持久化，免重复烧码。"""
+    from .store import store
+
+    day = _today_key()
+    try:
+        raw = json.loads(str(store.get_setting(_PROBE_META, "") or "{}"))
+    except ValueError:
+        return day, {}
+    if not isinstance(raw, dict) or raw.get("date") != day:
+        return day, {}
+    tried = raw.get("tried")
+    return day, tried if isinstance(tried, dict) else {}
+
+
+def _record_probe(account_id: str, plan_id: str) -> None:
+    day, tried = _probe_state()
+    ids = list(tried.get(account_id) or [])
+    if plan_id not in ids:
+        ids.append(plan_id)
+    tried[account_id] = ids
+    from .store import store
+
+    store.set_setting(_PROBE_META, json.dumps({"date": day, "tried": tried}))
+
+
+def _held_plan_ids(account: Account) -> set[str]:
+    """账号已持有的套餐 id（balance/current 的 plans[]），候选必须排除。"""
+    out: set[str] = set()
+    for p in account.plans or []:
+        pid = str((p or {}).get("plan_id") or "").strip()
+        if pid:
+            out.add(pid)
+    return out
+
+
+async def _probe_unlisted_plans(account: Account,
+                               skip_plan_ids: set[str] | None = None) -> list[dict]:
+    """preview 空时按候选 plan_id 直接尝试领取（投放空窗兜底）。
+
+    幂等安全：1003（已领取过）不判失败；1001（套餐不存在）说明 id 已下线，从
+    记住的候选里剔除。领取成功才计入 outcomes，失败只记日志（防面板噪声）。
+    skip_plan_ids：1005 名额等待期跳过的 id（与 preview 主路同语义），不消耗预算。
+    """
+    tried = _probe_state()[1]
+    tried_ids = set(tried.get(account.id) or [])
+    if len(tried_ids) >= _PROBE_DAILY_BUDGET:
+        return []
+
+    skip = skip_plan_ids or set()
+    held = _held_plan_ids(account)
+    candidates: list[str] = []
+    for pid in known_plan_ids():
+        if pid and pid not in held and pid not in tried_ids and pid not in skip \
+                and pid not in candidates:
+            candidates.append(pid)
+    # 预算按「真没试过的候选」数收口：held 命中不消耗每日额度（它们必定 1003，
+    # 记账只会把后面的新候选顶掉，白等一天）
+    candidates = candidates[:max(0, _PROBE_DAILY_BUDGET - len(tried_ids))]
+    if not candidates:
+        return []
+
+    logs.info("claim", f"账号 {account.name} preview 空，兜底尝试候选套餐: {candidates}")
+    outcomes: list[dict] = []
+    for pid in candidates:
+        # 先记账后打：异常/超时同样消耗预算，避免重启后反复重打同一候选
+        _record_probe(account.id, pid)
+        try:
+            result = await claim(account, pid)
+        except ClaimError as err:
+            if err.code == 1001:
+                _forget_plan_id(pid)
+            logs.info("claim", f"账号 {account.name} 兜底领取 {pid} 未成功: {err}")
+            continue
+        except Exception as err:  # noqa: BLE001 - 兜底路径绝不外溢
+            logs.warn("claim", f"账号 {account.name} 兜底领取 {pid} 异常: {err}")
+            continue
+        outcomes.append({"account_id": account.id, "account_name": account.name,
+                         "ok": True, **result, "probe": True})
+        logs.ok("claim", f"账号 {account.name} 兜底领取成功: "
+                         f"{result.get('plan_name') or pid}（preview 未列此套餐）")
+    return outcomes
+
 
 def _today_key() -> str:
     return time.strftime("%Y-%m-%d")
@@ -239,13 +375,18 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
     try:
         plans = await preview_plans(account)
     except ClaimError as err:
-        logs.info("claim", f"账号 {account.name} 无可领套餐（{err}）")
+        logs.info("claim", f"账号 {account.name} 无可领套餐（{err}），转兜底候选")
+        outcomes.extend(await _probe_unlisted_plans(account, skip_plan_ids))
         return outcomes
     except Exception as err:  # noqa: BLE001
         logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
         return outcomes
 
     if not plans:
+        probed = await _probe_unlisted_plans(account, skip_plan_ids)
+        if probed:
+            outcomes.extend(probed)
+            return outcomes
         logs.info("claim", f"账号 {account.name} 上游无投放套餐，跳过领取")
         return outcomes
 
@@ -298,18 +439,36 @@ async def preview_plans(account: Account) -> list[dict]:
     code = _business_code(body)
     if code != 0:
         raise _fail_error(code, body)
-    raw_plans = (body.get("data") or {}).get("plans") or []
+    data = body.get("data")
+    if not isinstance(data, dict):
+        # 上游投放空窗的真实形态（实测 code=0 且无 data）。旧实现静默成「无可领」
+        # 且不留痕迹，导致「领不到」与「上游真没发」在日志里不可区分。
+        logs.info("claim", f"账号 {account.name} preview 无 data 字段（上游投放空窗形态）")
+        return []
+    raw_plans = data.get("plans") or []
     plans = [parsed for parsed in (parse_plan(p) for p in raw_plans) if parsed]
     plans.sort(key=lambda p: (-p["priority"], p["plan_id"]))
+    # preview 列出的 id 是最可信的候选源，入库供空窗兜底复用
+    remember_plan_ids([p["plan_id"] for p in plans])
     return plans
 
 
 async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, str, list]:
-    """plan_id 为空时 preview 自动选优先级最高套餐。返回 (plan_id, plan_name, grants)。"""
+    """plan_id 为空时 preview 自动选优先级最高套餐。返回 (plan_id, plan_name, grants)。
+
+    preview 空时降级到收割候选（preview 历史列出过 / 池内任一号已入账的 id）——
+    后台面板的「手动领取」走的正是这条路，不降级就只能报「没有待领取的套餐」，
+    而同一时刻带明确 id 打 claim 是能成功的（2026-10-31 实证）。
+    """
     if plan_id:
         return plan_id, "", []
     plans = await preview_plans(account)
     if not plans:
+        held = _held_plan_ids(account)
+        for pid in known_plan_ids():
+            if pid and pid not in held:
+                logs.info("claim", f"账号 {account.name} preview 空，改用收割候选 {pid}")
+                return pid, "", []
         raise ClaimError("没有待领取的套餐")
     best = plans[0]
     return best["plan_id"], best["name"] or best["plan_id"], best["grants"]
