@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, logs, reqlog, riskmetrics, usage_stats
+from .. import captcha_ledger, freshness, logs, reqlog, riskmetrics, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -51,6 +52,21 @@ def _username_for(account) -> str | None:
         return None
     alias = store.get_setting(f"alias:{uid}")
     return str(alias) if alias else None
+
+
+@router.get("/sections/freshness")
+async def sections_freshness():
+    """system sidecar 文本新鲜度（2026-10-31 文本校验波次防复发哨兵）。
+
+    返回每日巡检落库的缓存状态；无缓存（首次/重启后未巡检）现算一次。
+    """
+    raw = store.get_setting("sections_freshness")
+    if raw:
+        try:
+            return {"data": json.loads(raw)}
+        except ValueError:
+            pass
+    return {"data": freshness.status()}
 
 
 @router.get("/accounts")

@@ -292,6 +292,12 @@ ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGI
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 APP_VERSION = "2.7.0"
 
+# system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
+# sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
+# 供 admin API（GET /admin/api/sections/freshness）与 healthcheck 读取；
+# 风控波次确认时若已过时，日志给「高度疑似措辞触发」提示（gateway 波次点）。
+SECTIONS_STALE_DAYS = _int("ZCODE_SECTIONS_STALE_DAYS", 21)
+
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 
 

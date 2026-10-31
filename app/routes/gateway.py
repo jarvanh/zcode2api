@@ -19,7 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, reqlog, riskmetrics, settings
+from .. import constants, freshness, logs, reqlog, riskmetrics, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -1470,6 +1470,11 @@ def _risk_wave_confirm(provider: str, account_id: str) -> bool:
         _risk_wave_until[provider] = new_until
     riskmetrics.record("wave", account_id, provider=provider,
                        pause=int(pause), level=level)
+    # 文本校验波次叠加提示（2026-10-31 教训）：sidecar 若已过时，波次大概率
+    # 就是措辞触发而非频控——趁运维还在看日志的时候把线索递到位。
+    hint = freshness.stale_hint()
+    if hint:
+        logs.warn("risk", f"风控波次与 sidecar 文本过时叠加，高度疑似措辞触发: {hint}")
     return True
 
 

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import constants, hostinfo, logs, settings
+from . import constants, freshness, hostinfo, logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import model_probe, monitor, risk_lane_probe
@@ -133,6 +133,7 @@ async def lifespan(app: FastAPI):
     if installed:
         logs.ok("install", f"存量账号补配安装身份 ×{installed}")
     monitor.start()
+    freshness.start()      # system sidecar 文本新鲜度巡检（0 依赖，防 405 文本校验波次复发）
     model_probe.start()       # 模型冷却探测轮（领包回血，0 = 关闭）
     risk_lane_probe.start()   # plan-lane 风控冷却探测轮（RISK_LANE_PROBE = 关闭）
     captcha_manager.start()   # 验证码预解池后台补充
@@ -149,6 +150,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await monitor.stop()
+        await freshness.stop()
         await model_probe.stop()
         await risk_lane_probe.stop()
         await claim_round.stop()
