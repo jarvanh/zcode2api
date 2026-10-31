@@ -429,9 +429,11 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
     冷却字段分立、不能共用错误类型：把风控封锁报成 model_no_quota 会误导
     客户端换模型重试（封锁按通道，换啥模型都没用）。
 
-    "quota"（2026-10-30）= 池内全部号额度耗尽（EXHAUSTED）。同样报 429
-    model_no_quota 语义而非 503：额度耗尽对下游网关（OmniRoute）是「定向
-    等 reset / 等领包」，503 会被当 node 故障熔断连坐健康模型。
+    "quota"（2026-10-30，2026-10-31 改 402）= 池内全部号额度耗尽（EXHAUSTED）。
+    报 402 而非 503/429：503 会被下游（OmniRoute）当 node 故障熔断连坐健康
+    模型；429 在其分类器里对 api-key 连接无条件判 RATE_LIMITED（不看文案），
+    令「仅配额耗尽回退」失效且给连接打限流标记。402 无条件判
+    QUOTA_EXHAUSTED（cooldownMs=0），恰好命中其「仅配额耗尽回退」语义。
 
     恢复时刻（quota）：默认**当天 23:00（北京时区）**——实测上游 balance
     窗口的 expires_at 不可信（余额 2.8 亿仍报额度耗尽，grant 腿与 balance
@@ -1307,7 +1309,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         kind, wait = _recovery(provider, model_key)
         reqlog.finish_error(
             req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）",
-            status=429 if (kind == "model" and wait) else 503,
+            status=429 if (kind == "model" and wait) else (
+                402 if kind == "quota" else 503),
         )
         if wait and wait > time.time():
             retry_after = max(1, int(wait - time.time() + 0.999))
@@ -1323,7 +1326,11 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                     headers={"Retry-After": str(retry_after)},
                 )
             if kind == "quota":
-                # 同排队路径：额度耗尽走 429 语义（等窗口重置/领包）
+                # 池级额度耗尽走 402 而非 429（2026-10-31）：下游 OmniRoute 的
+                # 错误分类器对 api-key 连接的 429 无条件判 RATE_LIMITED（不看
+                # 文案与 Retry-After），会提前终止 combo 并给连接打限流标记；
+                # 402 无条件判 QUOTA_EXHAUSTED（cooldownMs=0，不污染连接），
+                # 才能命中其「仅配额耗尽回退」。kind=="quota" 蕴含 wait 非空。
                 return JSONResponse(
                     {"error": {
                         "message": "所有账号套餐额度已用尽，等待窗口重置或自动领取新套餐",
@@ -1331,7 +1338,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                         "model": model_key, "queued_seconds": round(queued),
                         "next_available_at": round(wait),
                      }, "retry_after": retry_after},
-                    status_code=429,
+                    status_code=402,
                     headers={"Retry-After": str(retry_after)},
                 )
             # 风控通道冷却：封锁按通道，换模型无济于事 → 503 而非 429 语义
@@ -1356,7 +1363,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     kind, wait = _recovery(provider, model_key)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
-                        status=429 if (kind == "model" and wait) else 503)
+                        status=429 if (kind == "model" and wait) else (
+                            402 if kind == "quota" else 503))
     if wait and wait > time.time():
         retry_after = max(1, int(wait - time.time() + 0.999))
         if kind == "model":
@@ -1370,14 +1378,14 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 headers={"Retry-After": str(retry_after)},
             )
         if kind == "quota":
-            # 同排队路径：额度耗尽走 429 语义（等窗口重置/领包），不带排队秒数
+            # 池级额度耗尽走 402 而非 429（语义同上排队路径；不带排队秒数）
             return JSONResponse(
                 {"error": {
                     "message": "所有账号套餐额度已用尽，等待窗口重置或自动领取新套餐",
                     "type": "model_no_quota", "code": "no_quota_for_model",
                     "model": model_key, "next_available_at": round(wait),
                  }, "retry_after": retry_after},
-                status_code=429,
+                status_code=402,
                 headers={"Retry-After": str(retry_after)},
             )
         return JSONResponse(
