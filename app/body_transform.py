@@ -1,21 +1,29 @@
-"""请求体变换 —— 镜像官方 ZCode 3.16.3 ContextBuilder（bundle Fje/
-assembleSystemMessages，2026-10-24 实弹验证；此前 10-12 起的 405/3012
-"unusual activity" 根因即旧形状：独立 Environment 块 + powered-by 独立块
- 是官方客户端从不产生的形状，上游 WAF 按形状拦截，与账号/指纹无关）。
+"""请求体变换 —— 镜像官方 ZCode 3.17.1 ContextBuilder（bundle
+assembleSystemMessages；3.16.3 版镜像见 git 历史 zcode_sections_3163.json）。
+
+上游 WAF 对 system 块的校验史（同为 HTTP 405 承载的 3012 "unusual activity"，
+与账号/指纹/出口无关）：
+  2026-10-12 起  按块「形状」拦截：独立 Environment 块 + powered-by 独立块、
+                 2 块子代理形状均被拒，只认官方 3 块默认链（10-24 实弹修复）。
+  2026-10-31 起  按「文本」拦截：块1 cli_prefix 与块2 stable 的措辞必须与
+                 当前官方版本（3.17.1）一致——"an interactive coding agent"
+                 （3.16.3）与块2 里的 Desktop Context 追加段均触发 405；
+                 块3 dynamic 不校验（10-31 离线二分实弹：base 405 /
+                 3.17.1 块1+2 + 3.16.3 块3 200，交叉混合逐块定位）。
 
 官方桌面端默认装配（assembleSystemMessages）恰好 3 个线缆块：
   块1 cli_prefix 单独一块，无 cache_control（3.15.1 起不再带）；
-  块2 全部 stable 段 \n\n 连接（Agent Identity + Desktop Context），ephemeral；
+  块2 全部 stable 段 \n\n 连接（3.17.1：Agent Identity + Harness；CLI 面
+      不携带 Desktop Context），ephemeral；
   块3 全部 dynamic 段 \n\n 连接并带 "\n\n" 前缀（Dynamic Behavior /
       Environment Info（powered-by 行并入本段末行）/ Context
       Management），ephemeral。
-客户端自带 system（customSystemPrompt 语义，子代理形态）：2026-10-24 实弹
-  对照（同号同刻）：官方 2 块形状 [cli_prefix, "\n"+custom] 被 WAF 405，
-  默认 3 块 200 —— 上游形状校验已收紧到只认默认链。修法：custom 本就是
-  官方语义里的 stable 段（bundle Oda cacheHint:"stable"），并入 stable
-  合并块尾部，线缆形状与已验证 200 的默认链同构，仅文本多一段。
+客户端自带 system（customSystemPrompt 语义）：官方 bundle 里本就是 stable
+  段（Oda cacheHint:"stable"），但块2 文本已被上游按版本校验，任何追加都会
+  破坏逐字节一致性——改并入块3（dynamic）尾部（Agent2API PR #343 同语义，
+  10-31 实弹 200）。
 另注入 meta_user context_prefix（currentDate 的 <system-reminder> 首条
-user 消息，官方客户端始终携带）。
+user 消息，官方客户端始终携带；10-31 实弹证实不受校验）。
 
 所有变换对畸形输入保持 no-op：解析失败返回原样，坏 body 永远不会被这里放大。
 """
@@ -23,13 +31,12 @@ user 消息，官方客户端始终携带）。
 from __future__ import annotations
 
 import base64
-import copy
 import datetime
 import json
 import os
 from pathlib import Path
 
-Sections = dict  # 侧车 zcode_sections_3163.json 的加载形态
+Sections = dict  # 侧车 zcode_sections_3171.json 的加载形态
 
 
 def _load_sections() -> Sections | None:
@@ -37,7 +44,7 @@ def _load_sections() -> Sections | None:
     if _SECTIONS is None:
         try:
             _SECTIONS = json.loads(
-                (Path(__file__).with_name("zcode_sections_3163.json")).read_text("utf-8")
+                (Path(__file__).with_name("zcode_sections_3171.json")).read_text("utf-8")
             )
         except (OSError, ValueError):
             _SECTIONS = {}
@@ -125,14 +132,6 @@ def build_environment_section(env: dict, model: str | None, provider: str | None
     return "\n".join(lines)
 
 
-def build_desktop_context_section() -> str:
-    """Desktop Context 段（bundle Ekn）：无 vizDir 的 1 行 fallback 变体。"""
-    dc = _load_sections()["desktopContext"]
-    iv = dc["interactiveViews"]
-    interactive = "\n".join([iv["heading"], iv["fallbackLine"], iv["widgetLine"]])
-    return "\n\n".join([dc["heading"], interactive, dc["filesAndUrlsOnwards"]])
-
-
 def build_start_plan_system(
     existing_system: object,
     model: str | None = None,
@@ -140,7 +139,7 @@ def build_start_plan_system(
     env: dict | None = None,
 ) -> list[dict]:
     """镜像官方 assembleSystemMessages 的 3 块默认装配；custom system 并入
-    stable 合并块（2026-10-24 实弹：2 块子代理形状被 WAF 405，见模块头注释）。
+    dynamic 合并块尾部（块2 须保持 3.17.1 逐字节官方文本，见模块头注释）。
 
     env 段值必须与身份头同源（platform/osVersion 与 X-Platform/X-Os-Version
     一致），混合组合是真实客户端不产生的形状。
@@ -150,19 +149,18 @@ def build_start_plan_system(
         return []
     custom = _custom_system_text(existing_system)
     env = env or {}
-    stable = "\n\n".join(["\n\n".join(sec["stableSections"]), build_desktop_context_section()])
-    if custom is not None:
-        # 2026-10-24 实弹：官方 2 块子代理形状（custom 独占 stable 块、dynamic 全
-        # 跳过）也被上游 WAF 405 —— 同号同刻对照，默认 3 块 200 / 2 块 custom 405。
-        # 上游校验已收紧到「只认默认链」。custom 在官方 bundle 本就是 stable 段
-        # （Oda cacheHint:"stable"，content="\n"+o），并入 stable 合并块尾部：
-        # 线缆 3 块与已验证 200 的默认形状同构，仅 stable 段文本多一段 custom。
-        stable = "\n\n".join([stable, f"\n{custom}"])
+    stable = "\n\n".join(sec["stableSections"])
     dynamic = "\n\n".join([
         sec["dynamicSections"]["beforeEnvironment"],
         build_environment_section(env, model, provider),
         sec["dynamicSections"]["afterEnvironment"],
     ])
+    if custom is not None:
+        # 2026-10-31 起 WAF 按版本校验块1/块2 文本：stable 块任何追加都会破坏
+        # 逐字节一致性（"an interactive coding agent" 旧措辞与 Desktop Context
+        # 追加段均 405）。custom（官方语义 stable 段）改并入不受校验的块3 尾部，
+        # 线缆仍为 3 块官方形状（Agent2API PR #343 同语义，10-31 实弹 200）。
+        dynamic = "\n\n".join([dynamic, custom])
     return [
         {"type": "text", "text": sec["cliPrefix"]},
         {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},

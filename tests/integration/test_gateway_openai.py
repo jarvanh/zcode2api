@@ -51,11 +51,11 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        # 2026-10-24 实弹：官方 2 块子代理形状被上游 WAF 405，custom system 改为
-        # 并入 stable 合并块尾部（线缆 3 块与默认链同构），不再是独立末块。
-        assert [blk["text"] for blk in payload["system"]][0] == "You are ZCode, an interactive coding agent"
+        # 2026-10-31 起 WAF 按版本校验块1/块2 文本：块1 须为 3.17.1 措辞，
+        # custom system 改并入块3（dynamic，不受校验）尾部，块2 保持逐字节官方文本。
+        assert [blk["text"] for blk in payload["system"]][0] == "You are ZCode, an interactive agent"
         assert len(payload["system"]) == 3
-        assert payload["system"][1]["text"].endswith("守则")  # 用户 system 位于 stable 合并块尾部
+        assert payload["system"][2]["text"].endswith("守则")  # 用户 system 位于 dynamic 合并块尾部
         assert payload["system"][2]["text"].startswith("\n\n")  # 末块仍是 dynamic 段
 
     async def test_max_tokens_clamped_to_upstream_limit(self, gateway_client, fresh_app):
