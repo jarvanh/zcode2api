@@ -133,7 +133,10 @@ CAPTCHA_REGION_HEADER = "X-Aliyun-Captcha-Verify-Region"
 
 # ── 身份头仿真（对齐 zapi identity.ts 的 pio；顺序、取值逐字段镜像官方客户端）──
 # 官方客户端 companion 头集合，让代理在指纹层与官方 ZCode 桌面端不可区分。
-# darwin-arm64 桌面身份。X-Device-Mid 走 quota.device_mid() 持久化复用。
+# 以下 IDENTITY_* 仅是无账号回退路径的进程级身份（identity.py 无 account 分支、
+# install.py 进程级安装序、body_transform 无账号 Environment），配全局 device_mid；
+# 账号请求一律走 app/fingerprint.py 的每账号 DeviceProfile（accounts.data.fingerprint，
+# 成套 SKU + 独立 device_mid），两者勿混。进程级固定 darwin-arm64 是有意设计。
 IDENTITY_TITLE = "Z Code@electron"      # X-Title = "Z Code@{sourceTitle}"；桌面端账号走 electron
 IDENTITY_RELEASE_CHANNEL = "stable"
 IDENTITY_CLIENT_LANGUAGE = "zh-CN"
