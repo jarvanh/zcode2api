@@ -47,7 +47,7 @@ def _read_all(tmp_path):
 
 
 def test_record_failure_shapes_both_sides(tmp_path):
-    body = _record()
+    _record()
     rows = _read_all(tmp_path)
     assert len(rows) == 1
     r = rows[0]
@@ -81,9 +81,10 @@ def test_query_filters_by_status_and_newest_first(tmp_path):
 
 
 def test_prune_drops_old_days(tmp_path, monkeypatch):
-    _record()
     import datetime
+
     from app.diaglog import _BJ, _PREFIX
+    _record(req_id="r1")
     old_day = (datetime.datetime.now(_BJ) - datetime.timedelta(days=10)).strftime("%Y-%m-%d")
     old_file = tmp_path / f"{_PREFIX}{old_day}.jsonl"
     old_file.write_text('{"ts": 1}\n')

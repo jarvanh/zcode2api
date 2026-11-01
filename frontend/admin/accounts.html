@@ -52,6 +52,13 @@
   </div>
 
   <div class="section-head">
+    <div class="section-title">风控态势 <span class="section-count-badge" id="risk-wave-badge" style="display:none">波次暂停中</span></div>
+    <div class="section-meta" id="risk-updated"></div>
+  </div>
+  <div class="usage-grid" id="risk-grid"></div>
+  <div id="risk-lane-wrap"></div>
+
+  <div class="section-head">
     <div class="section-title">使用统计</div>
     <div class="section-meta" id="usage-range"></div>
   </div>
@@ -217,6 +224,7 @@ const NOTCH_COLORS=['var(--notch-1)','var(--notch-2)','var(--notch-3)','var(--no
   await loadUsage();
   startPolling();
   startUsagePolling();
+  startRiskPolling();
 })();
 
 function startPolling(){
@@ -260,9 +268,50 @@ function renderUsage(d){
   const meta=document.getElementById('usage-range');
   if(meta)meta.textContent=r.from?`${r.from} ~ ${r.to} · 不含探测`:'暂无用量记录';
 }
-function startUsagePolling(){
-  if(_usageTimer)clearInterval(_usageTimer);
-  _usageTimer=setInterval(()=>{ if(!document.hidden && !anyModalOpen()) loadUsage(); },60000);
+let _riskTimer=null;
+async function loadRisk(silent){
+  try{
+    const d=await api('GET','/risk-overview?days=7');
+    renderRisk(d);
+    document.getElementById('risk-updated').textContent='更新于 '+new Date().toLocaleTimeString();
+  }catch(e){ if(!silent)showToast('风控态势加载失败: '+e.message,'error'); }
+}
+function renderRisk(d){
+  const t=d.today||{};
+  const riskColor=(t.risk||0)>0?'var(--red)':'var(--mint)';
+  const wave=d.waves||[];
+  const badge=document.getElementById('risk-wave-badge');
+  if(badge){badge.style.display=wave.length?'':'none';}
+  const fr=d.freshness||{};
+  const freshColor=fr.stale?'var(--red)':'var(--mint)';
+  const freshLabel=fr.stale?'过时':'对齐';
+  const cards=[
+    ['今日 405 风控', t.risk||0, riskColor, '3012/unusual activity 命中次数'],
+    ['今日 429 限流', t.rate||0, 'var(--amber)', '换号优先计数'],
+    ['今日 连接失败', t.net||0, 'var(--purple)', 'net 退避计数（不含上游拒绝）'],
+    ['今日 波次确认', t.wave||0, wave.length?'var(--red)':'var(--mint)', '频道级波次（两账号确认制）'],
+    ['波次暂停', wave.length?wave.map(w=>w.provider+' '+Math.ceil(w.remain_s/60)+'min').join(' · '):'无', wave.length?'var(--red)':'var(--mint)', wave.length?('level '+(wave[0].level||1)):'全池未被波次暂停'],
+    ['文本新鲜度', freshLabel+(fr.age_days!=null?` · ${fr.age_days}天`:''), freshColor, fr.stale?((fr.problems||[]).join('；')):'sidecar 与官方 3.17.1 对齐'],
+  ];
+  const grid=document.getElementById('risk-grid');
+  if(grid)grid.innerHTML=cards.map(([label,val,color,tip])=>
+    `<div class="usage-card" title="${(tip||'').replace(/"/g,'&quot;')}">
+      <div class="usage-label">${label}</div>
+      <div class="usage-total" style="color:${color}">${val}</div>
+    </div>`).join('');
+  const rows=(d.accounts||[]).map(a=>{
+    const lanes=(a.lanes||[]).map(l=>`${l.lane} ${Math.ceil(l.remain_s/60)}min`).join(' · ');
+    const strikes=Object.entries(a.strikes||{}).map(([k,v])=>`${k}:${v}`).join(' · ');
+    return `<tr><td>${a.name}</td><td>${a.status}${a.enabled?'':'（停用）'}</td><td>${lanes||'—'}</td><td>${strikes||'—'}</td><td title="${(a.last_error||'').replace(/"/g,'&quot;')}">${(a.last_error||'—').slice(0,60)}</td></tr>`;
+  }).join('');
+  const wrap=document.getElementById('risk-lane-wrap');
+  if(wrap)wrap.innerHTML=rows?`<div class="acct-scroll"><table class="acct-table"><thead><tr><th>账号</th><th>状态</th><th>lane 冷却</th><th>strikes</th><th>最近错误</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    :'<div class="section-meta" style="padding:8px 2px">当前无账号处于风控冷却 / 打击状态</div>';
+}
+function startRiskPolling(){
+  if(_riskTimer)clearInterval(_riskTimer);
+  loadRisk(true);
+  _riskTimer=setInterval(()=>{ if(!document.hidden && !anyModalOpen()) loadRisk(true); },30000);
 }
 
 // 全量套餐（上游 plans 数组；旧数据回退单个 plan），entitlements 附带所属套餐信息

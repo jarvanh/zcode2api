@@ -62,6 +62,12 @@ zcode-hub/
 │   ├── captcha.py         # 求解器编排 + 预热池
 │   ├── oauth.py           # zai server-mediated CLI 流
 │   ├── auth_admin.py      # 后台 / 网关鉴权（后台失败节流）
+│   ├── body_transform.py  # system 三块装配（3.17.1 镜像；WAF 文本校验史见模块头）
+│   ├── freshness.py       # sidecar 文本新鲜度哨兵（每日巡检，admin / healthcheck 读）
+│   ├── dedup.py           # 同内容请求去重（失败冷却重放 + 非流式在途合并）
+│   ├── diaglog.py         # 失败请求诊断留存（双侧现场，3 天，/admin/api/diaglog）
+│   ├── session_ctx.py     # 会话亲和观测（observe 档：sess/cache_read 入 reqlog）
+│   ├── riskmetrics.py     # 风控事件按天统计（405/429/net/wave，risk-*.jsonl）
 │   └── reqlog.py          # 内存环形请求日志
 ├── captcha_node/          # Bun 主路径 solver-bun.ts + vendored captcha-happy.ts；回退 node solver.js
 ├── frontend/              # 后台静态页（accounts / settings / login）

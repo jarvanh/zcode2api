@@ -60,14 +60,22 @@ def status() -> dict:
             )
         if local_ver and local_ver != sidecar_ver:
             problems.append(f"本机官方客户端 {local_ver} ≠ sidecar {sidecar_ver}，官方可能已升版")
-        try:
-            captured = datetime.datetime.strptime(captured_at, "%Y-%m-%d")
-            age_days = max(0, (now - captured).days)
-            if age_days > settings.SECTIONS_STALE_DAYS:
-                problems.append(
-                    f"sidecar 已 {age_days} 天未跟进（阈值 {settings.SECTIONS_STALE_DAYS}）"
-                )
-        except ValueError:
+    # billing 侧一致性（claim/billing 全链路用 BILLING_APP_VERSION）：只改一个
+    # 常量的「半更新」正是 2026-10-31 那轮「领取失败/措辞过时」的组合病因
+    if constants.BILLING_APP_VERSION != constants.CLIENT_APP_VERSION:
+        problems.append(
+            f"billing 版本 {constants.BILLING_APP_VERSION} ≠ 身份版本 "
+            f"{constants.CLIENT_APP_VERSION}（两个常量须同步升）"
+        )
+    try:
+        captured = datetime.datetime.strptime(captured_at, "%Y-%m-%d")
+        age_days = max(0, (now - captured).days)
+        if age_days > settings.SECTIONS_STALE_DAYS:
+            problems.append(
+                f"sidecar 已 {age_days} 天未跟进（阈值 {settings.SECTIONS_STALE_DAYS}）"
+            )
+    except ValueError:
+        if captured_at:
             problems.append(f"sidecar captured_at 格式非法: {captured_at!r}")
 
     return {
@@ -75,6 +83,7 @@ def status() -> dict:
         "captured_at": captured_at,
         "age_days": age_days,
         "gateway_app_version": constants.CLIENT_APP_VERSION,
+        "billing_app_version": constants.BILLING_APP_VERSION,
         "local_client_version": local_ver,
         "stale": bool(problems),
         "problems": problems,
@@ -92,6 +101,29 @@ def check_and_record() -> dict:
         logs.info("freshness", f"sidecar 对齐官方 {st['sidecar_client_version']}"
                                f"（captured {st['captured_at']}）")
     return st
+
+
+def claim_hint() -> str | None:
+    """领取/preview 失败时的版本新鲜度提示（claim.py 失败路径调用）。
+
+    2026-10-30/31 实证：BILLING_APP_VERSION 停在旧版时，preview 空窗/领取
+    拒绝在日志里只表现为「上游无投放套餐」——没人会第一时间怀疑版本。
+    读缓存（每日巡检落 meta 表），无缓存现算一次。
+    """
+    try:
+        raw = store.get_setting(_FRESHNESS_KEY)
+        st = json.loads(raw) if raw else None
+        if st is None:
+            st = status()
+    except (ValueError, TypeError):
+        st = status()
+    if not st.get("stale"):
+        return None
+    return (
+        f"客户端版本/文本新鲜度告警（billing={st.get('billing_app_version')}, "
+        f"sidecar={st.get('sidecar_client_version')}, "
+        f"captured {st.get('captured_at')}）：{'；'.join(st.get('problems') or [])}"
+    )
 
 
 def stale_hint() -> str | None:

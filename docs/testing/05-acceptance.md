@@ -11,6 +11,12 @@
 - [ ] 变更涉及上游分类/池行为 → 对应 CLASSIFY-*/POOL-* 用例先行更新（行为变更与用例变更同 PR）
 - [ ] `.env` / `data/` / 向量口令不入镜像与仓库（CI 断言 + 人工复核）
 - [ ] 文档同步：02 移植映射勾选、05 协议如有实测修订、CHANGELOG 条目
+- [ ] system sidecar 文本新鲜度：app/zcode_sections_*.json 的 _meta.client_version
+      与 constants.CLIENT_APP_VERSION 一致、captured_at ≤ 21 天
+      （admin API GET /admin/api/sections/freshness 应为 stale=false；
+      2026-10-31 文本校验波次：措辞过时直接 405/3012，见 body_transform 模块头）
+- [ ] 新增观测/韧性模块测试齐备：dedup / diaglog / freshness / session_ctx
+      / captcha 波次助推（v2.8.0 起）
 
 ## 2. 里程碑验收（对应开发文档 07）
 

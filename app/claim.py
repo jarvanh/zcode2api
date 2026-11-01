@@ -20,9 +20,20 @@ import time
 
 import httpx
 
-from . import constants, logs, settings
+from . import constants, freshness, logs, settings
 from .captcha import captcha_manager
 from .models import Account, Status
+
+
+def _stale_suffix() -> str:
+    """版本新鲜度告警后缀（仅 stale 时非空）。
+
+    领取失败与版本过时在日志里长期不可区分（2026-10-30/31 两轮实证：
+    BILLING_APP_VERSION 停旧版 → preview 空窗/领取拒绝，日志只见「上游无
+    投放套餐」）——在失败原语上把线索直接递到位。
+    """
+    hint = freshness.claim_hint()
+    return f"（{hint}）" if hint else ""
 
 
 class ClaimError(Exception):
@@ -85,6 +96,7 @@ def _fail_error(code: int, body: dict) -> ClaimError:
     base = _CLAIM_FAIL.get(code, "领取失败")
     server = body.get("msg") or body.get("message") or ""
     message = f"{base}（{server}）" if server else base
+    message += _stale_suffix()
     next_at = None
     if code == 1005:
         ends = ((body.get("data") or {}).get("plan") or {}).get("ends_at")
@@ -387,7 +399,8 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
         if probed:
             outcomes.extend(probed)
             return outcomes
-        logs.info("claim", f"账号 {account.name} 上游无投放套餐，跳过领取")
+        hint = _stale_suffix()
+        logs.info("claim", f"账号 {account.name} 上游无投放套餐，跳过领取{hint}")
         return outcomes
 
     skip = skip_plan_ids or set()
@@ -469,7 +482,7 @@ async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, s
             if pid and pid not in held:
                 logs.info("claim", f"账号 {account.name} preview 空，改用收割候选 {pid}")
                 return pid, "", []
-        raise ClaimError("没有待领取的套餐")
+        raise ClaimError("没有待领取的套餐" + _stale_suffix())
     best = plans[0]
     return best["plan_id"], best["name"] or best["plan_id"], best["grants"]
 

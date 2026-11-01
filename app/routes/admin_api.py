@@ -9,7 +9,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, usage_stats
+from .. import captcha_ledger, dedup, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -110,6 +110,59 @@ async def status_info():
             p: sum(1 for a in store.list_accounts(p) if a.is_selectable())
             for p in PROVIDERS
         },
+    }
+
+
+# ── 风控态势总览（2026-11-01，控制台「风控态势」区块数据源）──────────────────
+@router.get("/risk-overview")
+async def risk_overview(days: int = 7):
+    """一屏风控态势：按天计数 / 账号 lane 冷却与 strikes / 波次暂停 / 新鲜度 / 去重。"""
+    import json as _json
+    import time as _time
+
+    agg = riskmetrics.aggregate(min(max(int(days), 1), 90))
+    day_rows = agg.get("days") or []
+    today = day_rows[-1] if day_rows else {}
+
+    now = _time.time()
+    lanes = []
+    for a in store.list_accounts("zai"):
+        cooling = [
+            {"lane": ln, "remain_s": max(0, int(until - now))}
+            for ln, until in (a.risk_lane_cooling or {}).items() if until > now
+        ]
+        strikes = {k: round(v, 1) for k, v in (a.risk_lane_strikes or {}).items()}
+        if cooling or strikes or a.status == Status.COOLING:
+            lanes.append({
+                "name": a.name, "status": a.status, "enabled": bool(a.enabled),
+                "lanes": cooling, "strikes": strikes,
+                "last_error": (a.last_error or "")[:120],
+            })
+
+    from .routes import gateway as gw  # 惰性：避免模块加载顺序耦合
+    waves = []
+    for provider, until in dict(getattr(gw, "_risk_wave_until", {})).items():
+        if until > now:
+            waves.append({
+                "provider": provider, "remain_s": int(until - now),
+                "level": int(getattr(gw, "_risk_wave_level", {}).get(provider, 0)),
+            })
+
+    raw_fresh = store.get_setting("sections_freshness")
+    try:
+        fresh = _json.loads(raw_fresh) if raw_fresh else freshness.status()
+    except ValueError:
+        fresh = freshness.status()
+
+    return {
+        "data": {
+            "days": day_rows,
+            "today": {k: today.get(k, 0) for k in ("risk", "rate", "net", "wave")},
+            "accounts": lanes,
+            "waves": waves,
+            "freshness": fresh,
+            "dedup": dedup.stats(),
+        }
     }
 
 
