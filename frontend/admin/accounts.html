@@ -281,21 +281,29 @@ async function loadRisk(silent){
   }catch(e){ if(!silent)showToast('风控态势加载失败: '+e.message,'error'); }
 }
 function renderRisk(d){
-  const t=d.today||{};
+  // risk-overview 返回 {data:{...}} 信封（与同页 /accounts、/usage/summary 的裸对象不同形），
+  // 直接读 d.today 全部落空 → 风控态势恒显 0（2026-11-02 主人报，实为前端解包缺失）
+  const r=(d&&d.data)||d||{};
+  const t=r.today||{};
   const riskColor=(t.risk||0)>0?'var(--red)':'var(--mint)';
-  const wave=d.waves||[];
+  const wave=r.waves||[];
   const badge=document.getElementById('risk-wave-badge');
   if(badge){badge.style.display=wave.length?'':'none';}
-  const fr=d.freshness||{};
+  const fr=r.freshness||{};
   const freshColor=fr.stale?'var(--red)':'var(--mint)';
-  const freshLabel=fr.stale?'过时':'对齐';
+  const freshVal=fr.stale
+    ? '过时'+(fr.age_days!=null?` · ${fr.age_days}天`:'')
+    : `对齐 ${fr.sidecar_client_version||'?'}${fr.age_days!=null?` · ${fr.age_days}天`:''}`;
+  const freshTip=fr.stale
+    ? (fr.problems||[]).join('；')
+    : `sidecar ${fr.sidecar_client_version||'?'}（文本采集 ${fr.captured_at||'?'}）= 网关身份 ${fr.gateway_app_version||'?'} = 本机客户端 ${fr.local_client_version||'未检测到'} = billing ${fr.billing_app_version||'?'} · 巡检 ${fr.checked_at||'—'}`;
   const cards=[
     ['今日 405 风控', t.risk||0, riskColor, '3012/unusual activity 命中次数'],
     ['今日 429 限流', t.rate||0, 'var(--amber)', '换号优先计数'],
     ['今日 连接失败', t.net||0, 'var(--purple)', 'net 退避计数（不含上游拒绝）'],
     ['今日 波次确认', t.wave||0, wave.length?'var(--red)':'var(--mint)', '频道级波次（两账号确认制）'],
     ['波次暂停', wave.length?wave.map(w=>w.provider+' '+Math.ceil(w.remain_s/60)+'min').join(' · '):'无', wave.length?'var(--red)':'var(--mint)', wave.length?('level '+(wave[0].level||1)):'全池未被波次暂停'],
-    ['文本新鲜度', freshLabel+(fr.age_days!=null?` · ${fr.age_days}天`:''), freshColor, fr.stale?((fr.problems||[]).join('；')):'sidecar 与官方 3.17.1 对齐'],
+    ['文本新鲜度', freshVal, freshColor, freshTip],
   ];
   const grid=document.getElementById('risk-grid');
   if(grid)grid.innerHTML=cards.map(([label,val,color,tip])=>
@@ -303,7 +311,7 @@ function renderRisk(d){
       <div class="usage-label">${label}</div>
       <div class="usage-total" style="color:${color}">${val}</div>
     </div>`).join('');
-  const rows=(d.accounts||[]).map(a=>{
+  const rows=(r.accounts||[]).map(a=>{
     const lanes=(a.lanes||[]).map(l=>`${l.lane} ${Math.ceil(l.remain_s/60)}min`).join(' · ');
     const strikes=Object.entries(a.strikes||{}).map(([k,v])=>`${k}:${v}`).join(' · ');
     return `<tr><td>${a.name}</td><td>${a.status}${a.enabled?'':'（停用）'}</td><td>${lanes||'—'}</td><td>${strikes||'—'}</td><td title="${(a.last_error||'').replace(/"/g,'&quot;')}">${(a.last_error||'—').slice(0,60)}</td></tr>`;
