@@ -12,9 +12,11 @@ observe 档（SESSION_OBSERVE，默认开）绝不改变任何请求行为：
   - summary() 聚合近 N 天：首见 vs 复见请求的 cache_read 均值对比——
     复见显著更高才值得做 enforce 档（转发稳定 session id）。
 
-enforce 档（SESSION_AFFINITY，默认关）：会话键 → 稳定 UUID 的进程内映射，
-JWT plan 通道把 x-session-id 从「逐请求随机」换成「同会话同值」（六件
-attribution 头形状不变，仅该值生命周期与官方对齐）；数据支持后开启。
+enforce 档（SESSION_AFFINITY，2026-11-01 主人拍板默认开）：会话键 → 稳定 UUID
+的进程内映射，JWT plan 通道把 x-session-id 从「逐请求随机」换成「同会话
+同值」（六件 attribution 头形状不变，仅该值生命周期与官方对齐）；observe
+数据尚未支持（repeat_ratio=0），但改动仅一枚头的生命周期，实效以
+admin API session-affinity 的 cache_read 对比持续观察。
 
 内存注册表仅用于「首见/复见」判定与稳定 id 映射（LRU 4096 / 24h TTL，纯进程内）。
 """

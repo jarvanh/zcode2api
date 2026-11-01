@@ -290,7 +290,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.9.1"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
@@ -340,12 +340,13 @@ CAPTCHA_ATTACH_PLAN = _bool("ZCODE_CAPTCHA_ATTACH_PLAN", False)
 # 绝不改变请求行为；summary 走 admin API GET /admin/api/session-affinity。
 SESSION_OBSERVE = _bool("ZCODE_SESSION_OBSERVE", True)
 
-# ── 会话亲和 enforce 档（app/session_ctx.py）───────────────────────────
+# ── 会话亲和 enforce 档（app/session_ctx.py）───────────────────────
 # 开启后 JWT plan 通道转发稳定 x-session-id（每会话键一枚持久 UUID，替换
 # build_trace_headers 里的逐请求随机值），换上游 prompt cache 命中；六件
-# attribution 头形状不变，仅 session-id 生命周期与官方对齐。默认关：observe
-# 数据（repeat_ratio/cache_read 对比）支持后再开（admin API session-affinity）。
-SESSION_AFFINITY = _bool("ZCODE_SESSION_AFFINITY", False)
+# attribution 头形状不变，仅 session-id 生命周期与官方对齐。
+# 2026-11-01 主人拍板默认开：observe 数据（repeat_ratio=0）尚未支持，但改动
+# 仅一枚头的生命周期、风险低，实效以 admin API session-affinity 持续观察。
+SESSION_AFFINITY = _bool("ZCODE_SESSION_AFFINITY", True)
 
 # ── 思考档处理（app/reasoning.py）──────────────────────────────────────────
 # OpenAI 入站的思考档兼容：GLM-5.3 家族恒思考（关不掉）且思考与正文共用
