@@ -17,9 +17,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .. import constants, diaglog, freshness, logs, reqlog, riskmetrics, settings
+from .. import constants, dedup, diaglog, freshness, logs, reqlog, riskmetrics, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -652,7 +652,7 @@ async def messages(request: Request):
     if body.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
         # 停掉 CDN 计时，此后失败降级 SSE error 事件（见 earlyflush 块注释）
-        task = asyncio.create_task(_dispatch(req_id, body, incoming_headers, port, provider))
+        task = asyncio.create_task(_dispatch_guarded(req_id, body, incoming_headers, port, provider))
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
         except TimeoutError:
@@ -675,7 +675,7 @@ async def messages(request: Request):
             )
     else:
         try:
-            result = await _dispatch(req_id, body, incoming_headers, port, provider)
+            result = await _dispatch_guarded(req_id, body, incoming_headers, port, provider)
         except asyncio.CancelledError:
             # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
             # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
@@ -1081,7 +1081,7 @@ async def chat_completions(request: Request):
     if payload.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
         # 停掉 CDN 计时，此后失败降级 SSE error 事件（见 earlyflush 块注释）
-        task = asyncio.create_task(_dispatch(req_id, body, incoming_headers, port, provider))
+        task = asyncio.create_task(_dispatch_guarded(req_id, body, incoming_headers, port, provider))
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=settings.EARLY_FLUSH_GRACE)
         except TimeoutError:
@@ -1103,7 +1103,7 @@ async def chat_completions(request: Request):
             )
     else:
         try:
-            result = await _dispatch(req_id, body, incoming_headers, port, provider)
+            result = await _dispatch_guarded(req_id, body, incoming_headers, port, provider)
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499)
             raise
@@ -1199,6 +1199,59 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
 
     return StreamingResponse(_iter(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache"})
+
+
+def _dedup_replay_worthy(provider: str, model: str) -> bool:
+    """失败重放仅当波次暂停仍未到期（同一封锁态仍在）。
+
+    暂停到期后的第一发试探请求必须放行——它承担波次再确认职责
+    （RISK_FAIL_FAST 已把它限制为最多烧 1 次 strike）；lane 冷却不作为
+    重放依据：冷却到期后的试探同样是恢复路径，零延迟优先。
+    突发并发重试的防烧由在途合并（begin_inflight/wait_inflight）承担。
+    """
+    return time.time() < _risk_wave_until.get(provider, 0)
+
+
+async def _dispatch_guarded(req_id, body, incoming_headers, port, provider):
+    """风暴去重守卫（app/dedup.py）：同内容请求的失败重放与在途合并。
+
+    包在 _dispatch 外层，四个调用点统一走本守卫。三档语义：
+      - TTL 内同指纹失败 → 直接重放缓存响应（零调度零 strike）；
+      - 非流式 + leader 在途 → 有界等待结局，失败重放、成功/超时放行；
+      - 流式 → 不合并不缓存（真实结局在生成器里），仅登记在途防同拍。
+    """
+    if not settings.DEDUP_ENABLED:
+        return await _dispatch(req_id, body, incoming_headers, port, provider)
+    fp = dedup.fingerprint(body)
+    if fp is None:
+        return await _dispatch(req_id, body, incoming_headers, port, provider)
+    hit = dedup.peek_failure(fp)
+    if hit is not None and _dedup_replay_worthy(provider, str(body.get("model") or "")):
+        status, payload = hit
+        logs.info(req_id, f"风暴去重: {settings.DEDUP_TTL}s 内同内容失败，直接重放（不进调度）")
+        return Response(content=payload, status_code=status, media_type="application/json")
+    stream = bool(body.get("stream"))
+    # 流式跳过登记（真实结局在生成器里）；非流式登记，True=leader / False=follower
+    is_leader = stream or dedup.begin_inflight(fp)
+    if not is_leader:
+        outcome = await dedup.wait_inflight(fp, timeout=settings.DEDUP_FOLLOWER_WAIT)
+        if outcome == "failed":
+            status, payload = dedup.failure_of(fp)
+            logs.info(req_id, "风暴去重: leader 同内容调度失败，重放其失败响应")
+            return Response(content=payload, status_code=status, media_type="application/json")
+        # leader 成功/超时 → follower 正常走自己的调度（上游已被证明健康）
+    result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    _dedup_note(fp, result, stream)
+    return result
+
+
+def _dedup_note(fp: str, result, stream: bool) -> None:
+    """把调度结局翻译给去重层：_Upstream = 成功（无 body 可缓存）；JSONResponse
+    按状态码记。early-flush 流式的真实失败在生成器里，此处只登记「已产出上游流」。"""
+    if isinstance(result, _Upstream):
+        dedup.note_result(fp, 200, b"", stream)
+        return
+    dedup.note_result(fp, result.status_code, getattr(result, "body", b"") or b"", stream)
 
 
 async def _dispatch(req_id, body, incoming_headers, port, provider):

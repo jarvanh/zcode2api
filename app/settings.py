@@ -318,3 +318,11 @@ def frontend_version() -> str:
 DIAGLOG_ENABLED = _bool("ZCODE_DIAGLOG_ENABLED", True)
 DIAGLOG_DAYS = _int("ZCODE_DIAGLOG_DAYS", 3)          # 保留天数（按天清理）
 DIAGLOG_MAX_BODY = _int("ZCODE_DIAGLOG_MAX_BODY", 2048)  # 响应体截断字节
+
+# ── 同内容请求去重（app/dedup.py，防 openclaw 重试风暴烧池）─────────────────
+# 按「客户端内容指纹」两级：TTL 内失败重放（零调度零 strike）+ 非流式在途
+# 合并（leader 失败重放/成功放行）。流式不合并不缓存（真实结局在生成器里）。
+DEDUP_ENABLED = _bool("ZCODE_DEDUP_ENABLED", True)
+DEDUP_TTL = _int("ZCODE_DEDUP_TTL", 30)                # 失败缓存冷却秒数
+DEDUP_FOLLOWER_WAIT = _int("ZCODE_DEDUP_FOLLOWER_WAIT", 25)  # follower 等 leader 上限
+DEDUP_MAX = _int("ZCODE_DEDUP_MAX", 1024)              # 内存 LRU 上限

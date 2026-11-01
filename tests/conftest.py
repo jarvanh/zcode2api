@@ -93,6 +93,10 @@ def fresh_app(tmp_path, monkeypatch):
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()
+    # 风暴去重是进程级单例（app/dedup.py），失败缓存跨用例泄漏会让后续同指纹
+    # 用例直接吃到上一个用例的重放响应——随 app 生命周期一并重置。
+    from app import dedup as dedup_module
+    dedup_module._reset_for_tests()
     return fresh
 
 
