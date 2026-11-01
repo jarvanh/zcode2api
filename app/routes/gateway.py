@@ -974,6 +974,8 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
         # 账号级出口代理：proxy_kwargs() 未配置时返回 {}，行为与直连一致
         client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
                                    **account.proxy_kwargs())
+        # 打标：本请求已发起上游调用（监控区分调度/上游失败，同 zai 主链路）
+        reqlog.mark_upstream(req_id)
         try:
             if stream:
                 req = client.build_request("POST", url, headers=headers, json=body)
@@ -1302,6 +1304,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     while attempts < MAX_ACCOUNT_ATTEMPTS:
         if deadline and time.time() - t0 > deadline:
             logs.warn(req_id, f"请求级死线 {deadline}s 已到，停止重试（已试 {len(tried)} 账号）")
+            reqlog.finish_error(req_id, f"请求级死线 {deadline}s 已到（已试 {len(tried)} 账号）", status=503)
             return JSONResponse(
                 {"error": {"message": f"所有账号重试均未成功（请求级死线 {deadline}s）",
                            "type": "no_available_account", "tried": sorted(tried)}},
@@ -1886,6 +1889,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # billing/claim/验证码不在此列（刻意直连，见 claim._billing_request）。
         client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
                                    **account.proxy_kwargs())
+        # 打标：本请求已发起上游调用（含连接失败/4xx/5xx）；调度层放弃的行
+        # 无此标记，监控端据此区分「调度失败·未达上游」与「上游失败」
+        reqlog.mark_upstream(req_id)
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()

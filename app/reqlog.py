@@ -6,7 +6,8 @@
   data/reqlog-<北京日期>.jsonl，按天分文件、保留 HISTORY_DAYS 天自动清理，
   供「7 天 / 30 天」视图聚合 —— 补上内存日志「重启即清零、看不了趋势」的缺口
 - 只落终态条目：在途条目（ok=None）不落盘，避免进程被杀留下永久幽灵行
-- 粒度：一次客户端请求一条；多账号重试不分裂，账号字段记录最终归宿
+- 粒度：一次客户端请求一条；多账号重试不分裂，账号字段记录最终归宿；
+  up 标记是否真实发起过上游调用（调度失败·未达上游的行，账号名仅供参考）
 - ok 三态：None=在途/未知，True=成功，False=失败（含客户端断开 status=499）
 - 纯观测：不触碰账号状态与调度逻辑；落盘失败只记日志，绝不影响请求
 """
@@ -51,6 +52,7 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "preview": (preview or "")[:80],
         "account": "",
         "mode": "",
+        "up": False,
         "ok": None,
         "status": None,
         "error": "",
@@ -83,6 +85,20 @@ def mark_account(req_id: str, account_name: str, mode: str) -> None:
         if entry is not None:
             entry["account"] = account_name
             entry["mode"] = mode
+
+
+def mark_upstream(req_id: str) -> None:
+    """标记本请求已真实发往上游（首次置位后不复位）。
+
+    与 mark_account 的区别：account 是重试梯子里「最后一次尝试」的账号名，
+    该号可能从未发出请求（如排队超时放弃）；up 只在真正发起上游调用后置
+    True —— 监控端据此区分「调度失败·未达上游」（账号名仅供参考）与
+    「上游失败·账号归属真实」，消除 503 排队放弃行张冠李戴的误读。
+    """
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["up"] = True
 
 
 def finish_ok(req_id: str, t_first: float | None = None,
@@ -170,6 +186,7 @@ def _persist(entry: dict) -> None:
             "status": entry.get("status"),
             "account": entry.get("account") or "",
             "mode": entry.get("mode") or "",
+            "up": bool(entry.get("up") or False),
             "model": entry.get("model") or "",
             "endpoint": entry.get("endpoint") or "",
             "stream": bool(entry.get("stream")),

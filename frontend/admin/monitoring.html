@@ -175,7 +175,11 @@ function renderStats(list){
 function statusCell(e){
   if(e.ok===true)return `<span class="badge badge-active">成功</span>`;
   if(e.ok===null)return `<span class="badge badge-cooling">进行中</span>`;
-  const label=e.status===499?'客户端断开':`失败${e.status?` · HTTP ${e.status}`:''}`;
+  if(e.status===499)return `<span class="badge badge-invalid" title="${esc(e.error||'')}">${e.up===false?'客户端断开·未达上游':'客户端断开'}</span>`;
+  // up=false = 请求未发起过上游调用（排队放弃/无号可选）：账号名仅供参考，
+  // 不代表该号被服务或被打挂；up=true/undefined（旧数据）= 账号归属真实
+  const kind=e.up===false?'调度失败':'失败';
+  const label=`${kind}${e.status?` · HTTP ${e.status}`:''}`;
   return `<span class="badge badge-invalid" title="${esc(e.error||'')}">${label}</span>`;
 }
 
