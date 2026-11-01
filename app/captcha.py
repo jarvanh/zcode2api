@@ -229,6 +229,11 @@ class CaptchaManager:
         self._last_take_at: float = 0.0
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
+        # 风控波次助推（2026-11-01，B 档）：波次暂停确认时由 gateway 调
+        # notify_wave_pause——暂停到期前后正是试探/恢复期，验证码消耗最集中，
+        # 预热目标临时抬升 CAPTCHA_WAVE_BOOST，闲置停解同时被压制（波次是
+        # 显式信号，优先级高于 deep-idle）。到期自动回落，无需显式清除。
+        self._wave_boost_until = 0.0
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self) -> dict:
@@ -338,10 +343,32 @@ class CaptchaManager:
         从未取用（_last_take_at=0）按闲置算——起服后不为第一个可能永远不来
         的请求空烧真浏览器。
         """
+        if self._wave_boost_active():
+            return False  # 波次助推期：显式信号压过 deep-idle（试探/恢复期消耗最集中）
         if settings.CAPTCHA_IDLE_AFTER <= 0:
             return False
         now = time.monotonic() if now is None else now
         return self._last_take_at <= 0 or (now - self._last_take_at) >= settings.CAPTCHA_IDLE_AFTER
+
+    def _wave_boost_active(self) -> bool:
+        return time.monotonic() < self._wave_boost_until
+
+    def _pool_target(self) -> int:
+        """当前预热目标：POOL_MIN + 波次助推加成（助推期外回落常规水位）。"""
+        if self._wave_boost_active():
+            return POOL_MIN + max(0, settings.CAPTCHA_WAVE_BOOST)
+        return POOL_MIN
+
+    def notify_wave_pause(self, seconds: float) -> None:
+        """波次暂停确认 → 临时抬升预热目标并压制闲置停解（gateway 波次点调用）。
+
+        到期自动回落（monotonic 比较），无需显式清除；重复确认取更晚到期。
+        """
+        until = time.monotonic() + max(0.0, float(seconds))
+        if until > self._wave_boost_until:
+            self._wave_boost_until = until
+        logs.info("captcha", f"波次助推 {max(0, int(seconds))}s：预热目标 "
+                             f"{self._pool_target()}（常规 {POOL_MIN}），闲置停解暂时压制")
 
     async def _refill_loop(self) -> None:
         while True:
@@ -362,7 +389,7 @@ class CaptchaManager:
                     await self._evict_expired()
                     await asyncio.sleep(3)
                     continue
-                need = POOL_MIN - self._pool_size
+                need = self._pool_target() - self._pool_size
                 if need > 0:
                     await self._refill_batch(need)
                 else:
@@ -494,6 +521,20 @@ class CaptchaManager:
                     self._trigger_refill(1)
                     return token.param, token.region
         raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
+
+    def try_take_now(self) -> tuple[str, str | None] | None:
+        """热路径同步取码（C 档 CAPTCHA_ATTACH_PLAN 用）：仅池内直取，绝不现解。
+
+        与 get_verify_param 的差别：池空返回 None（请求按无验证码形态发出，
+        fail-open），绝不阻塞热路径去起浏览器；取用同样打点 _last_take_at
+        （C 档开启时每请求都是流量信号，池水位由后台循环维持）。
+        """
+        self._last_take_at = time.monotonic()
+        token = self._pop_fresh()
+        if token is None:
+            return None
+        self._trigger_refill(1)
+        return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def _solve_raced(self, config: dict) -> _Token | None:

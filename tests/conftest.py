@@ -105,6 +105,15 @@ class _StubCaptcha:
 
     def __init__(self) -> None:
         self.invalidated = 0
+        self.wave_pauses: list[float] = []
+        self.taken_now: int = 0
+
+    def notify_wave_pause(self, seconds: float) -> None:
+        self.wave_pauses.append(seconds)
+
+    def try_take_now(self):
+        self.taken_now += 1
+        return None
 
     async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
         return "mock-verify-param", None

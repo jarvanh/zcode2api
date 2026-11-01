@@ -326,3 +326,11 @@ DEDUP_ENABLED = _bool("ZCODE_DEDUP_ENABLED", True)
 DEDUP_TTL = _int("ZCODE_DEDUP_TTL", 30)                # 失败缓存冷却秒数
 DEDUP_FOLLOWER_WAIT = _int("ZCODE_DEDUP_FOLLOWER_WAIT", 25)  # follower 等 leader 上限
 DEDUP_MAX = _int("ZCODE_DEDUP_MAX", 1024)              # 内存 LRU 上限
+
+# ── 验证码波次助推 + 全量带头（2026-11-01，app/captcha.py ④）────────────────
+# B 档：波次暂停确认时预热目标临时抬升 WAVE_BOOST 枚、闲置停解压制（到期自动
+# 回落）——暂停到期前后的试探/恢复期验证码消耗最集中；
+# C 档：plan 通道每请求附验证码头（zcode-api 实弹证明「承重结构」，当前上游
+# 未强制，默认关）。开启时建议同步调高 CAPTCHA_POOL_MIN/MAX（求解 10-40s/枚）。
+CAPTCHA_WAVE_BOOST = _int("ZCODE_CAPTCHA_WAVE_BOOST", 2)
+CAPTCHA_ATTACH_PLAN = _bool("ZCODE_CAPTCHA_ATTACH_PLAN", False)

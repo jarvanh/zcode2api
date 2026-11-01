@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 from . import body_transform, constants, settings
+from .captcha import captcha_manager
 from .identity import build_llm_identity_headers, build_trace_headers
 from .models import Account
 
@@ -133,6 +134,15 @@ def build_request(
         }
     if verify_param:
         headers[constants.CAPTCHA_HEADER] = verify_param
+    if settings.CAPTCHA_ATTACH_PLAN and not verify_param and use_plan:
+        # C 档（默认关）：plan 通道每请求附一枚池内验证码 token（zcode-api 实弹：
+        # 验证码头是 start-plane 承重结构，裸发会被 ESA 边缘间歇拒绝）。仅在
+        # 池内直取（try_take_now 绝不现解），池空 fail-open 按无码形态发出。
+        token = captcha_manager.try_take_now()
+        if token:
+            headers[constants.CAPTCHA_HEADER] = token[0]
+            if token[1]:
+                headers[constants.CAPTCHA_REGION_HEADER] = token[1]
     if verify_region:
         headers[constants.CAPTCHA_REGION_HEADER] = verify_region
 

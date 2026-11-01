@@ -1523,6 +1523,9 @@ def _risk_wave_confirm(provider: str, account_id: str) -> bool:
         _risk_wave_until[provider] = new_until
     riskmetrics.record("wave", account_id, provider=provider,
                        pause=int(pause), level=level)
+    # B 档验证码波次助推：暂停到期前后的试探/恢复期验证码消耗最集中，
+    # 预热目标临时抬升 + 闲置停解压制（到期自动回落，见 captcha.notify_wave_pause）
+    captcha_manager.notify_wave_pause(pause)
     # 文本校验波次叠加提示（2026-10-31 教训）：sidecar 若已过时，波次大概率
     # 就是措辞触发而非频控——趁运维还在看日志的时候把线索递到位。
     hint = freshness.stale_hint()
