@@ -148,6 +148,9 @@ def build_llm_identity_headers(account=None) -> dict[str, str]:
 
 def build_trace_headers() -> dict[str, str]:
     """追踪头：每请求全新 UUID（对齐官方 3.16.3 attribution 构造器）。
+    enforce 档（session_ctx.SESSION_AFFINITY）例外：x-session-id 用当前请求
+    的会话稳定 UUID（同会话同值，换上游 prompt cache 命中），其余五件仍逐
+    请求全新。
     历史注记：旧实现按 zapi（3.10.2 时代）静态分析做 start-plan/coding-plan
     分级——start-plan 只发 request-id/session-type/trace-id 三件，理由是
     「误发 query-id/session-id 触发 3012」。该结论产生于 2026-09-05 事件，
@@ -169,5 +172,15 @@ def build_trace_headers() -> dict[str, str]:
         "x-zcode-trace-id": str(uuid.uuid4()),
         "x-query-id": str(uuid.uuid4()),
         "x-zcode-query-source": "main_turn",
-        "x-session-id": str(uuid.uuid4()),
+        "x-session-id": _session_affinity_id() or str(uuid.uuid4()),
     }
+
+
+def _session_affinity_id() -> str | None:
+    """enforce 档取当前请求的稳定 session id；关闭/未设置返回 None（环导入延迟到调用时）。"""
+    try:
+        from . import session_ctx
+
+        return session_ctx.current_session()
+    except Exception:  # noqa: BLE001 - 头组装绝不放大请求失败
+        return None

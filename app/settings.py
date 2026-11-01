@@ -290,7 +290,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.9.0"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
@@ -339,3 +339,23 @@ CAPTCHA_ATTACH_PLAN = _bool("ZCODE_CAPTCHA_ATTACH_PLAN", False)
 # 会话亲和（转发稳定 session id 换上游 prompt cache 命中）」攒数据。纯观测，
 # 绝不改变请求行为；summary 走 admin API GET /admin/api/session-affinity。
 SESSION_OBSERVE = _bool("ZCODE_SESSION_OBSERVE", True)
+
+# ── 会话亲和 enforce 档（app/session_ctx.py）───────────────────────────
+# 开启后 JWT plan 通道转发稳定 x-session-id（每会话键一枚持久 UUID，替换
+# build_trace_headers 里的逐请求随机值），换上游 prompt cache 命中；六件
+# attribution 头形状不变，仅 session-id 生命周期与官方对齐。默认关：observe
+# 数据（repeat_ratio/cache_read 对比）支持后再开（admin API session-affinity）。
+SESSION_AFFINITY = _bool("ZCODE_SESSION_AFFINITY", False)
+
+# ── 思考档处理（app/reasoning.py）──────────────────────────────────────────
+# OpenAI 入站的思考档兼容：GLM-5.3 家族恒思考（关不掉）且思考与正文共用
+# max_tokens——小额度请求会被思考吃光出「200 但正文为空」。开启后按官方
+# bundle 口径注入 thinking+output_config，max_tokens += 预算再按模型上限截
+# 顶。0 = 整体旁路（恢复直传形态）。
+THINKING_COMPAT = _bool("ZCODE_THINKING_COMPAT", True)
+
+# ── 端点映射跟随（app/endpoint_routing.py）────────────────────────────
+# 周期拉 agent/configs 的 proxyEndpoint.mapping 表，按上游指令改写推理端点
+# （上游正把 coding-plan 流量往 zcode.z.ai ultra 端点搬）。fail-open：拉不到
+# 或表里没有 → 原 URL 原样放行。0 = 关闭（不拉表不改写）。
+ENDPOINT_ROUTING = _bool("ZCODE_ENDPOINT_ROUTING", True)

@@ -180,6 +180,9 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
         if name:
             body["tool_choice"] = {"type": "tool", "name": name}
     # "auto"/缺省：Anthropic 默认即 auto，无需显式映射
+    from . import reasoning
+
+    reasoning.apply_reasoning(body, payload)
     return body, None
 
 

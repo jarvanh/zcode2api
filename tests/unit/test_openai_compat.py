@@ -23,7 +23,11 @@ class TestOpenaiToAnthropic:
         assert body["system"] == "你是助手"
         assert [m["role"] for m in body["messages"]] == ["user", "assistant", "user"]
         assert body["messages"][0]["content"] == [{"type": "text", "text": "你好"}]
-        assert body["max_tokens"] == 4096  # OpenAI 可缺省，Anthropic 必填
+        # 思考档契约（app/reasoning.py）：GLM-5.3 家族默认 max 档，
+        # max_tokens += 预算（4096+32000），保住正文空间
+        assert body["max_tokens"] == 4096 + 32_000
+        assert body["thinking"] == {"type": "enabled", "budget_tokens": 32_000}
+        assert body["output_config"] == {"effort": "max"}
 
     def test_developer_role_treated_as_system(self):
         body, err = openai_to_anthropic({
@@ -47,9 +51,11 @@ class TestOpenaiToAnthropic:
             "stream": True,
         })
         assert err is None
-        assert body["max_tokens"] == 128
-        assert body["temperature"] == 0.5
-        assert body["top_p"] == 0.9
+        # 思考档契约：thinking enabled → temperature/top_p 被上游拒绝必须剔除；
+        # max_tokens += 预算（128+32000）
+        assert body["max_tokens"] == 128 + 32_000
+        assert "temperature" not in body
+        assert "top_p" not in body
         assert body["stop_sequences"] == ["END", "STOP"]
         assert body["stream"] is True
 

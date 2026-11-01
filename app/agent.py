@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from . import body_transform, constants, settings
+from . import body_transform, constants, endpoint_routing, settings
 from .captcha import captcha_manager
 from .identity import build_llm_identity_headers, build_trace_headers
 from .models import Account
@@ -114,12 +114,16 @@ def build_request(
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
         body = body_transform.transform_body(body, user_id, model, account=account)
+        # 端点映射跟随（fail-open）：按上游 agent/configs 快照改写 URL；
+        # 标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）
+        target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
             **build_llm_identity_headers(account),
             **build_trace_headers(),
+            **extra_headers,
         }
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集

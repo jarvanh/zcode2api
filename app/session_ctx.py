@@ -1,10 +1,10 @@
-"""会话亲和观测（observe 档）—— 为「是否值得做会话亲和」攒数据。
+"""会话亲和（observe 观测档 + enforce 转发档）。
 
 背景（2026-11-01 对比 zcode-api session-context.ts 得出）：稳定会话标识可换
 上游 prompt cache 命中（长上下文 agent 场景直接省钱），但 start-plan 官方
 形态本不带 x-session-id，转发属于「自创节奏」——上不上必须数据说话。
 
-本模块 observe-only，绝不改变任何请求行为：
+observe 档（SESSION_OBSERVE，默认开）绝不改变任何请求行为：
   - 会话键 = sha256(model + system + 首条 user 消息)[0:16]——无状态前缀哈希，
     同一会话的请求（system 稳定 + 首条消息即会话起点）稳定落在同键；
   - 每请求在 reqlog 行上落 sess（会话键）与 sess_repeat（24h 内非首见）；
@@ -12,7 +12,11 @@
   - summary() 聚合近 N 天：首见 vs 复见请求的 cache_read 均值对比——
     复见显著更高才值得做 enforce 档（转发稳定 session id）。
 
-内存注册表仅用于「首见/复见」判定（LRU 4096 / 24h TTL，纯进程内）。
+enforce 档（SESSION_AFFINITY，默认关）：会话键 → 稳定 UUID 的进程内映射，
+JWT plan 通道把 x-session-id 从「逐请求随机」换成「同会话同值」（六件
+attribution 头形状不变，仅该值生命周期与官方对齐）；数据支持后开启。
+
+内存注册表仅用于「首见/复见」判定与稳定 id 映射（LRU 4096 / 24h TTL，纯进程内）。
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ import hashlib
 import json
 import threading
 import time
+import uuid
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import settings
@@ -30,6 +36,13 @@ _MAX_KEYS = 4096
 
 _lock = threading.Lock()
 _seen: dict[str, float] = {}  # sess_key → last_seen（monotonic）
+_stable_ids: dict[str, str] = {}  # sess_key → 稳定 x-session-id（enforce 档）
+_MAX_STABLE = 8192
+
+# enforce 档：本请求应携带的稳定 x-session-id（tag() 设置，build_request 消费）。
+# contextvar 跨 asyncio 传播：网关 handler 在分发 create_task 前调用 tag()，
+# 子任务复制当前上下文时带上该值。
+_current: ContextVar[tuple[str, str] | None] = ContextVar("session_affinity", default=None)
 
 
 def session_key(body: dict) -> str | None:
@@ -66,15 +79,46 @@ def observe(body: dict) -> tuple[str, bool] | None:
     return key, prev is not None and (now - prev) < _TTL
 
 
+def _stable_session_id(key: str) -> str:
+    """会话键 → 稳定 UUID（进程内持久，同会话每请求同值）。"""
+    with _lock:
+        sid = _stable_ids.get(key)
+        if sid is None:
+            sid = str(uuid.uuid4())
+            _stable_ids[key] = sid
+            if len(_stable_ids) > _MAX_STABLE:
+                alive = set(_seen)
+                for k in [k for k in _stable_ids if k not in alive][: len(_stable_ids) - _MAX_STABLE]:
+                    _stable_ids.pop(k, None)
+        return sid
+
+
+def current_session() -> str | None:
+    """enforce 档：当前请求的稳定 x-session-id；未设置/关闭返回 None。"""
+    if not settings.SESSION_AFFINITY:
+        return None
+    entry = _current.get()
+    return entry[1] if entry else None
+
+
 def tag(req_id: str, body: dict) -> None:
-    """观测并写入 reqlog 在途条目（best-effort，reqlog 侧幂等容错）。"""
-    if not settings.SESSION_OBSERVE:
+    """观测 + enforce 装载（best-effort，观测绝不影响请求可用性）。
+
+    observe：写 reqlog 在途条目（SESSION_OBSERVE 门控）；
+    enforce：把 (会话键, 稳定 session id) 挂到本请求 context，供
+    build_request 经 current_session() 取用（SESSION_AFFINITY 门控）。
+    """
+    if not (settings.SESSION_OBSERVE or settings.SESSION_AFFINITY):
         return
     try:
-        from . import reqlog
-
         obs = observe(body)
-        if obs is not None:
+        if obs is None:
+            return
+        if settings.SESSION_AFFINITY:
+            _current.set((obs[0], _stable_session_id(obs[0])))
+        if settings.SESSION_OBSERVE:
+            from . import reqlog
+
             reqlog.tag_session(req_id, obs[0], obs[1])
     except Exception:  # noqa: BLE001 - 纯观测绝不影响请求
         pass
@@ -82,6 +126,8 @@ def tag(req_id: str, body: dict) -> None:
 
 def reset_for_tests() -> None:
     _seen.clear()
+    _stable_ids.clear()
+    _current.set(None)
 
 
 def summary(days: int = 7) -> dict:
