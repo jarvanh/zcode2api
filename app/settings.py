@@ -297,7 +297,6 @@ APP_VERSION = "2.8.0"
 # 供 admin API（GET /admin/api/sections/freshness）与 healthcheck 读取；
 # 风控波次确认时若已过时，日志给「高度疑似措辞触发」提示（gateway 波次点）。
 SECTIONS_STALE_DAYS = _int("ZCODE_SECTIONS_STALE_DAYS", 21)
-
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 
 

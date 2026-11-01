@@ -43,7 +43,7 @@ def test_billing_version_and_activation():
     # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
     assert constants.BILLING_APP_VERSION == "3.17.1"
     assert constants.BILLING_TITLE == "Z Code@electron"
-    assert constants.BILLING_RELEASE_CHANNEL == "stable"
+    assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
     assert constants.ACTIVATION_ELEMENTS == ("app_launch", "app_daily_active")
     assert constants.ACTIVATION_SCREEN_RESOLUTION == "2560x1440"
@@ -77,7 +77,7 @@ def test_identity_headers():
     assert constants.X_ZCODE_AGENT == "glm"
     assert constants.HTTP_REFERER == "https://zcode.z.ai"
     assert constants.IDENTITY_TITLE == "Z Code@electron"
-    assert constants.IDENTITY_RELEASE_CHANNEL == "stable"
+    assert constants.IDENTITY_RELEASE_CHANNEL == "production"
     assert constants.IDENTITY_CLIENT_LANGUAGE == "zh-CN"
     assert constants.IDENTITY_CLIENT_TIMEZONE == "Asia/Shanghai"
     assert constants.IDENTITY_OS_CATEGORY == "macos"

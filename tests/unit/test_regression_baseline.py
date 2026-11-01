@@ -211,11 +211,11 @@ class TestBuildRequest:
         assert url == "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
         assert headers["Authorization"] == "Bearer a.b.c"
         assert headers["anthropic-version"] == "2023-06-01"
-        # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
+        # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/production
         assert headers["X-Title"] == "Z Code@electron"
-        assert headers["X-Release-Channel"] == "stable"
-        # LLM 请求不带 X-Device-Mid（bundle g6n 实证，2026-10-24 形状修复）；
-        # UA 带 anthropic SDK 后缀（g6n/Y2 形状）
+        assert headers["X-Release-Channel"] == "production"
+        # LLM 请求不带 X-Device-Mid（bundle g6n 实证，2026-10-24 形状修复；
+        # 3.16.3 bundle Y2/gjs 复核维持）；UA 带 anthropic SDK 后缀（g6n/Y2 形状）
         assert "X-Device-Mid" not in headers
         assert headers["User-Agent"].endswith(identity_module.ANTHROPIC_SDK_UA)
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
