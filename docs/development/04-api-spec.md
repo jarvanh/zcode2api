@@ -87,6 +87,7 @@
 | 方法/路径 | 说明 |
 |-----------|------|
 | `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零） |
+| `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比/首见 vs 复见的 cache_read 均值对比 |
 | `POST /admin/api/monitoring/clear` | 清空监控 |
 | `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency` |
 | `PUT /admin/api/settings` | 改密钥、刷新间隔、并发上限（改后即生效，落 meta 表；并发 0 = 不限）。前端回填的掩码（含 `…` 或 `••••`）忽略不覆盖；网关 key 传空字符串表示关闭校验 |

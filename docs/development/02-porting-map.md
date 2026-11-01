@@ -74,6 +74,9 @@
 | 新模块 | zapi 参照（设计，不复制代码） | 说明 |
 |--------|-------------------------------|------|
 | `translator/openai_to_anthropic.py` | `src/translator/openai-to-anthropic.ts` 的映射规则 | 请求/响应/usage 字段映射 + 工具调用 |
+| `reasoning.py` | `src/provider/reasoning.ts` 的契约（实测证据不复制） | GLM-5.3 思考预算：档位↔预算表、max_tokens += 预算、采样参数剔除（v2.9.0 已落地） |
+| `endpoint_routing.py` | `src/proxy/endpoint-routing.ts` 的表形状与 fail-open 口径 | agent/configs proxyEndpoint.mapping 跟随（v2.9.0 已落地，M4 触发条件提前满足） |
+| `session_ctx.py` enforce 档 | `src/proxy/session-context.ts` 的稳定 session-id 语义 | 同会话稳定 x-session-id（v2.9.1 默认开） |
 | `translator/sse.py` | `src/translator/sse-translator.ts` | 逐块 SSE 双向翻译；`[DONE]`、usage 帧、content_block_delta 映射 |
 | `gateway/responses.py` | `src/proxy/responses-handler.ts` 的端点行为 | Responses→Chat→Anthropic 链路；`previous_response_id` 内存 LRU（TTL 24h） |
 | 模型白名单 | zapi `config.models` | `glm-4.5-air … glm-5.3-flash`，`defaultModel: glm-4.6` |

@@ -172,6 +172,10 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
 | `ZCODE_ACCOUNT_CONCURRENCY` | 2 | 单账号并发上限，0 不限（运行时可在后台设置改，以库为准）|
 | `ZCODE_CLAIM_ROUND_INTERVAL` | 600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
+| `ZCODE_THINKING_COMPAT` | 1 | 思考预算契约（GLM-5.3 家族恒思考，小 max_tokens 会被吃光）：注入 thinking+output_config，max_tokens += 预算再截顶，thinking 开启时剔除采样参数；0 = 直传 |
+| `ZCODE_ENDPOINT_ROUTING` | 1 | 端点映射跟随：周期拉 agent/configs 的 proxyEndpoint.mapping 表按上游指令改写推理端点（fail-open，不匹配原样放行）；0 = 关闭 |
+| `ZCODE_SESSION_OBSERVE` | 1 | 会话亲和观测档：reqlog 落会话键/复见标记与 cache_read，不改行为；`GET /admin/api/session-affinity` 看对比 |
+| `ZCODE_SESSION_AFFINITY` | 1 | 会话亲和 enforce 档：同会话转发稳定 x-session-id（六件 attribution 形状不变），提上游 prompt cache 命中；0 = 关闭 |
 | `ZCODE_NODE_PATH` | node | 求解器可执行文件（bun 或 node） |
 | `ZCODE_CAPTCHA_SOLVER_JS` | 空 | 显式指定求解器脚本（相对路径按项目根解析）；**优先级最高**，如 `captcha_node/solver-bun.ts` |
 | `ZCODE_CAPTCHA_SOLVER` | pw | 未显式指定时的推导：`legacy` → `solver.js`，`pw` → `solver_pw.js` |

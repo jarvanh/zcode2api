@@ -80,6 +80,8 @@ X-Aliyun-Captcha-Region: {region}
 
 Body：标准 Anthropic Messages（`model/max_tokens/stream/system/messages`）。上游模型名**大小写敏感**（`GLM-5.2`、`GLM-5-Turbo`）。
 
+LLM 请求头实况（g6n 构造器，与控制面 TV 头集的差异）：**无 X-Device-Mid**（LLM 请求从不带）；UA 附 anthropic SDK 后缀；附语言/时区/Os-Category；另带 attribution 追踪头六件（`x-request-id` / `x-zcode-session-type: main` / `x-zcode-trace-id` / `x-query-id` / `x-zcode-query-source: main_turn` / `x-session-id`，逐请求全新 UUID；会话亲和 enforce 档下 `x-session-id` 同会话稳定，见 v2.9.1）。思考预算契约（v2.9.0）：GLM-5.3 家族 OpenAI 入站注入 `thinking` + `output_config`，`max_tokens += 预算` 再按模型上限截顶。
+
 API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证码头。
 
 **验证码 verifyParam**：Bun+happy-dom 运行阿里云官方无痕 SDK（vendored 上游 captcha-happy.ts，回退 node 移植版）（`AliyunCaptcha.js`，o.alicdn.com），`startTracelessVerification()` 成功回调给出 `verifyParam = base64(JSON{certifyId, sceneId, isSign, securityToken})`；sceneId/region/prefix 从 `client/configs` 动态取（默认 `11xygtvd/sgp/no8xfe`）。挑战形态：403 + captcha 头；或 400 + body `{"code":3007}`。
@@ -155,7 +157,7 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
   "X-ZCode-Agent": "glm",
   "X-Platform": "{platform}-{arch}",
   "X-Os-Category": "{osCategory}",
-  "X-Release-Channel": "stable",
+  "X-Release-Channel": "production",
   "X-Client-Language": "{locale}",
   "X-Client-Timezone": "{timezone}",
   "X-Title": "Z Code@{sourceTitle}",

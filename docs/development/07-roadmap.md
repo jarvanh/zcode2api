@@ -49,7 +49,7 @@ M0 骨架      ──▶ M1 账号运营层(P1) ──▶ M2 网关扩展(P2) �
 
 ## M4 — 风控对抗（按需，触发条件驱动）
 
-- [ ] endpoint routing：`agent/configs` 拉取 + URL 重写（fail-open）——**触发条件**：观测到上游把流量迁往 ultra 端点
+- [x] endpoint routing：`agent/configs` 拉取 + URL 重写（fail-open）——**已于 v2.9.0 提前落地**（app/endpoint_routing.py，触发条件未到先上保险，当前上游表仅覆盖 bigmodel 端点、对 plan 通道休眠）
 - [ ] client signing V4：Ed25519 + PoW——**触发条件**：`agent/configs` 返回 `codingPlanSignature.enable=true`
 - [ ] start-plan 验证码池预热（进程内，非请求时求解）
 
