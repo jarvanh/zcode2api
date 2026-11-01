@@ -139,7 +139,7 @@ async def risk_overview(days: int = 7):
                 "last_error": (a.last_error or "")[:120],
             })
 
-    from .routes import gateway as gw  # 惰性：避免模块加载顺序耦合
+    from . import gateway as gw  # 惰性：避免模块加载顺序耦合（同包相对导入）
     waves = []
     for provider, until in dict(getattr(gw, "_risk_wave_until", {})).items():
         if until > now:
