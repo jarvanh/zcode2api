@@ -268,6 +268,10 @@ function renderUsage(d){
   const meta=document.getElementById('usage-range');
   if(meta)meta.textContent=r.from?`${r.from} ~ ${r.to} · 不含探测`:'暂无用量记录';
 }
+function startUsagePolling(){
+  if(_usageTimer)clearInterval(_usageTimer);
+  _usageTimer=setInterval(()=>{ if(!document.hidden && !anyModalOpen()) loadUsage(); },60000);
+}
 let _riskTimer=null;
 async function loadRisk(silent){
   try{
