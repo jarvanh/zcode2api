@@ -311,3 +311,10 @@ def frontend_version() -> str:
         return v or APP_VERSION
     except OSError:
         return APP_VERSION
+
+# ── 失败请求诊断留存（app/diaglog.py，2026-10-31 405 排障经验）──────────────
+# 上游 4xx/5xx/业务错误时按天落双侧现场（响应体截断 + 请求形状指纹，不含对话
+# 正文），admin API GET /admin/api/diaglog 查询。0 依赖热路径，落盘失败只留痕。
+DIAGLOG_ENABLED = _bool("ZCODE_DIAGLOG_ENABLED", True)
+DIAGLOG_DAYS = _int("ZCODE_DIAGLOG_DAYS", 3)          # 保留天数（按天清理）
+DIAGLOG_MAX_BODY = _int("ZCODE_DIAGLOG_MAX_BODY", 2048)  # 响应体截断字节

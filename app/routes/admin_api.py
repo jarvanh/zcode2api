@@ -9,7 +9,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, freshness, logs, reqlog, riskmetrics, usage_stats
+from .. import captcha_ledger, diaglog, freshness, logs, reqlog, riskmetrics, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -67,6 +67,12 @@ async def sections_freshness():
         except ValueError:
             pass
     return {"data": freshness.status()}
+
+
+@router.get("/diaglog")
+async def query_diaglog(days: int = 3, limit: int = 200, status: int | None = None):
+    """失败请求诊断留存（响应体 + 请求形状指纹，默认 3 天）。"""
+    return {"data": {"rows": diaglog.query(days=days, limit=limit, status=status)}}
 
 
 @router.get("/accounts")

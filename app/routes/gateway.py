@@ -19,7 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, freshness, logs, reqlog, riskmetrics, settings
+from .. import constants, diaglog, freshness, logs, reqlog, riskmetrics, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -1845,6 +1845,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             text = (await resp.aread()).decode("utf-8", "ignore")
             await cm.__aexit__(None, None, None)
             await client.aclose()
+            diaglog.record_failure(req_id, account_name=account.name, mode=account.mode,
+                                   model=str(body.get("model") or ""), url=url,
+                                   status=status_code, text=text, request_body=body)
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
@@ -2085,6 +2088,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 if hit is not None:
                     _status, etype, _emsg = hit
                     code_hit = _upstream_biz_code(text)
+                    diaglog.record_failure(req_id, account_name=account.name, mode=account.mode,
+                                           model=str(body.get("model") or ""), url=url,
+                                           status=200, text=text, request_body=body)
                     await cm.__aexit__(None, None, None)
                     await client.aclose()
                     if code_hit in _RISK_BIZ_CODES:
