@@ -19,7 +19,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .. import constants, dedup, diaglog, freshness, logs, reqlog, riskmetrics, settings
+from .. import constants, dedup, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -648,6 +648,7 @@ async def messages(request: Request):
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
                  bool(body.get("stream")), _last_user_text(body))
+    session_ctx.tag(req_id, body)
 
     if body.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
@@ -876,7 +877,8 @@ async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str
         usage = (data.get("usage") or {}) if isinstance(data, dict) else {}
         logs.req_ok(req_id)
         reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
-                         input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+                         input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
+                         cache_read=_cache_read(usage))
         record_usage(model, usage.get("input_tokens"), usage.get("output_tokens"))
         yield f"data: {text}\n\n"
         yield "data: [DONE]\n\n"
@@ -898,7 +900,8 @@ async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str
         logs.req_ok(req_id)
         reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                          input_tokens=conv.usage.get("prompt_tokens"),
-                         output_tokens=conv.usage.get("completion_tokens"))
+                         output_tokens=conv.usage.get("completion_tokens"),
+                         cache_read=_cache_read(conv.usage))
         record_usage(model, conv.usage.get("prompt_tokens"), conv.usage.get("completion_tokens"))
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
@@ -954,6 +957,7 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
                 break
     logs.req(req_id, model_name, stream, preview)
     reqlog.begin(req_id, "chat", model_name, stream, preview)
+    session_ctx.tag(req_id, payload)
     tried: set[str] = set()
     last_error = ""
     t0 = time.time()
@@ -1006,7 +1010,8 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
                     store.update_account(account)
                     reqlog.finish_ok(req_id, t_first=time.time() - t0, status=200,
                                      input_tokens=usage.get("prompt_tokens"),
-                                     output_tokens=usage.get("completion_tokens"))
+                                     output_tokens=usage.get("completion_tokens"),
+                                     cache_read=_cache_read(usage))
                     record_usage(model_name, usage.get("prompt_tokens"), usage.get("completion_tokens"))
                     await client.aclose()
                     return JSONResponse(data)
@@ -1077,6 +1082,7 @@ async def chat_completions(request: Request):
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
                  bool(payload.get("stream")), _last_user_text(body))
+    session_ctx.tag(req_id, body)
 
     if payload.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
@@ -1160,7 +1166,8 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
     usage = data.get("usage") or {}
     reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
-                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
+                     cache_read=_cache_read(usage))
     record_usage(model, usage.get("input_tokens"), usage.get("output_tokens"))
     return JSONResponse(anthropic_to_openai(data, model))
 
@@ -1186,7 +1193,8 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             logs.req_ok(req_id)
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                              input_tokens=conv.usage.get("prompt_tokens"),
-                             output_tokens=conv.usage.get("completion_tokens"))
+                             output_tokens=conv.usage.get("completion_tokens"),
+                             cache_read=_cache_read(conv.usage))
             record_usage(model, conv.usage.get("prompt_tokens"), conv.usage.get("completion_tokens"))
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
@@ -1243,6 +1251,17 @@ async def _dispatch_guarded(req_id, body, incoming_headers, port, provider):
     result = await _dispatch(req_id, body, incoming_headers, port, provider)
     _dedup_note(fp, result, stream)
     return result
+
+
+def _cache_read(usage) -> int | None:
+    """上游 usage 里的缓存命中 token 数（Anthropic cache_read_input_tokens /
+    OpenAI prompt_tokens_details.cached_tokens）；无则 None（会话亲和观测用）。"""
+    if not isinstance(usage, dict):
+        return None
+    v = usage.get("cache_read_input_tokens")
+    if v is None:
+        v = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    return v
 
 
 def _dedup_note(fp: str, result, stream: bool) -> None:
@@ -2227,7 +2246,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 sync_usage = (sync_data.get("usage") or {}) if isinstance(sync_data, dict) else {}
                 reqlog.finish_ok(req_id, t_first=time.time() - attempt_t0, status=status_code,
                                  input_tokens=sync_usage.get("input_tokens"),
-                                 output_tokens=sync_usage.get("output_tokens"))
+                                 output_tokens=sync_usage.get("output_tokens"),
+                                 cache_read=_cache_read(sync_usage))
                 record_usage(model_name, sync_usage.get("input_tokens"),
                              sync_usage.get("output_tokens"))
                 # 2026-10-25 防放大器：Plan 通道真实成功 = 上游风控窗口已开，

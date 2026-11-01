@@ -9,7 +9,7 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, diaglog, freshness, logs, reqlog, riskmetrics, usage_stats
+from .. import captcha_ledger, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, usage_stats
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -67,6 +67,12 @@ async def sections_freshness():
         except ValueError:
             pass
     return {"data": freshness.status()}
+
+
+@router.get("/session-affinity")
+async def session_affinity(days: int = 7):
+    """会话亲和观测聚合：首见 vs 复见请求的 cache_read 均值对比（observe 档）。"""
+    return {"data": session_ctx.summary(days=days)}
 
 
 @router.get("/diaglog")

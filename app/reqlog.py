@@ -58,10 +58,22 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "t_total": None,
         "input_tokens": None,
         "output_tokens": None,
+        "cache_read": None,
+        "sess": None,
+        "sess_repeat": None,
     }
     with _lock:
         _entries.append(entry)
         _inflight[req_id] = entry
+
+
+def tag_session(req_id: str, sess_key: str, repeat: bool) -> None:
+    """会话亲和观测（observe 档，app/session_ctx.py）：会话键 + 是否复见。"""
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["sess"] = sess_key
+            entry["sess_repeat"] = bool(repeat)
 
 
 def mark_account(req_id: str, account_name: str, mode: str) -> None:
@@ -75,7 +87,7 @@ def mark_account(req_id: str, account_name: str, mode: str) -> None:
 
 def finish_ok(req_id: str, t_first: float | None = None,
               input_tokens: int | None = None, output_tokens: int | None = None,
-              status: int | None = None) -> None:
+              status: int | None = None, cache_read: int | None = None) -> None:
     with _lock:
         entry = _inflight.pop(req_id, None)
         if entry is None:
@@ -86,6 +98,7 @@ def finish_ok(req_id: str, t_first: float | None = None,
         entry["t_total"] = time.time() - entry["ts"]
         entry["input_tokens"] = input_tokens
         entry["output_tokens"] = output_tokens
+        entry["cache_read"] = cache_read
         row = dict(entry)
     _persist(row)
 
@@ -164,6 +177,10 @@ def _persist(entry: dict) -> None:
             "t_total": entry.get("t_total"),
             "in": entry.get("input_tokens"),
             "out": entry.get("output_tokens"),
+            "cache_read": entry.get("cache_read"),
+            # 会话亲和观测（app/session_ctx.py）：sess 是内容哈希非正文
+            "sess": entry.get("sess"),
+            "sess_repeat": entry.get("sess_repeat"),
             # 历史只留错误摘要（明细 preview 含用户内容，不进磁盘）
             "err": (entry.get("error") or "")[:160],
         }

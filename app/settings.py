@@ -334,3 +334,9 @@ DEDUP_MAX = _int("ZCODE_DEDUP_MAX", 1024)              # 内存 LRU 上限
 # 未强制，默认关）。开启时建议同步调高 CAPTCHA_POOL_MIN/MAX（求解 10-40s/枚）。
 CAPTCHA_WAVE_BOOST = _int("ZCODE_CAPTCHA_WAVE_BOOST", 2)
 CAPTCHA_ATTACH_PLAN = _bool("ZCODE_CAPTCHA_ATTACH_PLAN", False)
+
+# ── 会话亲和观测（app/session_ctx.py，observe 档）───────────────────────────
+# 每请求在 reqlog 行落会话键与是否复见、响应侧落 cache_read——为「是否值得做
+# 会话亲和（转发稳定 session id 换上游 prompt cache 命中）」攒数据。纯观测，
+# 绝不改变请求行为；summary 走 admin API GET /admin/api/session-affinity。
+SESSION_OBSERVE = _bool("ZCODE_SESSION_OBSERVE", True)
