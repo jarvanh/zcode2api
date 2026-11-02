@@ -436,3 +436,90 @@ async def test_round_stagger_zero_keeps_old_behavior(monkeypatch):
     manager = ClaimRoundManager()
     await manager._round()
     assert visited == ["a1", "a2"], "stagger=0 必须逐个连续处理，无延迟"
+
+
+@pytest.mark.asyncio
+async def test_remember_new_plan_id_wakes_round(fresh_app, monkeypatch):
+    """真新 id 入池 → request_round 置位唤醒；旧 id 重复发现不唤醒。
+
+    2026-11-02 主人要求：balance 收割/preview 发现新投放时立即触发领取轮，
+    把「等下一个整点轮」的提前量从最长 1 小时压到秒级。
+    """
+    import app.claim as claim_mod
+
+    manager = ClaimRoundManager()
+    monkeypatch.setattr(claim_mod, "claim_round", manager)
+    assert not manager._wake.is_set()
+
+    claim_mod.remember_plan_ids(["brand-new-plan"])
+    assert manager._wake.is_set(), "新 id 必须唤醒领取轮"
+
+    manager._wake.clear()
+    claim_mod.remember_plan_ids(["brand-new-plan"])
+    assert not manager._wake.is_set(), "重复发现旧 id 不得再唤醒"
+
+
+@pytest.mark.asyncio
+async def test_loop_wake_triggers_immediate_round(monkeypatch):
+    """唤醒事件把 interval 等待截断，醒来后立即跑一轮。"""
+    import app.claim as claim_mod
+
+    rounds: list[float] = []
+
+    async def fake_round(self=None):
+        rounds.append(time.monotonic())
+
+    monkeypatch.setattr(ClaimRoundManager, "_round", fake_round)
+
+    class _FakeStore:
+        @staticmethod
+        def claim_round_interval():
+            return 3600  # 假设整点轮间隔 1h
+
+    monkeypatch.setattr("app.store.store", _FakeStore())
+
+    manager = ClaimRoundManager()
+    monkeypatch.setattr(type(manager), "START_DELAY_SECONDS", 0.05)
+    task = asyncio.create_task(manager._loop())
+    await asyncio.sleep(0.2)  # 首轮跑完进入 interval 等待
+    assert len(rounds) == 1
+
+    t0 = time.monotonic()
+    manager.request_round("test")
+    await asyncio.sleep(0.2)
+    assert len(rounds) == 2, "唤醒后必须立即开新轮"
+    assert time.monotonic() - t0 < 1, "唤醒不得等满 interval"
+
+    manager._stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_loop_wake_respects_disabled_interval(monkeypatch):
+    """interval=0（关闭）时唤醒只回看设置，不跑轮。"""
+    import app.claim as claim_mod
+
+    rounds: list[float] = []
+
+    async def fake_round(self=None):
+        rounds.append(time.monotonic())
+
+    monkeypatch.setattr(ClaimRoundManager, "_round", fake_round)
+
+    class _FakeStore:
+        @staticmethod
+        def claim_round_interval():
+            return 0  # 关闭
+
+    monkeypatch.setattr("app.store.store", _FakeStore())
+
+    manager = ClaimRoundManager()
+    monkeypatch.setattr(type(manager), "START_DELAY_SECONDS", 0.05)
+    task = asyncio.create_task(manager._loop())
+    await asyncio.sleep(0.15)
+    manager.request_round("test")
+    await asyncio.sleep(0.2)
+    assert rounds == [], "关闭态唤醒不得跑轮"
+
+    manager._stop.set()
+    await asyncio.wait_for(task, timeout=2)

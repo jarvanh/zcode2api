@@ -254,7 +254,12 @@ def known_plan_ids() -> list[str]:
 
 
 def remember_plan_ids(plan_ids: list[str]) -> None:
-    """并集入库（只增不减；失效 id 由 _forget_plan_id 按上游 1001 剔除）。"""
+    """并集入库（只增不减；失效 id 由 _forget_plan_id 按上游 1001 剔除）。
+
+    真新 id 入池即唤醒自动领取轮（request_round）：preview 列出 / balance
+    收割发现新投放时，把「等下一个整点轮」的提前量从最长 1 小时压到秒级
+    （2026-11-02 主人要求）。唤醒失败不影响发现链路，下轮自然兜底。
+    """
     from .store import store
 
     clean = [p for p in plan_ids if p and p.strip()]
@@ -264,6 +269,11 @@ def remember_plan_ids(plan_ids: list[str]) -> None:
     merged = list(dict.fromkeys(known + clean))
     if merged != known:
         store.set_setting(_KNOWN_PLANS_META, json.dumps(merged))
+        added = [p for p in merged if p not in known]
+        try:
+            claim_round.request_round(f"新候选套餐入池: {added}")
+        except Exception as err:  # noqa: BLE001 - 唤醒失败不阻断发现链路
+            logs.warn("claim", f"领取轮唤醒失败（下轮兜底）: {err}")
 
 
 def _forget_plan_id(plan_id: str) -> None:
@@ -710,16 +720,22 @@ class ClaimRoundManager:
     轮间隔运行期读 meta 设置（0 = 关闭，仍周期回看便于随时启用）；
     轮内相邻账号间可加 0～stagger 秒随机延迟（claim_round_stagger，打散
     「同轮全池同拍打上游 billing」的行为聚类；0 = 关闭，首个账号不等）。
+    新候选套餐入池（remember_plan_ids 发现真新 id）经 request_round 提前
+    唤醒，不等满 interval。
     单账号异常不中断整轮，后台任务异常全部自兜。
     """
 
     # 停服截止：轮内长尾（验证码求解重试可达分钟级）超时即 cancel，
     # uvicorn lifespan 关闭保持有界，不被半途的求解卡成 SIGKILL 脏停机
     STOP_GRACE_SECONDS = 10
+    # 启动错峰（避开安装序 / 入池自动领取的首次流量高峰）；类常量便于测试提速
+    START_DELAY_SECONDS = 30
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        # 新候选套餐入池的提前唤醒（request_round 置位，_loop 消费后清除）
+        self._wake = asyncio.Event()
         # 账号 → {plan_id: 名额恢复时间(ms)}：1005 退避记忆（仅轮次路径使用）
         self._claim_holds: dict[str, dict[str, int]] = {}
         # 无可服务账号的告警只在状态变化时发（持续故障期不逐轮刷屏）
@@ -800,12 +816,36 @@ class ClaimRoundManager:
         if claimed:
             logs.ok("claim", f"自动领取轮完成: {claimed} 个账号有新套餐入账")
 
+    async def _wait_stop_or_wake(self, timeout: float) -> bool:
+        """等待「停服 / 提前唤醒 / 到点」，返回是否因唤醒返回（停服/超时 False）。"""
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        wake_task = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({stop_task, wake_task}, timeout=timeout,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (stop_task, wake_task):
+                t.cancel()
+        if self._stop.is_set():
+            return False
+        return self._wake.is_set()
+
+    def request_round(self, reason: str) -> None:
+        """外部发现新候选套餐时提前唤醒领取轮（轮未运行时仅置位，无害）。
+
+        唤醒不越过 interval<=0 的关闭语义：_loop 醒来后仍按设置决定是否跑轮。
+        """
+        if self._wake.is_set():
+            return
+        logs.info("claim", f"领取轮提前唤醒: {reason}")
+        self._wake.set()
+
     async def _loop(self) -> None:
         from .store import store
 
         # 启动先等一段（避开启动安装序 / 入池自动领取的首次流量高峰）
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=30)
+            await asyncio.wait_for(self._stop.wait(), timeout=self.START_DELAY_SECONDS)
             return
         except TimeoutError:
             pass
@@ -819,11 +859,14 @@ class ClaimRoundManager:
                     logs.err("claim", f"自动领取轮出错: {err}")
             # interval<=0 视为关闭：仍周期性回看设置，便于随时启用
             wait = interval if interval > 0 else 30
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=wait)
-                return
-            except TimeoutError:
+            if await self._wait_stop_or_wake(wait):
+                # 新候选入池唤醒：清标记后立即进入下一轮（关闭态只回看设置）
+                self._wake.clear()
+                if interval > 0:
+                    logs.info("claim", "新候选套餐入池，提前触发一轮领取")
                 continue
+            if self._stop.is_set():
+                return
 
     def start(self) -> None:
         if self._task is None:
