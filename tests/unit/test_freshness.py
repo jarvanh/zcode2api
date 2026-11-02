@@ -10,19 +10,27 @@ import json
 
 import pytest
 
-from app import freshness
+from app import constants, freshness
 from app.store import store
 
 
 @pytest.fixture(autouse=True)
 def _isolated_sections(monkeypatch):
-    """每个用例注入独立的 sidecar _meta，不污染真实模块状态。"""
+    """每个用例注入独立的 sidecar _meta，不污染真实模块状态。
+
+    本机官方客户端版本同样必须钉住：部署机装了 ZCode 时读的是真实
+    current.json，官方一自更新（2026-11-02 实测 3.17.1 → 3.17.2），「对齐」
+    用例就会因宿主状态变红——那是部署机的漂移告警，不该是单测结论。
+    漂移本身由 freshness 巡检落 meta 表供 healthcheck 读，路径不变。
+    """
     holder: dict = {"meta": {}}
 
     def fake_load():
         return {"_meta": holder["meta"], "cliPrefix": "x"}
 
     monkeypatch.setattr(freshness, "_load_sections", fake_load)
+    monkeypatch.setattr(freshness.hostinfo, "local_client_version",
+                        lambda: constants.CLIENT_APP_VERSION)
     yield holder
 
 

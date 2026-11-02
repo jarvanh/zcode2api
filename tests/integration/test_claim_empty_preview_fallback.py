@@ -51,6 +51,10 @@ def env(gateway_client, fresh_app, monkeypatch):
     mock.state.billing_current_scenario = None
     mock.state.billing_balance_plans = None
     mock.state.billing_balance_windows = None
+    # 上游套餐存在性/已持有（claim 前置校验，先于验证码）；用例显式设列表，
+    # None = 不校验（旧协议）
+    mock.state.claim_known_plan_ids = None
+    mock.state.claim_held_plan_ids = None
     acc = seed_account(fresh_app, GOOD_JWT, name="fallback-a")
     return client, mock, stub, acc
 
@@ -63,8 +67,9 @@ def _auth(store) -> dict:
 class TestPreviewEmptyFallback:
     async def test_empty_preview_still_claims_harvested_plan(self, env, fresh_app):
         """核心回归：preview 无 data 时，仍按收割到的 plan_id 领取成功。"""
-        _client, mock, _stub, acc = env
+        _client, mock, stub, acc = env
         mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = [WEEKEND_PLAN]
         fresh_app.set_setting("claim_known_plan_ids", f'["{WEEKEND_PLAN}"]')
 
         outcomes = await auto_claim_all_plans(acc)
@@ -73,23 +78,49 @@ class TestPreviewEmptyFallback:
         assert outcomes[0]["ok"] is True
         assert outcomes[0]["plan_id"] == WEEKEND_PLAN
         assert outcomes[0]["probe"] is True, "兜底来源必须打标（面板可区分）"
+        assert stub.solve_count == 1, "只有探测确认存在的 id 才解一次码"
 
     async def test_no_candidates_still_skips_quietly(self, env):
-        """无候选可试时保持原语义：不谎报成功，也不抛异常。"""
-        _client, mock, _stub, acc = env
+        """上游没有任何在投套餐时：日期候选全部 1001，不谎报、不抛、不烧码。"""
+        _client, mock, stub, acc = env
         mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = []
         assert known_plan_ids() == []
         assert await auto_claim_all_plans(acc) == []
+        assert stub.solve_count == 0, "不存在的 id 不得进入验证码环节"
 
     async def test_held_plan_not_retried(self, env, fresh_app):
         """已持有的套餐不进兜底候选（必定 1003，白烧验证码）。"""
         _client, mock, stub, acc = env
         mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = [WEEKEND_PLAN]
+        mock.state.claim_held_plan_ids = [WEEKEND_PLAN]
         acc.plans = [{"plan_id": WEEKEND_PLAN}]
         fresh_app.set_setting("claim_known_plan_ids", f'["{WEEKEND_PLAN}"]')
 
         assert await auto_claim_all_plans(acc) == []
         assert stub.solve_count == 0, "不该为必然失败的候选求解验证码"
+
+    async def test_date_candidate_discovered_without_harvest(self, env, fresh_app):
+        """核心新能力：没有任何账号先领过，也能靠日期推导 id 自己领到。
+
+        主人 2026-11-02 的要求——「不能每次都要我先手动领取」。上游只投当
+        日日期 id，收割候选池为空。
+        """
+        from app import claim as claim_mod
+
+        _client, mock, stub, acc = env
+        today_plan = claim_mod._date_plan_candidates()[0]
+        mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = [today_plan]
+        assert known_plan_ids() == [], "本用例的前提是没有任何历史收割 id"
+
+        outcomes = await auto_claim_all_plans(acc)
+
+        assert len(outcomes) == 1, f"日期候选必须自证并领取: {outcomes}"
+        assert outcomes[0]["plan_id"] == today_plan
+        assert outcomes[0]["probe"] is True
+        assert stub.solve_count == 1, "探测免码，真实领取才解一次码"
 
     async def test_preview_listed_plan_is_harvested(self, env):
         """preview 正常列出时写入候选，供后续空窗轮复用。"""
@@ -177,6 +208,7 @@ class TestManualClaimFallback:
         """面板「手动领取」在 preview 空时也必须可用（同一根因的第二条路径）。"""
         client, mock, _stub, acc = env
         mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = [WEEKEND_PLAN]
         fresh_app.set_setting("claim_known_plan_ids", f'["{WEEKEND_PLAN}"]')
 
         res = await client.post("/admin/api/claim",

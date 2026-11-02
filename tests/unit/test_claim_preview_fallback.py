@@ -10,11 +10,14 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app import claim as claim_mod
 from app.claim import (
     ClaimError,
+    _date_plan_candidates,
     _held_plan_ids,
     _probe_state,
     _probe_unlisted_plans,
@@ -71,8 +74,23 @@ class TestPlanIdHarvest:
         assert _held_plan_ids(acc) == {"p1", "p2"}
 
 
+def _stub_probe(monkeypatch, code: int = 3007, calls: list[str] | None = None):
+    """把无验证码存在性探测桩成指定业务码（默认 3007=存在，待验证码）。"""
+    async def fake_probe(account, plan_id):
+        if calls is not None:
+            calls.append(plan_id)
+        return code
+
+    monkeypatch.setattr(claim_mod, "_probe_plan_code", fake_probe)
+
+
 @pytest.mark.asyncio
 class TestProbeUnlistedPlans:
+    @pytest.fixture(autouse=True)
+    def _isolate_date_candidates(self, monkeypatch):
+        """已知 id 用例只测收割候选；日期推导由 TestDatePlanCandidates 单独覆盖。"""
+        monkeypatch.setattr(claim_mod, "_date_plan_candidates", lambda now=None: [])
+
     async def test_claims_harvested_candidate(self, fresh_app, monkeypatch):
         """preview 空 ≠ 无可领：收割到的 id 必须真去打一次 claim。"""
         claims: list[str] = []
@@ -82,6 +100,7 @@ class TestProbeUnlistedPlans:
             return {"plan_id": plan_id, "plan_name": "ZCODE WEEKEND BUILD"}
 
         remember_plan_ids(["zcode-v3-start-plan-1030-wk"])
+        _stub_probe(monkeypatch)
         monkeypatch.setattr(claim_mod, "claim", fake_claim)
         out = await _probe_unlisted_plans(_acc(fresh_app, "probe-claim"))
 
@@ -100,6 +119,7 @@ class TestProbeUnlistedPlans:
             return {"plan_id": plan_id}
 
         remember_plan_ids(["held-plan", "new-plan"])
+        _stub_probe(monkeypatch)
         monkeypatch.setattr(claim_mod, "claim", fake_claim)
         acc = _acc(fresh_app, "probe-held")
         acc.plans = [{"plan_id": "held-plan"}]
@@ -117,6 +137,7 @@ class TestProbeUnlistedPlans:
             return {"plan_id": plan_id}
 
         remember_plan_ids(["waiting-plan"])
+        _stub_probe(monkeypatch)
         monkeypatch.setattr(claim_mod, "claim", fake_claim)
         out = await _probe_unlisted_plans(_acc(fresh_app, "probe-skip"),
                                           {"waiting-plan"})
@@ -130,6 +151,7 @@ class TestProbeUnlistedPlans:
             raise ClaimError("该套餐已经领取过", code=1003)
 
         remember_plan_ids(["b1", "b2", "b3"])
+        _stub_probe(monkeypatch)
         monkeypatch.setattr(claim_mod, "claim", fake_claim)
         monkeypatch.setattr(claim_mod, "_PROBE_DAILY_BUDGET", 2)
         acc = _acc(fresh_app, "probe-budget")
@@ -140,31 +162,90 @@ class TestProbeUnlistedPlans:
         assert await _probe_unlisted_plans(acc) == []
         assert claims == [], "预算耗尽当日不再打（防烧验证码池/风控分）"
 
-    async def test_forgets_plan_on_1001(self, fresh_app, monkeypatch):
-        """1001 = 套餐已下线：从候选剔除，别每天重复试。"""
+    async def test_forgets_plan_on_probe_1001(self, fresh_app, monkeypatch):
+        """1001 = 套餐已下线：探测阶段即剔除，不进入验证码环节。"""
+        claims: list[str] = []
+
         async def fake_claim(account, plan_id=None):
-            raise ClaimError("套餐不存在", code=1001)
+            claims.append(plan_id)
+            return {"plan_id": plan_id}
 
         remember_plan_ids(["dead-plan"])
+        _stub_probe(monkeypatch, 1001)
         monkeypatch.setattr(claim_mod, "claim", fake_claim)
         assert await _probe_unlisted_plans(_acc(fresh_app, "probe-1001")) == []
         assert known_plan_ids() == []
+        assert claims == [], "不存在的 id 不得烧验证码"
+
+    async def test_probe_1003_skips_without_claim(self, fresh_app, monkeypatch):
+        """探测已持有（本地 plans 陈旧）→ 不打真实领取。"""
+        claims: list[str] = []
+
+        async def fake_claim(account, plan_id=None):
+            claims.append(plan_id)
+            return {"plan_id": plan_id}
+
+        remember_plan_ids(["held-upstream"])
+        _stub_probe(monkeypatch, 1003)
+        monkeypatch.setattr(claim_mod, "claim", fake_claim)
+        assert await _probe_unlisted_plans(_acc(fresh_app, "probe-held-up")) == []
+        assert claims == []
+
+    async def test_probe_exception_does_not_escape(self, fresh_app, monkeypatch):
+        async def boom(account, plan_id):
+            raise RuntimeError("probe exploded")
+
+        remember_plan_ids(["x-plan"])
+        monkeypatch.setattr(claim_mod, "_probe_plan_code", boom)
+        assert await _probe_unlisted_plans(_acc(fresh_app, "probe-probe-boom")) == []
 
     async def test_network_exception_does_not_escape(self, fresh_app, monkeypatch):
         async def boom(account, plan_id=None):
             raise RuntimeError("network exploded")
 
         remember_plan_ids(["x-plan"])
+        _stub_probe(monkeypatch)
         monkeypatch.setattr(claim_mod, "claim", boom)
         assert await _probe_unlisted_plans(_acc(fresh_app, "probe-boom")) == []
 
-    async def test_probe_budget_resets_next_day(self, fresh_app):
-        from app.store import store
+    async def test_date_candidate_claimed_without_harvest(
+            self, fresh_app, monkeypatch):
+        """核心回归：没有任何历史/持有 id 时，日期候选也能触发领取。"""
+        claims: list[str] = []
 
-        store.set_setting(claim_mod._PROBE_META,
-                          '{"date": "2000-01-01", "tried": {"a1": ["p1", "p2"]}}')
-        _day, tried = _probe_state()
-        assert tried == {}, "跨日必须重置预算"
+        async def fake_claim(account, plan_id=None):
+            claims.append(plan_id)
+            return {"plan_id": plan_id, "plan_name": "ZCODE GLOBAL BUILD"}
+
+        monkeypatch.setattr(claim_mod, "_date_plan_candidates",
+                            lambda now=None: ["zcode-v3-start-plan-1102"])
+        _stub_probe(monkeypatch)
+        monkeypatch.setattr(claim_mod, "claim", fake_claim)
+        acc = _acc(fresh_app, "probe-date")
+        assert known_plan_ids() == []
+        out = await _probe_unlisted_plans(acc)
+        assert claims == ["zcode-v3-start-plan-1102"]
+        assert out and out[0]["probe"] is True
+
+
+class TestDatePlanCandidates:
+    """日期推导候选：不依赖任何账号已持有，解决「每次都要先手动领一个」。"""
+
+    @staticmethod
+    def _ts(m, d):
+        return time.mktime((2026, m, d, 12, 0, 0, 0, 0, -1))
+
+    def test_weekday_plain_id(self):
+        assert _date_plan_candidates(self._ts(11, 2)) == [
+            "zcode-v3-start-plan-1102"]
+
+    def test_friday_includes_weekend_variant(self):
+        assert _date_plan_candidates(self._ts(10, 30)) == [
+            "zcode-v3-start-plan-1030", "zcode-v3-start-plan-1030-wk"]
+
+    def test_sunday_includes_weekend_variant(self):
+        assert _date_plan_candidates(self._ts(11, 1)) == [
+            "zcode-v3-start-plan-1101", "zcode-v3-start-plan-1101-wk"]
 
 
 @pytest.mark.asyncio

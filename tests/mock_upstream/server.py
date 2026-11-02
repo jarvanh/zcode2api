@@ -362,15 +362,27 @@ def build_app() -> FastAPI:
         headers = {k.lower(): v for k, v in request.headers.items()}
         body = await request.body()
         _record("POST", request.url.path, headers, body)
-        if not headers.get("x-aliyun-captcha-verify-param"):
-            return Response(json.dumps({"code": 3007, "msg": "captcha required"}),
-                            media_type="application/json")
         try:
             payload = json.loads(body) if body else {}
         except json.JSONDecodeError:
             payload = {}
         if not payload.get("plan_id"):
             return Response(json.dumps({"code": 3001, "msg": "bad plan"}),
+                            media_type="application/json")
+        # 测试协议：app.state.claim_known_plan_ids 设列表时，套餐存在性/已持有
+        # 校验先于验证码（与真上游同序，2026-11-02 实测 1001/1003 均无验证码头
+        # 即返回）——兜底候选的免码探测靠这条才能被端到端测到。
+        # app.state.claim_held_plan_ids 设列表时，命中的 id 返回 1003。
+        known = getattr(app.state, "claim_known_plan_ids", None)
+        if known is not None and payload["plan_id"] not in known:
+            return Response(json.dumps({"code": 1001, "msg": "target not found"}),
+                            media_type="application/json")
+        held = getattr(app.state, "claim_held_plan_ids", None)
+        if held is not None and payload["plan_id"] in held:
+            return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
+                            media_type="application/json")
+        if not headers.get("x-aliyun-captcha-verify-param"):
+            return Response(json.dumps({"code": 3007, "msg": "captcha required"}),
                             media_type="application/json")
         scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
         if scenario == "claim_auth":
