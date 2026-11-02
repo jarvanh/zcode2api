@@ -284,13 +284,16 @@ UPSTREAM = {
 ZCODE_BILLING_BASE = constants.BILLING_BASE
 # 激活事件上报（测试时指向 Mock 上游）
 ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REPORT_URL)
+# 营销横幅 feed（测试时指向 Mock 上游）
+ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL",
+                                      constants.MARKETING_TOUCH_URL)
 
 # OAuth 与兑换链 origin（测试时指向 Mock 上游）
 OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/api/v1")
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.7"
+APP_VERSION = "2.9.8"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

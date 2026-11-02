@@ -55,6 +55,7 @@ def env(gateway_client, fresh_app, monkeypatch):
     # None = 不校验（旧协议）
     mock.state.claim_known_plan_ids = None
     mock.state.claim_held_plan_ids = None
+    mock.state.touch_plans = None  # None = feed 未部署（404 空态）
     acc = seed_account(fresh_app, GOOD_JWT, name="fallback-a")
     return client, mock, stub, acc
 
@@ -121,6 +122,24 @@ class TestPreviewEmptyFallback:
         assert outcomes[0]["plan_id"] == today_plan
         assert outcomes[0]["probe"] is True
         assert stub.solve_count == 1, "探测免码，真实领取才解一次码"
+
+    async def test_banner_plan_discovered_and_claimed(self, env, fresh_app):
+        """横幅 feed = 官方活动第二投放列表（magpie #503）：挂横幅期间 preview
+        看不到 plan，网关从 touch feed 拿到 id 领取；发现即入候选池供复用。"""
+        _client, mock, stub, acc = env
+        mock.state.claim_scenario = "claim_no_data"
+        mock.state.claim_known_plan_ids = [WEEKEND_PLAN]
+        mock.state.touch_plans = [{"plan_id": WEEKEND_PLAN,
+                                   "name": "ZCODE WEEKEND BUILD"}]
+        assert known_plan_ids() == [], "前提：候选池为空，全靠横幅发现"
+
+        outcomes = await auto_claim_all_plans(acc)
+
+        assert len(outcomes) == 1, f"横幅候选必须被领取: {outcomes}"
+        assert outcomes[0]["plan_id"] == WEEKEND_PLAN
+        assert outcomes[0]["probe"] is True
+        assert stub.solve_count == 1, "免码探测确认后才解一次码"
+        assert WEEKEND_PLAN in known_plan_ids(), "横幅发现即入候选池"
 
     async def test_preview_listed_plan_is_harvested(self, env):
         """preview 正常列出时写入候选，供后续空窗轮复用。"""

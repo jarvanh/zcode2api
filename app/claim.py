@@ -216,6 +216,9 @@ async def report_activation_events(account: Account) -> str | None:
 # preview 端点不走此门（用户触发 = zcode-switch claim_refresh 语义）。
 _ACTIVATION_REPORTED: dict[str, str] = {}
 
+# 营销横幅 feed 的 seq 每进程递增（官方 bootRequestSeq 同形，3.17.2 bundle）
+_TOUCH_SEQ = 0
+
 # ── preview 空窗兜底（投放发现）────────────────────────────────────
 # 2026-10-31 实证：三个号的 billing/preview 返回 {"code":0,"msg":"","logid":...}
 # ——连 data 字段都没有——但带明确 plan_id 打 billing/claim 返回 code=0 真实发放。
@@ -334,7 +337,10 @@ def _date_plan_candidates(now: float | None = None) -> list[str]:
     today = time.strftime("%m%d", local)
     out = [f"zcode-v3-start-plan-{today}"]
     if local.tm_wday in (4, 5, 6):  # 周五~周日：周末活动
+        # 后缀形态（…-1030-wk）为 10 月起现行；前缀（…-wk-0905）为 9 月实证
+        # 旧形——两种都试，官方改回也不漏（feed 上线后这只是廉价保险）。
         out.append(f"zcode-v3-start-plan-{today}-wk")
+        out.append(f"zcode-v3-start-plan-wk-{today}")
     return list(dict.fromkeys(out))
 
 
@@ -367,33 +373,40 @@ def _candidate_plan_ids(account: Account) -> list[str]:
 
 
 async def _probe_unlisted_plans(account: Account,
-                               skip_plan_ids: set[str] | None = None) -> list[dict]:
+                               skip_plan_ids: set[str] | None = None,
+                               priority_ids: set[str] | None = None) -> list[dict]:
     """preview 空时按候选 plan_id 发现并领取（投放空窗兜底）。
 
     候选先做无验证码存在性探测：只有 3007（缺验证码=存在且未持有）才走真实
     领取，1001/1003/1002/1005 等直接跳过——不存在的猜测不消耗验证码预算。
     幂等安全：1001 说明 id 已下线，从记住的候选里剔除。
     skip_plan_ids：1005 名额等待期跳过的 id（与 preview 主路同语义），不消耗预算。
+    priority_ids：官方渠道（横幅 feed）报过名的 id，探测/领取不占每日预算、
+    排在猜测候选之前——官方答案不该被命名规律猜测挤出预算窗口。
     """
     tried = _probe_state()[1]
     tried_ids = set(tried.get(account.id) or [])
-    if len(tried_ids) >= _PROBE_DAILY_BUDGET:
-        return []
 
     skip = skip_plan_ids or set()
+    held = _held_plan_ids(account)
+    priority = {pid for pid in (priority_ids or set())
+                if pid and pid not in held and pid not in skip}
     candidates = [pid for pid in _candidate_plan_ids(account)
-                  if pid not in tried_ids and pid not in skip]
+                  if pid not in tried_ids and pid not in skip
+                  and pid not in priority]
     # 预算按「真没试过的候选」数收口：held 命中不消耗每日额度（它们必定 1003，
     # 记账只会把后面的新候选顶掉，白等一天）
     candidates = candidates[:max(0, _PROBE_DAILY_BUDGET - len(tried_ids))]
-    if not candidates:
+    if not candidates and not priority:
         return []
 
-    logs.info("claim", f"账号 {account.name} preview 空，探测候选套餐: {candidates}")
+    logs.info("claim", f"账号 {account.name} preview 空，探测候选套餐: "
+                       f"{sorted(priority | set(candidates))}")
     verified: list[str] = []
-    for pid in candidates:
-        # 先记账后打：异常/超时同样消耗预算，避免重启后反复重打同一候选
-        _record_probe(account.id, pid)
+    for pid in sorted(priority) + candidates:
+        if pid not in priority:
+            # 先记账后打：异常/超时同样消耗预算，避免重启后反复重打同一候选
+            _record_probe(account.id, pid)
         try:
             code = await _probe_plan_code(account, pid)
         except ClaimError as err:
@@ -433,6 +446,128 @@ def _today_key() -> str:
     return time.strftime("%Y-%m-%d")
 
 
+# ── 营销横幅 feed（官方活动第二投放列表，magpie #503 / cpa touch.go 同构）────
+_TOUCH_CLAIM_ACTION = "claim_zcode_plan"
+_TOUCH_WALK_DEPTH = 12
+
+
+def _walk_touch(node, depth: int, ids: list[str], names: list[str],
+                metas: dict) -> None:
+    """递归 walk 一个投放：找 claim_zcode_plan action 与 zcode_plan 元数据。
+
+    刻意 walk 而非钉 schema：横幅按钮挪位置/换层级仍能找到（cpa 同容忍）。
+    """
+    if node is None or depth > _TOUCH_WALK_DEPTH:
+        return
+    if isinstance(node, list):
+        for item in node:
+            _walk_touch(item, depth + 1, ids, names, metas)
+        return
+    if not isinstance(node, dict):
+        return
+    if node.get("type") == _TOUCH_CLAIM_ACTION:
+        args = node.get("args")
+        if isinstance(args, dict):
+            pid = str(args.get("plan_id") or "").strip()
+            if pid and pid not in ids:
+                ids.append(pid)
+    zp = node.get("zcode_plan")
+    if isinstance(zp, dict):
+        name = str(zp.get("name") or "").strip()
+        if name and not names:
+            names.append(name)
+        mpid = str(zp.get("plan_id") or "").strip()
+        if mpid and mpid not in metas:
+            metas[mpid] = zp
+    for child in node.values():
+        _walk_touch(child, depth + 1, ids, names, metas)
+
+
+def parse_touch_plans(body) -> list[dict]:
+    """从 touch feed 响应提取候选 [{"plan_id", "name"}]（读不出 → [] 由调用方定语义）。
+
+    命名回退按投放走（cpa touchPlansFromDelivery 同形）：先匹配同 id 的
+    zcode_plan 元数据，缺省用**本投放**首个横幅名，最后退回 id 本身——
+    跨投放的首名不该串到别的横幅上。
+    """
+    if not isinstance(body, dict):
+        return []
+    data = body.get("data")
+    deliveries = data.get("deliveries") if isinstance(data, dict) else None
+    if not isinstance(deliveries, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for dv in deliveries:
+        ids: list[str] = []
+        names: list[str] = []
+        metas: dict = {}
+        _walk_touch(dv, 0, ids, names, metas)
+        for pid in ids:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            meta = metas.get(pid) or {}
+            name = (str(meta.get("name") or "").strip()
+                    or (names[0] if names else "") or pid)
+            out.append({"plan_id": pid, "name": name})
+    return out
+
+
+async def fetch_touch_plans(account: Account) -> list[dict]:
+    """拉营销横幅 feed，返回横幅活动候选。
+
+    404 = feed 未部署（无横幅活动的空态，不是错）；body 读不出 = 错误
+    （「未知」绝不冒充「无套餐」，cpa 同语义）；401/403 = 凭证失效（同
+    billing 门）。
+    """
+    global _TOUCH_SEQ
+    from .quota import _auth_headers
+
+    headers = _auth_headers(account)
+    try:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            res = await client.get(settings.ZCODE_MARKETING_TOUCH_URL,
+                                   headers=headers, params={"seq": str(_TOUCH_SEQ)})
+    except httpx.HTTPError as err:
+        raise ClaimError(f"营销 feed 网络错误: {err}") from err
+    _TOUCH_SEQ += 1
+    if res.status_code == 404:
+        return []
+    if res.status_code in (401, 403):
+        text = (res.text or "").lower()
+        if "captcha" not in text and "verify" not in text:
+            _mark_auth_failure(account)
+            raise ClaimError(AUTH_EXPIRED_MESSAGE)
+    try:
+        body = res.json()
+    except ValueError:
+        raise ClaimError(f"营销 feed 响应非 JSON HTTP {res.status_code}") from None
+    return parse_touch_plans(body)
+
+
+async def _banner_candidate(account: Account) -> list[str]:
+    """横幅 feed 候选 id；发现即入候选池（remember 内含领取轮唤醒）。
+
+    任何失败只记日志返回 []——feed 是增益渠道，绝不阻断既有 preview/兜底链。
+    """
+    try:
+        banner = await fetch_touch_plans(account)
+    except ClaimError as err:
+        logs.info("claim", f"账号 {account.name} 营销 feed 读取失败: {err}")
+        return []
+    except Exception as err:  # noqa: BLE001 - feed 异常不阻断领取链
+        logs.warn("claim", f"账号 {account.name} 营销 feed 读取异常: {err}")
+        return []
+    if not banner:
+        return []
+    ids = [p["plan_id"] for p in banner]
+    remember_plan_ids(ids)
+    logs.info("claim", f"账号 {account.name} 横幅发现候选套餐: "
+                       f"{'、'.join(p['name'] for p in banner)}")
+    return ids
+
+
 async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | None = None) -> list[dict]:
     """新账号入池自动领取：每日一次激活上报（preview 之前）→ preview → 逐个领取。
 
@@ -464,14 +599,17 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
         plans = await preview_plans(account)
     except ClaimError as err:
         logs.info("claim", f"账号 {account.name} 无可领套餐（{err}），转兜底候选")
-        outcomes.extend(await _probe_unlisted_plans(account, skip_plan_ids))
+        outcomes.extend(await _probe_unlisted_plans(
+            account, skip_plan_ids, priority_ids=set(await _banner_candidate(account))))
         return outcomes
     except Exception as err:  # noqa: BLE001
         logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
         return outcomes
 
     if not plans:
-        probed = await _probe_unlisted_plans(account, skip_plan_ids)
+        banner_ids = await _banner_candidate(account)
+        probed = await _probe_unlisted_plans(account, skip_plan_ids,
+                                             priority_ids=set(banner_ids))
         if probed:
             outcomes.extend(probed)
             return outcomes
@@ -553,8 +691,25 @@ async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, s
         return plan_id, "", []
     plans = await preview_plans(account)
     if not plans:
+        # 横幅 feed 先行：官方活动第二投放列表（挂横幅期间 preview 看不到）。
         # 候选同样先做免码探测：直接返回第一个 id 会把「不存在」的猜测交给
         # 带码请求（面板手动领取一次 = 一次验证码 + 一次 1001 失败）。
+        for pid in await _banner_candidate(account):
+            if pid in _held_plan_ids(account):
+                continue
+            try:
+                code = await _probe_plan_code(account, pid)
+            except ClaimError as err:
+                logs.info("claim", f"账号 {account.name} 候选 {pid} 探测失败: {err}")
+                continue
+            except Exception as err:  # noqa: BLE001 - 探测异常不阻断选择
+                logs.warn("claim", f"账号 {account.name} 候选 {pid} 探测异常: {err}")
+                continue
+            if code == 3007:
+                logs.info("claim", f"账号 {account.name} preview 空，改用横幅候选 {pid}")
+                return pid, "", []
+            if code == 1001:
+                _forget_plan_id(pid)
         for pid in _candidate_plan_ids(account):
             try:
                 code = await _probe_plan_code(account, pid)

@@ -79,6 +79,13 @@ BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_
 # app_daily_active —— 疑似活动套餐投放的资格信号（官方客户端可见活动而纯
 # billing 轮询号 preview 为空的差异点）。
 EVENT_REPORT_URL = f"{ZCODE_ORIGIN}/api/v1/event/report"
+# 营销横幅 feed（官方活动第二投放列表）：App 活动横幅不走 billing/preview，
+# 从这里读投放，按钮 claim_zcode_plan action 直接带 plan_id（magpie #503 /
+# cpa-multi-plugins touch.go 实证；WEEKEND BUILD 挂横幅期间 preview/current
+# 均看不到它——2026-11-02 我们的「空窗」形态同源）。3.17.2 bundle 对拍：
+# GET ?seq=<每进程递增>，头 = JWT + X-Device-Mid + X-Client-Language +
+# X-ZCode-App-Version。
+MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}/api/v1/marketing/touch"
 ACTIVATION_ELEMENTS = ("app_launch", "app_daily_active")
 ACTIVATION_SCREEN_RESOLUTION = "2560x1440"
 

@@ -74,6 +74,35 @@ class TestPlanIdHarvest:
         assert _held_plan_ids(acc) == {"p1", "p2"}
 
 
+class TestTouchFeed:
+    """营销横幅 feed（官方活动第二投放列表，magpie #503 / cpa touch.go 同构）。"""
+
+    def test_parse_walks_nested_banner_actions(self):
+        body = {"code": 0, "data": {"deliveries": [
+            {"banner": {
+                "action": {"type": "claim_zcode_plan", "args": {"plan_id": "p-1"}},
+                "background": {"args": {"zcode_plan": {"name": "WEEKEND",
+                                                       "plan_id": "p-1"}}},
+            }},
+            {"deep": {"deeper": {
+                "action": {"type": "other"},
+                "nested": [{"action": {"type": "claim_zcode_plan",
+                                       "args": {"plan_id": "p-2"}}}],
+            }}},
+        ]}}
+        out = claim_mod.parse_touch_plans(body)
+        assert [p["plan_id"] for p in out] == ["p-1", "p-2"], "深层按钮也要找到"
+        assert out[0]["name"] == "WEEKEND", "zcode_plan 元数据命名"
+        assert out[1]["name"] == "p-2", "无元数据时退回 id 本身"
+
+    def test_parse_tolerates_malformed(self):
+        assert claim_mod.parse_touch_plans({"code": 0}) == []
+        assert claim_mod.parse_touch_plans(None) == []
+        assert claim_mod.parse_touch_plans("x") == []
+        assert claim_mod.parse_touch_plans(
+            {"code": 0, "data": {"deliveries": "not-a-list"}}) == []
+
+
 def _stub_probe(monkeypatch, code: int = 3007, calls: list[str] | None = None):
     """把无验证码存在性探测桩成指定业务码（默认 3007=存在，待验证码）。"""
     async def fake_probe(account, plan_id):
@@ -208,6 +237,27 @@ class TestProbeUnlistedPlans:
         monkeypatch.setattr(claim_mod, "claim", boom)
         assert await _probe_unlisted_plans(_acc(fresh_app, "probe-boom")) == []
 
+    async def test_priority_ids_bypass_daily_budget(self, fresh_app, monkeypatch):
+        """官方渠道（横幅 feed）报过名的 id 不占每日预算、排在猜测之前。"""
+        claims: list[str] = []
+
+        async def fake_claim(account, plan_id=None):
+            claims.append(plan_id)
+            return {"plan_id": plan_id, "plan_name": "BANNER PLAN"}
+
+        acc = _acc(fresh_app, "probe-prio")
+        for pid in ("a", "b", "c", "d"):  # 预算烧满
+            claim_mod._record_probe(acc.id, pid)
+        _stub_probe(monkeypatch)
+        monkeypatch.setattr(claim_mod, "claim", fake_claim)
+
+        out = await _probe_unlisted_plans(acc, priority_ids={"banner-plan"})
+        assert claims == ["banner-plan"], "预算耗尽不得挡官方报名的 id"
+        assert out and out[0]["probe"] is True
+
+        claims.clear()
+        assert await _probe_unlisted_plans(acc) == [], "无优先级时预算语义不变"
+
     async def test_date_candidate_claimed_without_harvest(
             self, fresh_app, monkeypatch):
         """核心回归：没有任何历史/持有 id 时，日期候选也能触发领取。"""
@@ -239,13 +289,16 @@ class TestDatePlanCandidates:
         assert _date_plan_candidates(self._ts(11, 2)) == [
             "zcode-v3-start-plan-1102"]
 
-    def test_friday_includes_weekend_variant(self):
+    def test_friday_includes_weekend_variants(self):
+        # 后缀（…-1030-wk）为 10 月现行；前缀（…-wk-0905）为 9 月实证旧形
         assert _date_plan_candidates(self._ts(10, 30)) == [
-            "zcode-v3-start-plan-1030", "zcode-v3-start-plan-1030-wk"]
+            "zcode-v3-start-plan-1030", "zcode-v3-start-plan-1030-wk",
+            "zcode-v3-start-plan-wk-1030"]
 
-    def test_sunday_includes_weekend_variant(self):
+    def test_sunday_includes_weekend_variants(self):
         assert _date_plan_candidates(self._ts(11, 1)) == [
-            "zcode-v3-start-plan-1101", "zcode-v3-start-plan-1101-wk"]
+            "zcode-v3-start-plan-1101", "zcode-v3-start-plan-1101-wk",
+            "zcode-v3-start-plan-wk-1101"]
 
 
 @pytest.mark.asyncio
