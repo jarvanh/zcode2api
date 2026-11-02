@@ -18,8 +18,8 @@ def _write(tmp_path, day: date, rows: list[dict]):
 
 def test_summarize_periods_and_probe(tmp_path):
     today = date(2026, 10, 23)  # 周五
-    week_start = today - timedelta(days=today.weekday())  # 10/19
-    month_start = today.replace(day=1)  # 10/1
+    day7_start = today - timedelta(days=6)    # 近 7 天窗口起点（10/17）
+    day30_start = today - timedelta(days=29)  # 近 30 天窗口起点（9/24）
 
     files = [
         (today, _write(tmp_path, today, [
@@ -30,10 +30,12 @@ def test_summarize_periods_and_probe(tmp_path):
         (today - timedelta(days=1), _write(tmp_path, today - timedelta(days=1), [
             {"in": 20, "out": 10},
         ])),
-        (week_start - timedelta(days=1), _write(tmp_path, week_start - timedelta(days=1), [
+        # 9 天前：在近 7 天窗外、近 30 天窗内
+        (today - timedelta(days=9), _write(tmp_path, today - timedelta(days=9), [
             {"in": 30, "out": 15},
         ])),
-        (month_start - timedelta(days=1), _write(tmp_path, month_start - timedelta(days=1), [
+        # 40 天前：两个滚动窗都窗外，仅「历史」
+        (today - timedelta(days=40), _write(tmp_path, today - timedelta(days=40), [
             {"in": 40, "out": 20},
         ])),
     ]
@@ -44,18 +46,34 @@ def test_summarize_periods_and_probe(tmp_path):
     assert data["today"] == {
         "requests": 2, "in": 10, "out": 5, "total": 15, "credit": 1.5,
     }
-    # 本周：今日 + 昨天（10/22）
-    assert data["week"]["requests"] == 3
-    assert data["week"]["total"] == 45
-    # 本月：今日 + 昨天 + 10/18（周一前一日，但仍在 10 月）
-    assert data["month"]["requests"] == 4
-    assert data["month"]["total"] == 90
-    # 历史：全部（含 9/30）
+    # 近 7 天：今日 + 昨天（9 天前在窗外）
+    assert data["day7"]["requests"] == 3
+    assert data["day7"]["total"] == 45
+    # 近 30 天：今日 + 昨天 + 9 天前（40 天前在窗外）
+    assert data["day30"]["requests"] == 4
+    assert data["day30"]["total"] == 90
+    # 历史：全部（含 40 天前那份）
     assert data["all"]["requests"] == 5
     assert data["all"]["total"] == 150
     assert data["range"] == {
-        "from": "2026-09-30", "to": "2026-10-23", "days": 4,
+        "from": "2026-09-13", "to": "2026-10-23", "days": 4,
     }
+
+
+def test_summarize_rolling_window_boundary(tmp_path):
+    """滚动窗边界：第 7 天（含）与第 8 天（不含）——与自然周口径的关键差异。"""
+    today = date(2026, 10, 23)
+    files = [
+        (today - timedelta(days=6), _write(tmp_path, today - timedelta(days=6), [
+            {"in": 7, "out": 0},
+        ])),
+        (today - timedelta(days=7), _write(tmp_path, today - timedelta(days=7), [
+            {"in": 8, "out": 0},
+        ])),
+    ]
+    data = usage_stats._summarize(files, today)
+    assert data["day7"]["requests"] == 1  # 只含 6 天前那份，7 天前不在窗内
+    assert data["day7"]["in"] == 7
 
 
 def test_summarize_empty():

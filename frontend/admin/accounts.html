@@ -253,7 +253,7 @@ async function loadUsage(){
 function renderUsage(d){
   const el=document.getElementById('usage-grid');
   if(!el)return;
-  const defs=[['today','今日'],['week','本周'],['month','本月'],['all','历史']];
+  const defs=[['today','今日'],['day7','近 7 天'],['day30','近 30 天'],['all','历史']];
   el.innerHTML=defs.map(([k,label])=>{
     const u=d[k]||{};
     const req=Number(u.requests)||0;

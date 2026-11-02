@@ -74,17 +74,19 @@ def _signature(files: list[tuple[date, Path]]) -> tuple:
 
 
 def _summarize(files: list[tuple[date, Path]], today: date) -> dict:
-    """把文件列表聚合成今日/本周/本月/历史四个桶。
+    """把文件列表聚合成今日/近7天/近30天/历史四个桶。
 
-    周从周一算起，月从 1 号算起，均按北京日期；探测请求不计入。
+    近 N 天为滚动窗口（含今天，按北京日期），不随周一起点/月初跳变——
+    2026-11-01 主人拍板：自然周口径在周一出现「今日=本周」的恒等空窗，
+    改为相对时段。探测请求不计入。
     """
     files = sorted(files, key=lambda item: item[0])
-    week_start = today - timedelta(days=today.weekday())
-    month_start = today.replace(day=1)
+    day7_start = today - timedelta(days=6)     # 近 7 天：含今天共 7 天
+    day30_start = today - timedelta(days=29)   # 近 30 天：含今天共 30 天
     buckets = {
         "today": _empty(),
-        "week": _empty(),
-        "month": _empty(),
+        "day7": _empty(),
+        "day30": _empty(),
         "all": _empty(),
     }
 
@@ -106,15 +108,15 @@ def _summarize(files: list[tuple[date, Path]], today: date) -> dict:
             _add(buckets["all"], row)
             if day == today:
                 _add(buckets["today"], row)
-            if day >= week_start:
-                _add(buckets["week"], row)
-            if day >= month_start:
-                _add(buckets["month"], row)
+            if day >= day7_start:
+                _add(buckets["day7"], row)
+            if day >= day30_start:
+                _add(buckets["day30"], row)
 
     return {
         "today": buckets["today"],
-        "week": buckets["week"],
-        "month": buckets["month"],
+        "day7": buckets["day7"],
+        "day30": buckets["day30"],
         "all": buckets["all"],
         "range": {
             "from": files[0][0].isoformat() if files else None,
