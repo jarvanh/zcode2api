@@ -3,11 +3,12 @@
 上游 405/3012 校验史：
   - 10-12 起按「形状」拦：非官方 3 块链（2 块子代理 / 4+ 块）全拒；
   - 10-31 起按「文本」拦：块1 cli_prefix 与块2 stable 必须与当前官方版本
-    （3.17.1）逐字节一致——3.16.3 旧措辞与 Desktop Context 追加段均 405；
+    （3.17.2；与 3.17.1 同文）逐字节一致——3.16.3 旧措辞与 Desktop Context
+    追加段均 405；
     块3 dynamic 不校验（离线二分实弹：base 405 / 3.17.1 块1+2 + 3.16.3 块3
     200，交叉混合逐块定位）。
 
-本文件锁三件事：块1/块2 与 sidecar（3.17.1）逐字节一致、custom system 只
+本文件锁三件事：块1/块2 与 sidecar（3.17.2）逐字节一致、custom system 只
 出现在块3 尾部、重复变换幂等。
 """
 
@@ -24,9 +25,15 @@ from app.body_transform import (
 )
 
 
-def test_sidecar_is_3171_wording():
-    """sidecar 必须是 3.17.1 措辞——旧文本会直接 405，这里锁死防回退。"""
+def test_sidecar_is_official_wording():
+    """sidecar 必须是官方现行版措辞——旧文本会直接 405，这里锁死防回退。
+
+    3.17.2 对拍实证（scripts/capture_sections.py 可复跑）：默认链块1/2 文本
+    与 3.17.1 逐字节相同，bundle 仅拆常量以支持 Output Style/Workflow Actor
+    变体，故断言值不变、版本名随侧车走。
+    """
     sec = bt._load_sections()
+    assert sec["_meta"]["client_version"] == "3.17.2"
     assert sec["cliPrefix"] == "You are ZCode, an interactive agent"
     stable = "\n\n".join(sec["stableSections"])
     assert stable.startswith("\nYou are an agent working with the user toward their goals")

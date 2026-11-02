@@ -29,8 +29,8 @@
     "close": "</system-reminder>"
   },
   "_meta": {
-    "client_version": "3.17.1",
-    "captured_at": "2026-10-31",
-    "source": "官方 3.17.1 桌面端 bundle 镜像（cliPrefix/stableSections；dynamic 沿用 3.16.3，实弹证实不受校验）"
+    "client_version": "3.17.2",
+    "captured_at": "2026-11-03",
+    "source": "官方 3.17.2 server bundle（~/.zcode/server/releases/3.17.2-*/runtime/zcode.cjs）镜像：块1 hBa/buildCliPrefixSection 与块2 buildIdentityPrompt（gBa+\"\\n\\n\"+cBo）+buildHarnessBlock 重组后与 3.17.1 逐字节一致（3.17.2 仅拆常量以支持 Output Style/Workflow Actor 变体，默认链文本未变）；dynamic/contextPrefix 沿用 3.17.1（3.17.2 起官方默认链 system 块仅剩 cli_prefix+identity，env_info/model/current_date 迁 meta_user 附件 A3a、块3 默认为空——10-31 实弹证实块3 与 context_prefix 均不受校验，网关维持 3 块线缆形状）"
   }
 }

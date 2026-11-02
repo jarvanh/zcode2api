@@ -103,6 +103,45 @@ def check_and_record() -> dict:
     return st
 
 
+def refresh() -> dict:
+    """现算一次并回写 meta 表，返回最新状态（admin 读路径调用）。
+
+    与 check_and_record 的差别：status() 零网络纯本地读，现算代价为零，
+    admin 轮询（30s 一轮）直接现算即可消掉「官方升版后最长 6h 巡检盲窗」
+    （2026-11-02 实测：启动巡检 7 分钟后本机客户端自更新 3.17.1→3.17.2，
+    控制台一直亮绿到下一跳）。回写让 stale_hint() 热路径与 healthcheck 同步
+    吃到最新状态；日志只在状态翻转/问题集变化时打一次，否则 30s 轮询刷屏。
+    """
+    st = status()
+    prev_raw = store.get_setting(_FRESHNESS_KEY)
+    prev: dict | None = None
+    if prev_raw:
+        try:
+            prev = json.loads(prev_raw)
+        except (ValueError, TypeError):
+            prev = None
+    sig = (st["stale"], tuple(st["problems"]), st["sidecar_client_version"],
+           st["local_client_version"])
+    prev_sig = ((prev or {}).get("stale"), tuple((prev or {}).get("problems") or []),
+                (prev or {}).get("sidecar_client_version"), (prev or {}).get("local_client_version"))
+    if _strip_checked_at(st) != _strip_checked_at(prev):
+        store.set_setting(_FRESHNESS_KEY, json.dumps(st, ensure_ascii=False))
+    if prev is None or sig != prev_sig:
+        if st["stale"]:
+            logs.warn("freshness", "system sidecar 文本疑似过时: " + "; ".join(st["problems"]))
+        else:
+            logs.info("freshness", f"sidecar 对齐官方 {st['sidecar_client_version']}"
+                                   f"（captured {st['captured_at']}）")
+    return st
+
+
+def _strip_checked_at(st: dict | None) -> dict | None:
+    """去掉 checked_at 的副本（时间戳每秒都变，不能参与回写判定）。"""
+    if not isinstance(st, dict):
+        return None
+    return {k: v for k, v in st.items() if k != "checked_at"}
+
+
 def claim_hint() -> str | None:
     """领取/preview 失败时的版本新鲜度提示（claim.py 失败路径调用）。
 

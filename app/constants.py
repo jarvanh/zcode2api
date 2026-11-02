@@ -45,7 +45,7 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源：官方客户端 3.17.1，2026-10-31 跟进）────────────────
+# ── 客户端版本（单一真相源：官方客户端 3.17.2，2026-11-03 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
 # 出处：本机官方 ZCode Server current.json（appVersion=3.16.3，2026-10-23 实测；
 # 前值 3.14.4 为 2026-10-02 注册表实测），Linux 无注册表改读 current.json。# zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
@@ -57,7 +57,9 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # 真正根因是 preview 空窗与套餐发现渠道（见 claim.py 空窗兜底）。但钉旧版仍是
 # 长期隐患（上游随时可拉高门槛），官方升版照跟；启动时会比对本机
 # ~/.zcode/server/current.json 并在落伍时告警（main.py lifespan）。
-CLIENT_APP_VERSION = "3.17.1"
+# 2026-11-03 跟进 3.17.2：块1/2 文本与 3.17.1 逐字节相同（bundle 重组对拍，
+# 见 zcode_sections_3172.json _meta），仅常量/侧车版本号跟进。
+CLIENT_APP_VERSION = "3.17.2"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 # bundle 实证（3.16.3）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
@@ -67,7 +69,7 @@ CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.17.1"
+BILLING_APP_VERSION = "3.17.2"  # 须与 CLIENT_APP_VERSION 同步升（半更新=2026-10-31 组合病因，freshness 告警项）
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
                                          # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时

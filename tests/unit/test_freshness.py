@@ -34,7 +34,7 @@ def _isolated_sections(monkeypatch):
     yield holder
 
 
-def _meta(version="3.17.1", captured="2026-10-31"):
+def _meta(version="3.17.2", captured="2026-11-03"):
     return {"client_version": version, "captured_at": captured}
 
 
@@ -79,3 +79,31 @@ def test_check_and_record_persists_to_meta_table(_isolated_sections):
     freshness.check_and_record()
     hint = freshness.stale_hint()
     assert hint and "≠ 网关身份版本" in hint
+
+
+def test_refresh_recomputes_and_writes_back(_isolated_sections):
+    """refresh() 现算并回写 meta 表：读路径消官方升版后的巡检盲窗（2026-11-02
+    实测：启动巡检 7 分钟后本机客户端自更新，控制台亮绿到下一跳）。"""
+    _isolated_sections["meta"] = _meta()
+    st = freshness.refresh()
+    raw = store.get_setting("sections_freshness")
+    assert raw and json.loads(raw)["sidecar_client_version"] == constants.CLIENT_APP_VERSION
+    assert st["stale"] is False
+
+
+def test_refresh_logs_only_on_transition(_isolated_sections, monkeypatch):
+    """日志只在状态翻转/问题集变化时打——否则 30s 控制台轮询刷屏。"""
+    calls: list[str] = []
+    monkeypatch.setattr(freshness.logs, "info", lambda *a, **k: calls.append("info"))
+    monkeypatch.setattr(freshness.logs, "warn", lambda *a, **k: calls.append("warn"))
+    # 先钉住已知起点（store 跨用例共享，前序用例可能留下任意缓存状态）
+    _isolated_sections["meta"] = _meta(version="3.16.3")
+    freshness.refresh()
+    calls.clear()
+    _isolated_sections["meta"] = _meta()
+    freshness.refresh()  # stale→fresh：info 一次
+    freshness.refresh()  # 状态未变：不重复打
+    assert calls == ["info"]
+    _isolated_sections["meta"] = _meta(version="3.16.3")
+    freshness.refresh()  # fresh→stale：warn 一次
+    assert calls == ["info", "warn"]

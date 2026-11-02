@@ -125,9 +125,11 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.17.1"`（官方客户端
-现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.17.1（2026-10-31 实测；
-前值 3.16.3 为 2026-10-23 实测）；zcode-switch Windows 路径读注册表本机真实版同源。
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.17.2"`（官方客户端
+现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.17.2（2026-11-03 实测；
+前值 3.17.1 为 2026-10-31 实测、3.16.3 为 2026-10-23 实测；3.17.2 块1/2 文本与
+3.17.1 逐字节相同，仅版本常量/侧车跟进，对拍工具 scripts/capture_sections.py）；
+zcode-switch Windows 路径读注册表本机真实版同源。
 **升版先改此常量**；网关启动时比对本机 current.json 并在落伍时告警
 （app/main.py `_warn_version_drift`）。
 订正 2026-10-31：同一号分别用 3.16.3 / 3.17.1 打 preview 结果一致（都无 data），

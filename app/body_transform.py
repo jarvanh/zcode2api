@@ -1,5 +1,8 @@
-"""请求体变换 —— 镜像官方 ZCode 3.17.1 ContextBuilder（bundle
-assembleSystemMessages；3.16.3 版镜像见 git 历史 zcode_sections_3163.json）。
+"""请求体变换 —— 镜像官方 ZCode 3.17.2 ContextBuilder（bundle
+assembleSystemMessages；3.17.2 起默认链 system 块仅剩 cli_prefix+identity，
+env_info/model/current_date 迁 meta_user 附件 A3a、块3 默认为空——网关维持
+3 块线缆形状不变，块3/context_prefix 不受校验（10-31 实弹））。历史镜像：
+3.16.3/3.17.1 见 git 历史 zcode_sections_3163/3171.json。
 
 上游 WAF 对 system 块的校验史（同为 HTTP 405 承载的 3012 "unusual activity"，
 与账号/指纹/出口无关）：
@@ -13,8 +16,9 @@ assembleSystemMessages；3.16.3 版镜像见 git 历史 zcode_sections_3163.json
 
 官方桌面端默认装配（assembleSystemMessages）恰好 3 个线缆块：
   块1 cli_prefix 单独一块，无 cache_control（3.15.1 起不再带）；
-  块2 全部 stable 段 \n\n 连接（3.17.1：Agent Identity + Harness；CLI 面
-      不携带 Desktop Context），ephemeral；
+  块2 全部 stable 段 \n\n 连接（3.17.1/3.17.2 同文：Agent Identity + Harness；
+      CLI 面不携带 Desktop Context；3.17.2 custom_system_prompt 归 stable 族，
+      但块2 文本被上游按版本校验，追加即破坏逐字节一致性——维持并入块3），ephemeral；
   块3 全部 dynamic 段 \n\n 连接并带 "\n\n" 前缀（Dynamic Behavior /
       Environment Info（powered-by 行并入本段末行）/ Context
       Management），ephemeral。
@@ -36,7 +40,7 @@ import json
 import os
 from pathlib import Path
 
-Sections = dict  # 侧车 zcode_sections_3171.json 的加载形态
+Sections = dict  # 侧车 zcode_sections_3172.json 的加载形态
 
 
 def _load_sections() -> Sections | None:
@@ -44,7 +48,7 @@ def _load_sections() -> Sections | None:
     if _SECTIONS is None:
         try:
             _SECTIONS = json.loads(
-                (Path(__file__).with_name("zcode_sections_3171.json")).read_text("utf-8")
+                (Path(__file__).with_name("zcode_sections_3172.json")).read_text("utf-8")
             )
         except (OSError, ValueError):
             _SECTIONS = {}
@@ -139,7 +143,8 @@ def build_start_plan_system(
     env: dict | None = None,
 ) -> list[dict]:
     """镜像官方 assembleSystemMessages 的 3 块默认装配；custom system 并入
-    dynamic 合并块尾部（块2 须保持 3.17.1 逐字节官方文本，见模块头注释）。
+    dynamic 合并块尾部（块2 须保持 3.17.2 逐字节官方文本——与 3.17.1 同文，
+    见模块头注释）。
 
     env 段值必须与身份头同源（platform/osVersion 与 X-Platform/X-Os-Version
     一致），混合组合是真实客户端不产生的形状。

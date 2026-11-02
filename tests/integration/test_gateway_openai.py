@@ -51,8 +51,9 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        # 2026-10-31 起 WAF 按版本校验块1/块2 文本：块1 须为 3.17.1 措辞，
-        # custom system 改并入块3（dynamic，不受校验）尾部，块2 保持逐字节官方文本。
+        # 2026-10-31 起 WAF 按版本校验块1/块2 文本：块1 须为官方现行版措辞
+        # （3.17.2 与 3.17.1 同文），custom system 改并入块3（dynamic，不受校验）
+        # 尾部，块2 保持逐字节官方文本。
         assert [blk["text"] for blk in payload["system"]][0] == "You are ZCode, an interactive agent"
         assert len(payload["system"]) == 3
         assert payload["system"][2]["text"].endswith("守则")  # 用户 system 位于 dynamic 合并块尾部

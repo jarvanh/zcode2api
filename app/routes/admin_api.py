@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 
 import httpx
@@ -58,15 +57,11 @@ def _username_for(account) -> str | None:
 async def sections_freshness():
     """system sidecar 文本新鲜度（2026-10-31 文本校验波次防复发哨兵）。
 
-    返回每日巡检落库的缓存状态；无缓存（首次/重启后未巡检）现算一次。
+    现算并回写（status() 零网络纯本地读）：官方升版后最长 6h 的巡检盲窗里
+    控制台一直亮绿（2026-11-02 实测），读路径现算即消。回写同时喂饱
+    stale_hint() 热路径与 healthcheck。
     """
-    raw = store.get_setting("sections_freshness")
-    if raw:
-        try:
-            return {"data": json.loads(raw)}
-        except ValueError:
-            pass
-    return {"data": freshness.status()}
+    return {"data": freshness.refresh()}
 
 
 @router.get("/session-affinity")
@@ -117,7 +112,6 @@ async def status_info():
 @router.get("/risk-overview")
 async def risk_overview(days: int = 7):
     """一屏风控态势：按天计数 / 账号 lane 冷却与 strikes / 波次暂停 / 新鲜度 / 去重。"""
-    import json as _json
     import time as _time
 
     agg = riskmetrics.aggregate(min(max(int(days), 1), 90))
@@ -148,11 +142,8 @@ async def risk_overview(days: int = 7):
                 "level": int(getattr(gw, "_risk_wave_level", {}).get(provider, 0)),
             })
 
-    raw_fresh = store.get_setting("sections_freshness")
-    try:
-        fresh = _json.loads(raw_fresh) if raw_fresh else freshness.status()
-    except ValueError:
-        fresh = freshness.status()
+    # 新鲜度现算并回写（同 /sections/freshness，消巡检盲窗；30s 轮询也吃到官方升版漂移）
+    fresh = freshness.refresh()
 
     return {
         "data": {
