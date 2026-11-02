@@ -190,6 +190,11 @@ select.input option{background:var(--panel);color:var(--ink)}
 .uid-tag:hover{background:var(--blue-a16);color:var(--ink)}
 /* 上游用户名标签（OAuth 授权瞬间抓取，存量账号补查不到故常缺） */
 .uname-tag{flex:none;display:inline-flex;align-items:center;height:17px;padding:0 6px;border-radius:4px;font-size:10px;font-weight:600;background:var(--mint-a15);color:var(--mint);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 出口代理标签（2026-11-02 主人要求代理信息显眼）：amber 常显、点击直达编辑弹窗；
+   未配置显示灰色「直连」标 */
+.proxy-tag{flex:none;display:inline-flex;align-items:center;height:17px;padding:0 6px;border-radius:4px;font-family:var(--mono);font-size:10px;font-weight:600;background:rgba(230,170,80,.15);color:var(--amber);cursor:pointer;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proxy-tag:hover{color:var(--ink)}
+.proxy-tag-none{background:var(--ink-faint);color:var(--ink-mute);font-family:inherit}
 .no-cfg{color:var(--red);font-size:11px}
 .recent-ts{font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);font-variant-numeric:tabular-nums;margin-bottom:5px}
 /* 最近请求 tick 条：绿=成功 红=失败，最新在末尾 */
