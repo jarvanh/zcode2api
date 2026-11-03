@@ -34,14 +34,14 @@ def env(gateway_client, fresh_app, monkeypatch):
         def __init__(self):
             self.solve_count = 0
 
-        async def get_verify_param(self, port=None):
+        async def get_verify_param(self, egress_tag=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
-        async def fetch_config(self):
+        async def fetch_config(self, egress_tag=None):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp"}
 
-        def invalidate(self):
+        def invalidate(self, tag=None):
             pass
 
     stub = _StubCaptcha()

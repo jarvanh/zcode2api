@@ -269,7 +269,7 @@ class TestRiskControlBan:
         assert acc.status == Status.ACTIVE
         assert acc.is_cooling() is False
         assert acc.risk_strikes == 1  # 整号计数保留作审计展示
-        assert (acc.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
+        assert (acc.risk_lane_cooling.get("plan:glm-5.3") or 0) > time.time()
         assert acc.is_selectable() is True  # Key 回退腿仍可被选中
         paths = [c[1] for c in mock.state.calls if c[1].endswith("/messages")]
         assert "/api/v1/zcode-plan/anthropic/v1/messages" in paths
@@ -334,7 +334,7 @@ class TestRiskControlBan:
         # lane 语义：业务码 3012 与 HTTP 405 同形，只冷却 plan 腿
         assert after.status == Status.ACTIVE
         assert after.risk_strikes == 1
-        assert (after.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
+        assert (after.risk_lane_cooling.get("plan:glm-5.3") or 0) > time.time()
         paths = [c[1] for c in mock.state.calls[before:] if c[1].endswith("/messages")]
         assert "/api/v1/zcode-plan/anthropic/v1/messages" in paths
         assert "/api/anthropic/v1/messages" in paths
@@ -375,10 +375,10 @@ class TestRiskControlBan:
         assert risk.cooling_until is not None
         assert 175 < risk.cooling_until - time.time() <= 185  # ≈ 180s
         assert "命中风控" in (risk.last_error or "")
-        assert "plan:glm-5.2" in (risk.last_error or "")
+        assert "plan:glm-5.3" in (risk.last_error or "")
         assert risk.is_selectable() is False
         assert risk.is_cooling() is True  # 冷却中有恢复倒计时
-        assert (risk.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
+        assert (risk.risk_lane_cooling.get("plan:glm-5.3") or 0) > time.time()
 
     async def test_fallback_5xx_preserves_risk_cooldown(self, gateway_client, fresh_app, monkeypatch):
         """风控冷却中回退 Key 5xx 耗尽：不得用 300s 普通冷却覆盖 900s 风控退避
@@ -403,7 +403,7 @@ class TestRiskControlBan:
         assert "命中风控" in (acc.last_error or "")
         assert "5xx" not in (acc.last_error or "")
         assert acc.risk_strikes == 1
-        assert (acc.risk_lane_cooling.get("plan:glm-5.2") or 0) > time.time()
+        assert (acc.risk_lane_cooling.get("plan:glm-5.3") or 0) > time.time()
 
     async def test_risk_disable_auto_rotates_fingerprint(self, gateway_client, fresh_app, monkeypatch):
         """风控升级禁用时自动换发设备指纹（2.6.8：「风控后换设备重生」自动化），
@@ -480,15 +480,15 @@ class TestRiskControlBan:
 
         await client.post("/v1/messages", json=_MSG_BODY)
         assert acc.risk_strikes == 1
-        assert acc.risk_lane_strikes["plan:glm-5.2"] == 1
+        assert acc.risk_lane_strikes["plan:glm-5.3"] == 1
         # 模拟 lane 冷却到期后再次命中（不经人工启用，保留累积语义）
         acc.cooling_until = time.time() - 1
-        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() - 1
+        acc.risk_lane_cooling["plan:glm-5.3"] = time.time() - 1
         fresh_app.update_account(acc)
         mock.state.sequences[_RISK_JWT[:16]] = ["risk_control_3012"]
         await client.post("/v1/messages", json=_MSG_BODY)
         assert acc.risk_strikes == 2
-        assert acc.risk_lane_strikes["plan:glm-5.2"] == 2
+        assert acc.risk_lane_strikes["plan:glm-5.3"] == 2
         assert "第 2 次" in (acc.last_error or "")
         assert "指数退避" not in (acc.last_error or "")  # lane 曲线无整号退避文案@pytest.mark.integration
 class TestRiskLaneScoped:
@@ -515,7 +515,7 @@ class TestRiskLaneScoped:
 
         # lane 到期：自动回轮询，无需任何人工动作
         acc.cooling_until = time.time() - 1
-        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() - 1
+        acc.risk_lane_cooling["plan:glm-5.3"] = time.time() - 1
         fresh_app.update_account(acc)
         assert acc.is_selectable(model="GLM-5.2") is True
 
@@ -559,14 +559,14 @@ class TestRiskLaneScoped:
         client, mock = gateway_client
         monkeypatch.setattr(captcha_module, "captcha_manager", stub_captcha)
         acc = seed_account(fresh_app, _RISK_JWT, name="a-probe")
-        acc.risk_lane_cooling["plan:glm-5.2"] = time.time() + 30  # 尾段（window=300）
+        acc.risk_lane_cooling["plan:glm-5.3"] = time.time() + 30  # 尾段（window=300）
         fresh_app.update_account(acc)
         mock.state.sequences[_RISK_JWT[:16]] = ["ok"]
 
         n = await risk_lane_probe._round()
         assert n == 1
         after = fresh_app.find("zai", acc.id)
-        assert "plan:glm-5.2" not in after.risk_lane_cooling
+        assert "plan:glm-5.3" not in after.risk_lane_cooling
 
 
 @pytest.mark.integration

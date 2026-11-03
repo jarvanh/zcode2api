@@ -96,12 +96,14 @@ def test_explicit_disabled_passthrough():
     assert body["max_tokens"] == 4096
 
 
-def test_non_glm53_no_injection_unless_explicit():
+def test_non_glm53_no_thinking_injection_unless_explicit():
     from app.openai_compat import openai_to_anthropic
 
+    # 非 5.3 家族不注入 thinking 预算；但 reasoning_effort 是上游通用档位通道
+    # （2.7.x 并入的 openai_compat 行为，官方客户端同形态），恒映射 output_config
     body, _ = openai_to_anthropic(_payload(model="glm-4.6", reasoning_effort="high"))
     assert "thinking" not in body
-    assert "output_config" not in body
+    assert body["output_config"] == {"effort": "high"}
 
     body, _ = openai_to_anthropic(_payload(model="glm-4.6", thinking={"type": "enabled", "budget_tokens": 4096}))
     assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}

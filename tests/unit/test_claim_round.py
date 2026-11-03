@@ -40,6 +40,10 @@ def _fake_store(accounts, *, stagger: int = 0):
             return next(a for a in accounts if a.id == aid)
 
         @staticmethod
+        def claim_round_hours():
+            return []  # 空窗口 = 全天
+
+        @staticmethod
         def claim_round_stagger():
             return stagger
 
@@ -476,6 +480,10 @@ async def test_loop_wake_triggers_immediate_round(monkeypatch):
         def claim_round_interval():
             return 3600  # 假设整点轮间隔 1h
 
+        @staticmethod
+        def claim_round_hours():
+            return []  # 空窗口 = 全天
+
     monkeypatch.setattr("app.store.store", _FakeStore())
 
     manager = ClaimRoundManager()
@@ -510,6 +518,10 @@ async def test_loop_wake_respects_disabled_interval(monkeypatch):
         @staticmethod
         def claim_round_interval():
             return 0  # 关闭
+
+        @staticmethod
+        def claim_round_hours():
+            return []  # 空窗口 = 全天
 
     monkeypatch.setattr("app.store.store", _FakeStore())
 

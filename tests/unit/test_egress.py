@@ -10,7 +10,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app import constants, egress
+from app import constants, egress, settings
 from app.captcha import CaptchaManager, _Token
 
 _ZAI = "https://zcode.z.ai/api/v1/x"
@@ -157,6 +157,8 @@ class TestCaptchaEgressSeparation:
             return None
 
         monkeypatch.setattr(mgr, "_refill_batch", _no_refill)
+        # 本节验出口隔离，不验竞速：固定单路求解，solved 才能一一对应
+        monkeypatch.setattr(settings, "CAPTCHA_EMPTY_TAKE_RACE", 1)
         return mgr
 
     async def test_non_hot_egress_solves_on_demand(self, monkeypatch):

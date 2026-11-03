@@ -55,7 +55,8 @@ class TestSystemShape:
         body_transform.transform_body(body, model="GLM-5.3")
         blocks = body["system"]
         assert len(blocks) == 3
-        assert "powered by the model named GLM-5.3" in blocks[-1]["text"]
+        # 2.7.x 起 powered-by 行带 provider 前缀（官方客户端同形态）
+        assert "powered by the model named zai-api/GLM-5.3" in blocks[-1]["text"]
 
     def test_transform_is_idempotent(self):
         body = _body(system="守则")
@@ -65,10 +66,13 @@ class TestSystemShape:
         assert [b["text"] for b in body["system"]] == first
         assert len(body["system"]) == 3
 
-    def test_all_blocks_carry_cache_control(self):
+    def test_cache_control_on_prompt_blocks_only(self):
+        """块1（cliPrefix）不带 cache_control（3.15.1 起官方不再带），块2/3 带。"""
         body = _body()
         body_transform.transform_body(body)
-        assert all(b.get("cache_control") == {"type": "ephemeral"} for b in body["system"])
+        blocks = body["system"]
+        assert "cache_control" not in blocks[0]
+        assert all(b.get("cache_control") == {"type": "ephemeral"} for b in blocks[1:])
 
     def test_date_turn_prepended_once(self):
         body = _body()

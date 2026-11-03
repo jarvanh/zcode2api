@@ -35,7 +35,7 @@ def mgr(monkeypatch):
     m = CaptchaManager()
     monkeypatch.setattr(m, "_note_mint_failure", lambda: None)
     monkeypatch.setattr(m, "_note_mint_success", lambda: None)
-    monkeypatch.setattr(m, "_trigger_refill", lambda need: None)
+    monkeypatch.setattr(m, "_trigger_refill", lambda need, _tag=None: None)
     return m
 
 
@@ -68,9 +68,9 @@ class TestWakeOnTake:
         monkeypatch.setattr(settings, "CAPTCHA_IDLE_AFTER", 600)
         assert mgr._idle() is True
 
-        async def raced(config):
-            mgr._put(_token())
-            return mgr._pop_fresh()
+        async def raced(config, tag):
+            mgr._put(_token(), tag)
+            return mgr._pop_fresh(tag)
 
         monkeypatch.setattr(mgr, "_solve_raced", raced)
         param, region = await mgr.get_verify_param()
@@ -105,12 +105,12 @@ class TestRaceLateArrival:
 
         release = asyncio.Event()
 
-        async def slow_solve(config):
+        async def slow_solve(config, tag):
             await asyncio.wait_for(release.wait(), timeout=5)
             return _token()
 
-        async def solve_one(config):
-            return await slow_solve(config)
+        async def solve_one(config, tag):
+            return await slow_solve(config, tag)
 
         monkeypatch.setattr(mgr, "_solve_one", solve_one)
         got = await mgr._solve_raced({})
@@ -119,9 +119,9 @@ class TestRaceLateArrival:
         # 竞速任务仍在后台跑：放行后迟到成功应落池
         release.set()
         await asyncio.sleep(0.3)
-        assert mgr._pool_size == 1  # 此前该分支会把 token 整个丢弃
+        assert sum(mgr._pool_sizes.values()) == 1  # 此前该分支会把 token 整个丢弃
         # 落池的 token 可被下一次请求亚毫秒直取
-        token = mgr._pop_fresh()
+        token = mgr._pop_fresh(next(iter(mgr._pools)))
         assert token is not None
 
     async def test_winner_still_served_before_deadline(self, mgr, monkeypatch):
@@ -130,20 +130,20 @@ class TestRaceLateArrival:
         胜者此时尚未消费故不拦），T3 被池内查重拦截 → 池=1（对齐上游）。"""
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
 
-        async def fast_solve(config):
+        async def fast_solve(config, tag):
             return _token()
 
         monkeypatch.setattr(mgr, "_solve_one", fast_solve)
         got = await mgr._solve_raced({})
         assert got is not None
-        assert mgr._pool_size == 1
+        assert sum(mgr._pool_sizes.values()) == 1
 
     async def test_distinct_loser_tokens_are_banked(self, mgr, monkeypatch):
         """死线内败者（不同 certifyId 的有效 token）入库不浪费。"""
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
         counter = {"n": 0}
 
-        async def fast_solve(config):
+        async def fast_solve(config, tag):
             counter["n"] += 1
             import base64
             import json as _json
@@ -154,4 +154,4 @@ class TestRaceLateArrival:
         monkeypatch.setattr(mgr, "_solve_one", fast_solve)
         got = await mgr._solve_raced({})
         assert got is not None
-        assert mgr._pool_size == 2  # 胜者直接返回，两个败者入库
+        assert sum(mgr._pool_sizes.values()) == 2  # 胜者直接返回，两个败者入库

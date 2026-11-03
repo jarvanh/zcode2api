@@ -826,7 +826,7 @@ async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, s
                 _forget_plan_id(pid)
         raise ClaimError("没有待领取的套餐" + _stale_suffix())
     best = plans[0]
-    return best["plan_id"], best["name"] or best["plan_id"], best["grants"]
+    return best["plan_id"], str(best.get("name") or "") or best["plan_id"], best.get("grants") or []
 
 
 def _claim_headers(account: Account, verify_param: str, region: str | None) -> dict:

@@ -166,11 +166,14 @@ async def fetch_quota(account: Account) -> dict:
     plans_source_ok = False
 
     def _collect_plans(payload: dict) -> bool:
-        # 返回「本次响应含 data 对象」（即权威 plans 源）。缺 data 的响应不得
-        # 当作「plans 为空」的依据——上游投放空窗就是 code=0 无 data（官方客户端
-        # 对此直接抛 manual_claim_preview_missing_data，口径对齐）。
+        # 返回「本次响应带 plans 字段」（即权威 plans 源）。缺 data、或 data 里
+        # 没有 plans 键的响应都不得当作「plans 为空」的依据：上游投放空窗就是
+        # code=0 无 data（官方客户端对此直接抛 manual_claim_preview_missing_data，
+        # 口径对齐）；balance 的常态响应只有 balances[]、没有 plans 键，若把它
+        # 当成权威源，billing/current 回 200+1005 时就会把历史 plans 洗成 []
+        #（2026-10-31 实证：额度拒绝被写成「上游没投放套餐」）。
         data = payload.get("data")
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or "plans" not in data:
             return False
         for p in data.get("plans") or []:
             pid = str(p.get("plan_id") or "").strip()

@@ -1160,13 +1160,14 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
                 status_code=500,
             )
     if not isinstance(result, _Upstream):
-        # 同步直通（_try_account 已读完 body 并收口监控含 tokens）：此处仅把
-        # Anthropic message 转换为 OpenAI chat.completion；错误响应原样返回
+        # 同步直通（_try_account 已读完 body 并收口监控含 tokens）：成功时按
+        # 端点各自的 finalize 转形状（chat → chat.completion / responses →
+        # response 对象）；错误响应原样返回
         raw = getattr(result, "body", None)
         if result.status_code < 300 and raw:
             data = _safe_json(raw.decode("utf-8", "ignore"))
             if isinstance(data, dict) and data.get("type") == "message":
-                return JSONResponse(anthropic_to_openai(data, str(body.get("model") or "")))
+                return JSONResponse(finalize(data, str(body.get("model") or "")))
         return result
 
     model = str(body.get("model") or "")
@@ -1483,11 +1484,15 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
             continue
         attempts += 1
-        # needs_captcha 同时代表「本请求走 Plan 腿」：该腿正在风控冷却且有可用
-        # 回退 Key 时，build_request 会直接路由到 Key 通道，这里必须跟着变，
-        # 否则验证码流程与实际通道错配（风控 strike 也会记到错误的 lane）。
-        needs_captcha = (provider == "zai" and account.uses_plan_channel()
-                         and account.plan_lane_available(model_key))
+        # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
+        # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须
+        # 不带（带了就是「官方不会干的事」，3012 的结构性嫌疑）。上游若仍回 3007 要码，
+        # _try_account 会补码重试。lane 可用性（风控冷却且有 Key 回退时路由到 Key
+        # 通道）仍须满足：验证码流程必须与实际通道一致，strike 才会记对 lane。
+        plan_channel = provider == "zai" and account.uses_plan_channel()
+        needs_captcha = (plan_channel and account.plan_lane_available(model_key)
+                         and await captcha_manager.model_requests_need_captcha(
+                             egress.egress_for(settings.UPSTREAM["zai"])))
 
         slot_box: list[str | None] = [None]
         if limit > 0:
@@ -2167,10 +2172,16 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 405 一律按风控计（RISK_CONTROL_HTTP_STATUSES），所以必须把上游
                 # body 留一段在日志里——否则分不清是 3012 标记、验证码挑战还是
                 # WAF/签名拒绝，strikes 花完了仍不知道上游在拒什么。
+                # 200-biz（上游统一映射成 405 到这里）与原生 405 共用分支：
+                # body 是业务码 JSON 时 signal 标「业务码 N」，日志/面板可区分
+                # 载体（fork 语义保留），否则按原生 HTTP 405 记。
+                biz_code = _upstream_biz_code(text)
+                signal = (f"业务码 {biz_code}" if biz_code is not None
+                          else f"3012/unusual activity HTTP {status_code}")
                 snippet = " ".join(text.split())[:200]
-                account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
+                account.record_result(False, f"风控 {signal}（HTTP {status_code}）")
                 penalty_note = _apply_risk_strike(
-                    account, f"3012/unusual activity HTTP {status_code}", req_id,
+                    account, signal, req_id,
                     model=str(body.get("model") or ""),
                     channel="plan" if "/zcode-plan/" in url else "apikey",
                 )
@@ -2457,8 +2468,11 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         status_code=_status,
                     )
                 # 业务正常的同步响应：body 已读完，重建等价响应交给上层
-                await cm.__aexit__(None, None, None)
-                await client.aclose()
+                if cm is not None:
+                    await cm.__aexit__(None, None, None)
+                if client is not None:
+                    await client.aclose()
+                cm = client = None
                 from fastapi import Response as _Resp
                 account.use_count += 1
                 account.last_used_at = time.time()

@@ -345,31 +345,6 @@ def build_app() -> FastAPI:
             }}},
         }), media_type="application/json")
 
-    async def _marketing_touch(request: Request) -> Response:
-        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
-        # 测试协议：app.state.touch_plans = None → 404（feed 未部署的空态）；
-        # 设列表 → deliveries 里包一层横幅（claim_zcode_plan action 携带 plan_id，
-        # zcode_plan 元数据携带 name/grant_units，与真实横幅同形）。
-        plans = getattr(app.state, "touch_plans", None)
-        if plans is None:
-            return Response(json.dumps({"code": 0, "msg": "no campaign"}),
-                            status_code=404, media_type="application/json")
-        deliveries = []
-        for p in plans:
-            deliveries.append({
-                "banner": {
-                    "action": {"type": "claim_zcode_plan",
-                               "args": {"plan_id": p["plan_id"]}},
-                    "background": {"args": {"zcode_plan": {
-                        "name": p.get("name") or p["plan_id"],
-                        "plan_id": p["plan_id"],
-                        "grant_units": p.get("grant_units", 300000000),
-                    }}},
-                },
-            })
-        return Response(json.dumps({"code": 0, "data": {"deliveries": deliveries}}),
-                        media_type="application/json")
-
     async def _event_report(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         body = await request.body()
@@ -421,6 +396,26 @@ def build_app() -> FastAPI:
     async def _marketing_touch(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         _record("GET", request.url.path, headers, b"")
+        # fork 测试协议保留：app.state.touch_plans 设列表 → deliveries 包横幅
+        # （claim_zcode_plan action + zcode_plan 元数据，与真实横幅同形）；
+        # None → 走下方 scenario 协议（空 deliveries = feed 无活动）。
+        plans = getattr(app.state, "touch_plans", None)
+        if plans is not None:
+            deliveries = []
+            for p in plans:
+                deliveries.append({
+                    "banner": {
+                        "action": {"type": "claim_zcode_plan",
+                                   "args": {"plan_id": p["plan_id"]}},
+                        "background": {"args": {"zcode_plan": {
+                            "name": p.get("name") or p["plan_id"],
+                            "plan_id": p["plan_id"],
+                            "grant_units": p.get("grant_units", 300000000),
+                        }}},
+                    },
+                })
+            return Response(json.dumps({"code": 0, "data": {"deliveries": deliveries}}),
+                            media_type="application/json")
         scenario = getattr(app.state, "marketing_scenario", None) or headers.get("x-mock-marketing-scenario")
         if scenario == "marketing_plan":
             return Response(json.dumps({
