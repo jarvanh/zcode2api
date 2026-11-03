@@ -16,6 +16,7 @@ from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
     _is_captcha_error,
+    _is_concurrency_hit,
     _is_exhausted,
     _normalize_body,
 )
@@ -24,12 +25,14 @@ from app.routes.gateway import (
 # ── 模型归一化 ────────────────────────────────────────────────────────────────
 class TestNormalizeBody:
     def test_lowercase_alias_mapped(self):
+        # glm-5.2 是**已退役**型号（上游 3006），别名表直接改写到 GLM-5.3
         body = {"model": "glm-5.2"}
-        assert _normalize_body(body)["model"] == "GLM-5.2"
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_provider_prefix_stripped(self):
+        # 前缀剥离后仍是退役型号 → 再改写到 GLM-5.3（两层改写都覆盖）
         body = {"model": "bigmodel/GLM-5.2"}
-        assert _normalize_body(body)["model"] == "bigmodel/GLM-5.2".split("/")[-1]
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
@@ -258,7 +261,10 @@ class TestBuildRequest:
         })
         # 客户端的鉴权/身份头被丢弃，authorization 保留的是账号自身凭证
         assert headers["Authorization"] == "Bearer a.b.c"
-        assert "x-api-key" not in {h.lower() for h in headers}
+        # x-api-key 恒为本账号 JWT 自身（官方 anthropic SDK 与 Bearer 同值双发，
+        # vlelyanin 实证：缺失会被 start-plan 网关判为非客户端流量），
+        # 绝不是客户端透传的 "leak"
+        assert headers["x-api-key"] == "a.b.c"
         assert headers.get("x-zcode-foo") is None
         assert headers["User-Agent"] != "UA/1"
         assert headers.get("x-custom") == "keep"
@@ -345,3 +351,22 @@ def fresh_account(secret: str) -> Account:
     """向当前 store 注入账号（gateway_client 用 fresh_app 的 store 单例）。"""
     from app.store import store
     return store.add_account("zai", "t", secret)
+
+
+# ── 3009 并发识别（2026-11-03 review：禁止裸子串，logid 会撞车）───────────────
+class TestConcurrencyHit:
+    def test_business_code_3009(self):
+        body = '{"code":3009,"msg":"model concurrency limit exceeded","logid":"202611030003009"}'
+        assert _is_concurrency_hit(body) is True
+
+    def test_logid_substring_alone_is_not_enough(self):
+        """20 位随机 logid 含 "3009" 子串（真实 429 形态）不得误判为并发。"""
+        body = '{"code":1302,"msg":"rate limited","logid":"202611030003009xxxx"}'
+        assert _is_concurrency_hit(body) is False
+
+    def test_text_fallback_for_non_json(self):
+        assert _is_concurrency_hit("model concurrency limit exceeded") is True
+
+    def test_other_codes_are_not_concurrency(self):
+        assert _is_concurrency_hit('{"code":1113,"msg":"insufficient balance"}') is False
+        assert _is_concurrency_hit("server busy") is False

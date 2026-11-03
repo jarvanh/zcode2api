@@ -20,7 +20,7 @@ import time
 
 import httpx
 
-from . import constants, freshness, logs, settings
+from . import constants, egress, freshness, logs, settings
 from .captcha import captcha_manager
 from .models import Account, Status
 
@@ -140,15 +140,90 @@ def parse_plan(raw: dict) -> dict | None:
     }
 
 
+def extract_plans_from_marketing_deliveries(deliveries: list) -> list[dict]:
+    """从 marketing/touch 的 deliveries 载荷中提取待领取套餐。
+
+    官方客户端结构实证（2026-11-03 逆向 + 线上实测）：
+    delivery.banner.buttons[].action: {"type": "claim_zcode_plan", "args": {"plan_id": "..."}}
+    delivery.banner.args.zcode_plan: {"plan_id": "...", "name": "...", "priority": ..., "entitlements": [...]}
+    """
+    plans: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _scan(obj: object) -> None:
+        if isinstance(obj, dict):
+            # 1. 优先提取挂在 args 里的完整 zcode_plan
+            zp = obj.get("zcode_plan") or obj.get("zcodePlan")
+            if isinstance(zp, dict):
+                parsed = parse_plan(zp)
+                if parsed:
+                    pid = parsed["plan_id"]
+                    existing = next((p for p in plans if p["plan_id"] == pid), None)
+                    if existing is not None:
+                        existing.update(parsed)
+                    else:
+                        plans.append(parsed)
+                        seen_ids.add(pid)
+            # 2. 检查 claim_zcode_plan 按钮动作
+            action = obj.get("action")
+            if isinstance(action, dict) and action.get("type") == "claim_zcode_plan":
+                args = action.get("args") or {}
+                pid = str(args.get("plan_id") or args.get("planId") or "").strip()
+                if pid and pid not in seen_ids:
+                    plans.append({
+                        "plan_id": pid,
+                        "name": pid,
+                        "description": "活动投放套餐",
+                        "priority": 100,
+                        "grants": [],
+                    })
+                    seen_ids.add(pid)
+            for v in obj.values():
+                _scan(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _scan(item)
+
+    for delivery in deliveries or []:
+        _scan(delivery)
+
+    return plans
+
+
+async def fetch_marketing_touch_plans(account: Account) -> list[dict]:
+    """拉取 marketing/touch 接口下发的活动套餐（2026-11 官方实证）。
+
+    失败时仅记录并返回空列表，不阻断主流程。
+    """
+    from .quota import _auth_headers
+
+    try:
+        body = await _billing_request(
+            account, "GET", settings.ZCODE_MARKETING_TOUCH_URL,
+            headers=_auth_headers(account),
+            params={"seq": "0"},
+        )
+    except Exception as err:
+        logs.info("claim", f"账号 {account.name} marketing/touch 查询跳过（{err}）")
+        return []
+
+    code = _business_code(body)
+    if code != 0:
+        return []
+    deliveries = (body.get("data") or {}).get("deliveries") or []
+    return extract_plans_from_marketing_deliveries(deliveries)
+
+
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
+    url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
     try:
         # trust_env=False：billing 全家桶直连。实测「解码直连 + claim 直连」才能过
         # 上游风控（claim 走 US 出口被拒「unusual activity」，直连 code:0）；
         # messages 端点与此相反（直连曾被 3012 风控），仍走 env 的 US 代理。
         async with httpx.AsyncClient(timeout=25, trust_env=False) as client:
             res = await client.request(
-                method, f"{settings.ZCODE_BILLING_BASE}{path}",
+                method, url,
                 headers=headers, **kwargs,
             )
     except httpx.HTTPError as err:
@@ -205,8 +280,15 @@ async def report_activation_events(account: Account) -> str | None:
         try:
             await post_activation_event(profile, user_id, element)
         except (httpx.HTTPError, RuntimeError) as err:
-            return f"激活事件 {element} 上报失败: {err}"
+            return _activation_err_text(element, err)
     return None
+
+
+def _activation_err_text(element: str, err: Exception) -> str:
+    """激活失败文案。httpx 的部分异常（ReadError 等）str 为空——空串时回退
+    异常类名，否则日志只剩「上报失败: 」查无可查（2026-11-03 线上实锤）。"""
+    detail = str(err).strip() or type(err).__name__
+    return f"激活事件 {element} 上报失败: {detail}"
 
 
 # 激活上报每日去重门：账号 id → 最近一次**成功**上报的本地日期。
@@ -648,7 +730,13 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
 
 
 async def preview_plans(account: Account) -> list[dict]:
-    """拉取账号当前可领取套餐，按优先级降序。"""
+    """拉取账号当前可领取套餐，按优先级降序。
+
+    双通道发现：
+    1. /billing/preview（常规预览端点）
+    2. /api/v1/marketing/touch（活动投放端点，2026-11 官方实证）
+    两者套餐按 plan_id 去重合并并按优先级降序排列。
+    """
     blocked = billing_block_reason(account, action="上游查询")
     if blocked:
         raise ClaimError(blocked)
@@ -674,6 +762,18 @@ async def preview_plans(account: Account) -> list[dict]:
         return []
     raw_plans = data.get("plans") or []
     plans = [parsed for parsed in (parse_plan(p) for p in raw_plans) if parsed]
+
+    # 合并 marketing/touch 活动投放通道（官方客户端实证：活动套餐由此下发）
+    try:
+        marketing_plans = await fetch_marketing_touch_plans(account)
+        seen_ids = {p["plan_id"] for p in plans}
+        for mp in marketing_plans:
+            if mp["plan_id"] not in seen_ids:
+                plans.append(mp)
+                seen_ids.add(mp["plan_id"])
+    except Exception as err:
+        logs.warn("claim", f"账号 {account.name} marketing/touch 套餐合并异常: {err}")
+
     plans.sort(key=lambda p: (-p["priority"], p["plan_id"]))
     # preview 列出的 id 是最可信的候选源，入库供空窗兜底复用
     remember_plan_ids([p["plan_id"] for p in plans])
@@ -770,10 +870,12 @@ def _claim_outcome(body: dict, plan_id: str, plan_name: str, grants: list) -> di
         return int(val * 1000) if isinstance(val, (int, float)) and val > 0 else None
 
     server_time = data.get("server_time")
+    resp_name = str(plan.get("name") or "").strip()
+    parsed_grants = grants or (parse_plan(plan) or {}).get("grants", [])
     return {
         "plan_id": plan_id,
-        "plan_name": plan_name,
-        "grants": grants,
+        "plan_name": resp_name or plan_name or plan_id,
+        "grants": parsed_grants,
         "starts_at": _ms("starts_at"),
         "ends_at": _ms("ends_at"),
         "server_time": int(server_time * 1000) if isinstance(server_time, (int, float)) and server_time > 0 else None,
@@ -845,8 +947,12 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
         raise ClaimError(blocked)
 
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
-    verify_param, verify_region = await captcha_manager.get_verify_param()
-    config = await captcha_manager.fetch_config()
+    # claim 的 billing 请求走 trust_env=False 直连，验证码必须同样直连解，
+    # 否则 token 的出口与请求出口不一致，上游判 unusual activity。
+    verify_param, verify_region = await captcha_manager.get_verify_param(
+        egress_tag=egress.DIRECT
+    )
+    config = await captcha_manager.fetch_config(egress.DIRECT)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
     body = await _billing_request(
@@ -859,7 +965,7 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
         _clear_cooling_after_claim(account)
         return outcome
     if code == 3007:
-        captcha_manager.invalidate()  # 被拒的码出池，避免下轮复用
+        captcha_manager.invalidate(egress.DIRECT)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
 
 
@@ -872,11 +978,12 @@ class ClaimRoundManager:
     1005（今日名额用完）按服务端 next_at 退避：等待期该套餐不打 claim
     （省 captcha 求解与上游写流量），preview 照常保留新套餐发现
     （docs/development/05「按服务端 next window 退避」语义落地）。
-    轮间隔运行期读 meta 设置（0 = 关闭，仍周期回看便于随时启用）；
-    轮内相邻账号间可加 0～stagger 秒随机延迟（claim_round_stagger，打散
-    「同轮全池同拍打上游 billing」的行为聚类；0 = 关闭，首个账号不等）。
-    新候选套餐入池（remember_plan_ids 发现真新 id）经 request_round 提前
-    唤醒，不等满 interval。
+    轮间隔与**领取窗口**（claim_round_hours，北京时间小时）运行期读 meta 设置
+    （interval 0 = 关闭，仍周期回看便于随时启用；窗口外只睡不跑、到点准时醒来；
+    空窗口 = 全天）。轮内相邻账号间可加 0～stagger 秒随机延迟
+    （claim_round_stagger，打散「同轮全池同拍打上游 billing」的行为聚类；
+    0 = 关闭，首个账号不等）。新候选套餐入池（remember_plan_ids 发现真新 id）
+    经 request_round 提前唤醒，不等满窗口/interval。
     单账号异常不中断整轮，后台任务异常全部自兜。
     """
 
@@ -1007,21 +1114,71 @@ class ClaimRoundManager:
 
         while not self._stop.is_set():
             interval = store.claim_round_interval()  # 实时读取设置，改后即生效
-            if interval > 0:
+            hours = store.claim_round_hours()
+            if self._should_run(interval, hours):
                 try:
                     await self._round()
                 except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
                     logs.err("claim", f"自动领取轮出错: {err}")
-            # interval<=0 视为关闭：仍周期性回看设置，便于随时启用
-            wait = interval if interval > 0 else 30
-            if await self._wait_stop_or_wake(wait):
+            # 等待三件事任一：停服 / 新候选入池唤醒 / 下一次节拍到点
+            # （节拍由 _next_wait 给出：关闭态 30s 回看、窗口外睡到窗口开启）。
+            if await self._wait_stop_or_wake(self._next_wait(interval, hours)):
                 # 新候选入池唤醒：清标记后立即进入下一轮（关闭态只回看设置）
                 self._wake.clear()
                 if interval > 0:
                     logs.info("claim", "新候选套餐入池，提前触发一轮领取")
-                continue
             if self._stop.is_set():
                 return
+
+    @classmethod
+    def _should_run(cls, interval: int, hours: list[int], now: float | None = None) -> bool:
+        """本轮是否执行：轮次启用（interval>0）且（无窗口限制 或 当前在窗口内）。"""
+        return interval > 0 and cls._in_window(hours, now)
+
+    # ── 领取窗口调度（北京时间）─────────────────────────────────────────────
+    # 上游套餐按天投放，用户侧实证每天 19:00 放量。窗口锚定北京时钟而非 host
+    # 时区（host 换成 UTC 也不漂）；中国无夏令时，固定 +8 即精确，无 tzdata 依赖。
+
+    @staticmethod
+    def _beijing_hour_frac(now: float | None = None) -> float:
+        """当前北京时间的小时（含小数，19.5 = 19:30）。"""
+        lt = time.gmtime((now if now is not None else time.time()) + 8 * 3600)
+        return lt.tm_hour + lt.tm_min / 60 + lt.tm_sec / 3600
+
+    @classmethod
+    def _in_window(cls, hours: list[int], now: float | None = None) -> bool:
+        """当前北京时间小时是否在领取窗口内（空窗口 = 全天不限时）。"""
+        if not hours:
+            return True
+        return int(cls._beijing_hour_frac(now)) in hours
+
+    @classmethod
+    def _seconds_until_window(cls, hours: list[int], now: float | None = None) -> float:
+        """距下一个窗口起点（北京时间整点）的秒数；已在窗口内返回 0。"""
+        frac = cls._beijing_hour_frac(now)
+        if int(frac) in hours:
+            return 0.0  # 恰逢整点（frac == hour）也属于窗口内，不能落进「今天已过」
+        for hour in sorted(hours):
+            if frac < hour:
+                return (hour - frac) * 3600
+        return (24 - frac + min(hours)) * 3600  # 今天窗口已过 → 明天第一个窗口
+
+    @classmethod
+    def _next_wait(cls, interval: int, hours: list[int], now: float | None = None) -> float:
+        """下一次唤醒秒数。
+
+        interval<=0：关闭态 30s 回看设置（随时可启用）；
+        无窗口：interval 节拍；有窗口：窗口内 interval 节拍，窗口外最迟 30min
+        回看一次设置、并在窗口开始时准时醒来（19:00 放量即领，不空转一天）。
+        """
+        if interval <= 0:
+            return 30.0
+        if not hours:
+            return float(interval)
+        now = now if now is not None else time.time()
+        if cls._in_window(hours, now):
+            return float(interval)
+        return max(30.0, min(1800.0, cls._seconds_until_window(hours, now)))
 
     def start(self) -> None:
         if self._task is None:

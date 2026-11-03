@@ -24,7 +24,7 @@ from ..claim import (
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Account, Status
 from ..oauth import ZaiAuthFlow, parse_userinfo
-from ..quota import fetch_quota, refresh_accounts
+from ..quota import fetch_coding_limits, fetch_quota, refresh_accounts
 from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
@@ -308,6 +308,20 @@ async def refresh_one(account_id: str):
         return {"ok": False, "message": blocked, "account": acc.public_view()}
     res = await fetch_quota(acc)
     return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
+
+
+@router.get("/accounts/{account_id}/coding_limits")
+async def coding_limits(account_id: str):
+    """Coding 平面额度（api.z.ai monitor 端点，按 API Key 鉴权）。
+
+    与 billing 族是两套账本：Plan 通道额度看 `quota` 快照，API Key 直连
+    api.z.ai 的额度只能从这里看。体验套餐号常返回「当前用户不存在 coding plan」。
+    """
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    res = await fetch_coding_limits(acc)
+    return {"ok": "error" not in res, **res}
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
@@ -619,8 +633,10 @@ async def claim(payload: dict = Body(default=None)):
 async def claim_captcha_config():
     """手动领取用：阿里验证码 SDK 初始化参数（前端浏览器内完成人机验证）。"""
     from ..captcha import captcha_manager
+    from ..egress import DIRECT
 
-    config = await captcha_manager.fetch_config()
+    # claim 全链路走直连（billing 请求 trust_env=False），验证码配置同源拉取
+    config = await captcha_manager.fetch_config(DIRECT)
     return {
         "enabled": bool(config.get("enabled", True)),
         "scene_id": config.get("sceneId") or "",
@@ -689,6 +705,7 @@ async def get_settings():
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
         "claim_round_stagger": store.claim_round_stagger(),
+        "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
     }
 
 
@@ -735,6 +752,24 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "领取错峰间隔必须是非负整数（0 = 关闭）") from None
         store.set_setting("claim_round_stagger", str(stagger))
+    if "claim_round_hours" in payload:
+        # 领取窗口（北京时间小时，逗号分隔；空 / * = 全天）。归一成升序去重后落库。
+        raw = str(payload["claim_round_hours"] or "").strip()
+        hours: list[int] = []
+        if raw not in ("", "*"):
+            for part in raw.replace("，", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    hour = int(part)
+                except ValueError:
+                    raise HTTPException(400, "领取窗口小时必须是 0-23 的整数，逗号分隔（空 = 全天）") from None
+                if not 0 <= hour <= 23:
+                    raise HTTPException(400, "领取窗口小时必须在 0-23 之间")
+                if hour not in hours:
+                    hours.append(hour)
+        store.set_setting("claim_round_hours", ",".join(map(str, sorted(hours))))
     return {"ok": True}
 
 

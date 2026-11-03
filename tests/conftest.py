@@ -107,23 +107,32 @@ class _StubCaptcha:
         self.invalidated = 0
         self.wave_pauses: list[float] = []
         self.taken_now: int = 0
+        self.solve_count = 0
+        self.last_egress: str | None = None
+        # 线上配置默认「模型请求也要验证码」；测试可置 False 覆盖
+        self.needs_captcha = True
+        self.config = dict(constants.CAPTCHA_DEFAULTS)
 
     def notify_wave_pause(self, seconds: float) -> None:
         self.wave_pauses.append(seconds)
 
-    def try_take_now(self):
+    def try_take_now(self, egress_tag: str | None = None):
         self.taken_now += 1
         return None
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+        return dict(self.config)
+
+    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+        return self.needs_captcha
+
+    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+        self.solve_count += 1
+        self.last_egress = egress_tag
         return "mock-verify-param", None
 
-    def invalidate(self) -> None:
+    def invalidate(self, tag: str | None = None) -> None:
         self.invalidated += 1
-
-    async def fetch_config(self) -> dict:
-        """与 Mock 上游 /api/v1/client/configs 返回的 captcha 配置同形。"""
-        return {"region": "cn", "enabled": True}
 
 
 @pytest.fixture
@@ -144,6 +153,7 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     })
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
+    monkeypatch.setattr(settings, "ZCODE_MARKETING_TOUCH_URL", f"{base}/api/v1/marketing/touch")
     # 激活事件上报也指向 Mock
     monkeypatch.setattr(settings, "ZCODE_EVENT_REPORT_URL", f"{base}/api/v1/event/report")
     # 营销横幅 feed 也指向 Mock（v2.9.8 活动第二投放列表）

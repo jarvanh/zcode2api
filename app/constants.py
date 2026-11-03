@@ -37,6 +37,11 @@ BILLING_BALANCE_PATH = "/billing/balance"
 USAGE_PATH = "/usage"
 # WAF 风险点：billing/* 连续查询易触发拦截，轮询必须错峰（docs 05 §风险控制）
 
+# Coding 平面额度：api.z.ai 自有端点（与 billing 族是两套独立账本）。
+# 鉴权用 `authorization: <api_key>`（裸值，无 Bearer，也不是 JWT）。
+# 2026-11-02 实测：体验套餐号返回 {"code":500,"msg":"当前用户不存在coding plan"}。
+CODING_LIMIT_URL = f"{ZAI_API_ORIGIN}/api/monitor/usage/quota/limit"
+
 # ── OAuth ────────────────────────────────────────────────────────────────────
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
@@ -52,19 +57,28 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
 # ⚠️ 上游疑似按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空，
 # 跟进官方现行版后恢复——发现 preview 为空时优先核对此常量是否落后于官方。
-# 2026-10-31 复测订正：版本门槛**不是**本次「领不到」的根因（同一号用 3.16.3
-# 与 3.17.1 打 preview 结果一致（都无 data），且带 plan_id 用 3.16.3 能领取成功）；
-# 真正根因是 preview 空窗与套餐发现渠道（见 claim.py 空窗兜底）。但钉旧版仍是
-# 长期隐患（上游随时可拉高门槛），官方升版照跟；启动时会比对本机
-# ~/.zcode/server/current.json 并在落伍时告警（main.py lifespan）。
+# 2026-10-31 曾复测「preview 空窗」与版本无关（同一号 3.16.3/3.17.1 的 preview
+# 结果一致，带 plan_id 用 3.16.3 也能领取成功）——那次的根因是 preview 空窗与
+# 套餐发现渠道（见 claim.py 空窗兜底）。但 2026-11-03 上游实测定论：**claim 阶段
+# 确有版本门槛**，旧版（3.16.3）打 claim 报 1004「不符合领取条件（no permission）」，
+# 跟到 3.17.1 立即成功领取 3 亿 token。preview 无 data 与 claim 被拒是两回事，
+# 两者都要跟版。钉旧版是长期隐患（上游随时拉高门槛），官方升版照跟；启动时
+# 比对本机 ~/.zcode/server/current.json 并在落伍时告警（main.py lifespan）。
 # 2026-11-03 跟进 3.17.2：块1/2 文本与 3.17.1 逐字节相同（bundle 重组对拍，
 # 见 zcode_sections_3172.json _meta），仅常量/侧车版本号跟进。
 CLIENT_APP_VERSION = "3.17.2"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
-# bundle 实证（3.16.3）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
+# bundle 实证（3.17.1）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
+
+# ── 营销触达 / 活动投放端点（2026-11-03 官方客户端逆向实证）───────────────────────
+# 官方活动套餐（如 zcode-v3-start-plan-MMDD）经由此服务（marketing-touch）下发，
+# 常规 billing/preview 端点保持为空。返回 deliveries[].banner/popup 中包含
+# action.type="claim_zcode_plan" 及 args.zcode_plan。
+MARKETING_TOUCH_PATH = "/api/v1/marketing/touch"
+MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
 
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
@@ -90,18 +104,37 @@ ACTIVATION_ELEMENTS = ("app_launch", "app_daily_active")
 ACTIVATION_SCREEN_RESOLUTION = "2560x1440"
 
 # ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
-CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
+# skip_model_request 缺省 False：官方无配置时按「模型请求也要验证码」处理
+CAPTCHA_DEFAULTS = {
+    "enabled": True,
+    "prefix": "no8xfe",
+    "region": "cn",
+    "sceneId": "11xygtvd",
+    "skip_model_request": False,
+}
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────
 # Z.AI 上游模型名大小写敏感；客户端传小写别名时映射到官方名（gateway.MODEL_NAME_MAP）
+#
+# 2026-10-30 实测：套餐只放行 GLM-5.3 系，GLM-5.2 / GLM-5-Turbo / GLM-5.1 / GLM-4.7
+# 一律 400 code 3006「model not allowed」——它们是**已退役别名**，不是拼写别名。
+# 老客户端（Claude Code 配置、第三方 SDK 默认 GLM-5.2）会固定带这些名字，若原样
+# 透传，客户端拿到的是上游 3006 而网关没有任何可用模型，等于「用一个合规请求换一个
+# 必然失败的响应」。因此退役名统一改写到当前主力型号（GLM-5.3），保留大小写别名。
+RETIRED_MODEL_ALIASES = {
+    "GLM-5.2": "GLM-5.3",
+    "GLM-5-Turbo": "GLM-5.3",
+    "GLM-5.1": "GLM-5.3",
+    "GLM-4.7": "GLM-5.3",
+}
 MODEL_NAME_MAP = {
     "glm-5.3-flash": "GLM-5.3-Flash",
     "glm-5.3": "GLM-5.3",
-    "glm-5.2": "GLM-5.2",
-    "glm-5-turbo": "GLM-5-Turbo",
-    "glm-turbo": "GLM-5-Turbo",
-    "glm-5.1": "GLM-5.1",
-    "glm-4.7": "GLM-4.7",
+    "glm-5.2": "GLM-5.3",
+    "glm-5-turbo": "GLM-5.3",
+    "glm-turbo": "GLM-5.3",
+    "glm-5.1": "GLM-5.3",
+    "glm-4.7": "GLM-5.3",
 }
 # bigmodel 资源包模型：仅 OpenAI 兼容端点（/api/paas/v4/chat/completions）可用；
 # Anthropic 兼容端点受 Coding Plan 门禁（1309），不能走 _dispatch 的 Anthropic 通道。
@@ -161,7 +194,16 @@ IDENTITY_OS_VERSION = "25.6.0"
 
 # ── 上游被拒信号 → 账号动作（gateway / quota 判定共用）────────────────────────
 EXHAUST_HTTP_STATUSES = (402,)
-EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
+# 额度耗尽信号。2026-10-31 复盘：原实现是**裸子串**匹配 "quota"，任何含该词的
+# 文案（含风控/验证码页）都会被判成「额度用完」而把号踢成 EXHAUSTED——比漏判更糟。
+# 改为 ① 业务码（Plan 通道 {"code":1005,"msg":"exceed quota limit"} 实测形态）
+#      ② 定量短语（完整词 + 明确的无额度语义），不再用裸词。
+EXHAUST_BUSINESS_CODES = (1005, 1113)   # 1005 exceed quota limit / 1113 无余额
+EXHAUST_KEYWORDS = (
+    "exceed quota", "quota limit", "quota exceeded", "quota exhausted",
+    "insufficient balance", "insufficient quota", "no balance",
+    "额度已用完", "额度用完", "额度不足", "余额不足", "余额已用完", "无余额",
+)
 # 验证码挑战：HTTP 403 + 文案，或 HTTP 400 + body {"code":3007}（docs 05 §被拒信号表）
 # 注意：403 不再无条件判 invalid —— 需先排除验证码挑战（captcha/verify 文案或
 # challenge 头），否则一次人机校验续期就把账号错杀成 INVALID（对齐 zapi
@@ -173,6 +215,12 @@ CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
 # 高频请求触发，官方政策定性为临时限制（限流/冻结，3 次以上违规才封号）。
 # 处置：账号指数退避冷却 + 暂停验证码池预热（池预热本身即上游流量，会加剧风控）。
 RISK_CONTROL_HTTP_STATUSES = (405,)
+RISK_BUSINESS_CODE = 3012
+# 429 承载的「模型并发已满」（2026-11-02 实测 {"code":3009,"msg":"model
+# concurrency limit exceeded"}）：并发争用是瞬态，短退避重试，不等 Retry-After。
+# ⚠️ 判定必须解析业务码，不能用裸子串——响应体里的 logid 是 20 位随机数字，
+# 裸子串 "3009" 会撞车（与 EXHAUST 裸子串教训同款，见上方 EXHAUST_KEYWORDS 注）。
+CONCURRENCY_BUSINESS_CODE = 3009
 RISK_CONTROL_MARKERS = (
     '"code":3012', '"code": 3012',
     "unusual activity",

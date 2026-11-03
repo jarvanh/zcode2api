@@ -113,6 +113,9 @@ CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
+# 预热哪个出口的 token 池：空 = 跟随 messages 上游的实际出口（推荐）。
+# 可强制 "proxy" / "direct"；非预热出口按需现解（claim 一小时一轮，够用）。
+CAPTCHA_POOL_EGRESS = (os.getenv("ZCODE_CAPTCHA_POOL_EGRESS", "").strip().lower() or "")
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
@@ -179,6 +182,9 @@ EARLY_FLUSH_GRACE = _int("ZCODE_EARLY_FLUSH_GRACE", 30)
 # 提前发头后、等待调度结果期间的心跳间隔（SSE 注释行）：既冲刷缓冲，
 # 也防流式 idle 被中间层掐断。<=0 时回退 15s。
 EARLY_FLUSH_BEAT = _int("ZCODE_EARLY_FLUSH_BEAT", 15)
+# 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
+# Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
+RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -265,6 +271,9 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 时触发；10 分钟轮次 + 每轮 app_launch 上报是标记不消退的帮凶。0 = 关闭轮次，
 # 仅入池/手动触发。运行期可在后台设置改（meta 表即时生效）
 CLAIM_ROUND_INTERVAL = _int("ZCODE_CLAIM_ROUND_INTERVAL", 3600)
+# 领取窗口（北京时间小时，逗号分隔；空/"*" = 全天）。上游套餐按天投放，
+# 用户侧实证每天 19:00 放量——窗口外轮询只会空转 preview。
+CLAIM_ROUND_HOURS = os.getenv("ZCODE_CLAIM_ROUND_HOURS", "19")
 
 # 领取轮账号错峰上限（秒）：轮内相邻账号间 0～该值的随机延迟，打散「同轮
 # 全池同拍打上游 billing」的请求簇（行为聚类是风控信号之一；zcode-proxy
@@ -282,6 +291,8 @@ UPSTREAM = {
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
+ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
 ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REPORT_URL)
 # 营销横幅 feed（测试时指向 Mock 上游）
@@ -293,7 +304,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.8"
+APP_VERSION = "2.9.9"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

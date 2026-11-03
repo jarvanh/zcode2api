@@ -31,13 +31,18 @@ import time
 
 import httpx
 
-from . import captcha_ledger, constants, logs, settings
+from . import captcha_ledger, constants, egress, logs, settings
 from .store import store
 
 # 池参数：真浏览器求解重（10–40s/枚），默认 min1/max2 见 settings 注释
 POOL_MIN = settings.CAPTCHA_POOL_MIN
 POOL_MAX = settings.CAPTCHA_POOL_MAX
 TOKEN_TTL_MS = settings.CAPTCHA_TOKEN_TTL  # 单枚 token 的最大可用时长（ms）
+
+
+def _now_ms() -> float:
+    """墙上时间（ms）。配置缓存用，不能换成 monotonic（重启后要与 TTL 比对）。"""
+    return time.time() * 1000
 
 
 class CaptchaSolveError(Exception):
@@ -190,13 +195,14 @@ def _parse_certify_id(param: str) -> str | None:
 
 
 class _Token:
-    __slots__ = ("param", "region", "born_at", "certify_id")
+    __slots__ = ("param", "region", "born_at", "certify_id", "egress")
 
-    def __init__(self, param: str, region: str | None) -> None:
+    def __init__(self, param: str, region: str | None, egress_tag: str = egress.DIRECT) -> None:
         self.param = param
         self.region = region
         self.born_at = time.monotonic()
         self.certify_id = _parse_certify_id(param)
+        self.egress = egress_tag
 
     def expired(self) -> bool:
         return (time.monotonic() - self.born_at) * 1000 >= TOKEN_TTL_MS
@@ -204,13 +210,17 @@ class _Token:
 
 class CaptchaManager:
     def __init__(self) -> None:
-        self._pool: asyncio.Queue[_Token] = asyncio.Queue(maxsize=POOL_MAX)
-        self._pool_size = 0          # Queue 无可信 len，自行维护
+        # 按出口分池：token 只能用在签发它的那个出口上，混池会让请求与
+        # token 的 IP 对不上，上游判 unusual activity（见 app/egress.py）。
+        self._pools: dict[str, asyncio.Queue[_Token]] = {}
+        self._pool_sizes: dict[str, int] = {}
         self._refill_task: asyncio.Task | None = None
         self._refilling = False
         self._config_lock = asyncio.Lock()
-        self._config_cache: dict | None = None
-        self._config_cache_at: float = 0.0
+        # 配置按出口缓存：上游按出口 IP 给不同的 captcha 配置（实测直连 region=cn、
+        # 走 US 代理 region=sgp），混用会把错地区的 token 配到请求上。
+        self._config_cache: dict[str, dict] = {}
+        self._config_cache_at: dict[str, float] = {}
         self._last_error: str | None = None
         self._last_solver_stderr: str | None = None
         # 已签发 certifyId → 签发时刻（monotonic s），TTL 同 token：过期后上游
@@ -235,29 +245,71 @@ class CaptchaManager:
         # 显式信号，优先级高于 deep-idle）。到期自动回落，无需显式清除。
         self._wave_boost_until = 0.0
 
+    # ── 出口 ─────────────────────────────────────────────────────────────────
+    def hot_egress(self) -> str:
+        """预热哪个出口的池：默认跟随 messages 上游的实际出口。
+
+        只有 messages 是热路径（每次请求都要验证码）；claim 一小时一轮，
+        按需现解即可，不必占第二个池的内存。
+        """
+        forced = settings.CAPTCHA_POOL_EGRESS
+        return forced or egress.egress_for(settings.UPSTREAM["zai"])
+
+    def _pool_for(self, tag: str) -> asyncio.Queue[_Token]:
+        pool = self._pools.get(tag)
+        if pool is None:
+            pool = asyncio.Queue(maxsize=POOL_MAX)
+            self._pools[tag] = pool
+            self._pool_sizes[tag] = 0
+        return pool
+
+    def _size(self, tag: str) -> int:
+        return self._pool_sizes.get(tag, 0)
+
     # ── 配置 ─────────────────────────────────────────────────────────────────
-    async def fetch_config(self) -> dict:
-        now = time.time() * 1000
-        if self._config_cache and now - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
-            return self._config_cache
+    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+        """取 captcha 配置（按出口缓存）。`egress_tag` 决定拉取走哪条出口。"""
+        tag = egress_tag or self.hot_egress()
+        ttl = settings.CAPTCHA_CONFIG_CACHE_TTL
+        if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
+            return self._config_cache[tag]
         async with self._config_lock:
             # 双检：等锁期间可能已被其他请求填充
-            if self._config_cache and time.time() * 1000 - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
-                return self._config_cache
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    res = await client.get(
-                        f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
-                    )
-                res.raise_for_status()
-                captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
-                if captcha:
-                    self._config_cache = captcha
-                    self._config_cache_at = time.time() * 1000
-                    return captcha
-            except (httpx.HTTPError, ValueError) as err:
-                logs.warn("captcha", f"获取配置失败，使用默认: {err}")
+            if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
+                return self._config_cache[tag]
+            err: Exception | None = None
+            for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，重试一次（err 的 str 常为空）
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=30, trust_env=tag == egress.PROXY
+                    ) as client:
+                        res = await client.get(
+                            f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
+                        )
+                    res.raise_for_status()
+                    captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
+                    if captcha:
+                        self._config_cache[tag] = captcha
+                        self._config_cache_at[tag] = _now_ms()
+                        return captcha
+                except (httpx.HTTPError, ValueError) as exc:
+                    err = exc
+            logs.warn(
+                "captcha",
+                f"获取配置失败（出口={tag}），使用默认: {type(err).__name__ if err else '无响应'}: {err}",
+            )
             return dict(constants.CAPTCHA_DEFAULTS)
+
+    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+        """模型请求是否该带验证码——官方 `requiresRequestVerification` 的等价物。
+
+        bundle 原文：`mode==="start-plan" && enabled!==false && skipModelRequest!==true`。
+        线上配置 `skip_model_request:true` ⇒ 官方客户端在模型请求上**不带**
+        `X-Aliyun-Captcha-Verify-Param`；hub 长期无条件带，这正是「官方不会干的
+        事」，也是 3012 的结构性嫌疑。无配置时官方仍要求验证码，故默认 False。
+        """
+        config = await self.fetch_config(egress_tag)
+        return config.get("enabled") is not False and config.get("skip_model_request") is not True
 
     # ── 预解池 ───────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -373,27 +425,34 @@ class CaptchaManager:
     async def _refill_loop(self) -> None:
         while True:
             try:
+                tag = self.hot_egress()
                 # 风暴冷却期间停止主动铸码（不产生上游流量，等 IP 侧解除）
                 if self._storm_gate_closed():
-                    await self._evict_expired()
+                    await self._evict_expired(tag)
                     await asyncio.sleep(5)
                     continue
                 # 闲置停解：零流量时段只淘汰过期 token（让池自然蒸发清空），
                 # 不铸新码；任意取用即恢复（get_verify_param 里打点）
                 if self._idle():
-                    await self._evict_expired()
+                    await self._evict_expired(tag)
                     await asyncio.sleep(3)
                     continue
                 # 无可服务账号（全冷却/禁用/无号）：只淘汰过期 token，不解新码（不产生上游流量）
                 if not self._gate_open():
-                    await self._evict_expired()
+                    await self._evict_expired(tag)
                     await asyncio.sleep(3)
                     continue
-                need = self._pool_target() - self._pool_size
+                # 上游对模型请求免验证码（skip_model_request）时池无人取用，
+                # 继续预热只是白烧阿里云求解流量与 chrome 内存
+                if not await self.model_requests_need_captcha(tag):
+                    await self._evict_expired(tag)
+                    await asyncio.sleep(30)
+                    continue
+                need = self._pool_target() - self._size(tag)
                 if need > 0:
-                    await self._refill_batch(need)
+                    await self._refill_batch(need, tag)
                 else:
-                    await self._evict_expired()
+                    await self._evict_expired(tag)
                 await asyncio.sleep(3)
             except asyncio.CancelledError:
                 raise
@@ -402,7 +461,7 @@ class CaptchaManager:
                 logs.warn("captcha", f"补充循环异常: {err}")
                 await asyncio.sleep(5)
 
-    async def _refill_batch(self, need: int) -> None:
+    async def _refill_batch(self, need: int, tag: str | None = None) -> None:
         """串行补充（求解有 CPU 开销，避免并发爆 Node 进程）。
 
         闲置（无取用超阈值/从未取用）直接返回——门禁在此兜底而不仅靠
@@ -411,15 +470,16 @@ class CaptchaManager:
         if self._idle() or self._refilling:
             return
         self._refilling = True
+        tag = tag or self.hot_egress()
         try:
-            config = await self.fetch_config()
+            config = await self.fetch_config(tag)
             for _ in range(need):
-                if self._pool_size >= POOL_MAX:
+                if self._size(tag) >= POOL_MAX:
                     break
-                token = await self._solve_one(config)
+                token = await self._solve_one(config, tag)
                 if token is None:
                     break
-                self._put(token)
+                self._put(token, tag)
         finally:
             self._refilling = False
 
@@ -440,29 +500,38 @@ class CaptchaManager:
             self._issued[token.certify_id] = time.monotonic()
 
     def _pool_has_certify_id(self, certify_id: str) -> bool:
-        return any(t.certify_id == certify_id for t in list(self._pool._queue))
+        return any(
+            t.certify_id == certify_id
+            for pool in list(self._pools.values())
+            for t in list(pool._queue)
+        )
 
-    def _put(self, token: _Token) -> None:
+    def _put(self, token: _Token, tag: str | None = None) -> None:
         # 已签发（=已消费，_pop_fresh 出口登记）/池内已有的 certifyId 不再
         # 入库（对齐 zapi pushToken：只查重、不登记——登记必须发生在真正
         # 交给客户端的出口，否则池内 token 会被自己的账本拦成不可用）。
+        # 查重跨出口：同一 certifyId 在任一出池内都算重复，上游只认证 ID。
         if token.certify_id and (self._is_issued(token.certify_id) or self._pool_has_certify_id(token.certify_id)):
             return
+        tag = tag or token.egress
         try:
-            self._pool.put_nowait(token)
-            self._pool_size += 1
+            self._pool_for(tag).put_nowait(token)
+            self._pool_sizes[tag] = self._size(tag) + 1
         except asyncio.QueueFull:
             pass
 
-    def _pop_fresh(self) -> _Token | None:
-        """取一枚可用 token：跳过过期与已签发（F008 风险），取出即登记。"""
-        while self._pool_size > 0:
+    def _pop_fresh(self, tag: str | None = None) -> _Token | None:
+        """取一枚可用 token（指定出口池）：跳过过期、跨出口与已签发（F008 风险），取出即登记。"""
+        tag = tag or self.hot_egress()
+        pool = self._pool_for(tag)
+        while self._size(tag) > 0:
             try:
-                token = self._pool.get_nowait()
+                token = pool.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._pool_size = max(0, self._pool_size - 1)
-            if token.expired():
+            self._pool_sizes[tag] = max(0, self._size(tag) - 1)
+            if token.expired() or token.egress != tag:
+                # 出口不符的 token 不能将就用（请求 IP 与 token 不一致 → 3012）
                 continue
             if token.certify_id and self._is_issued(token.certify_id):
                 continue
@@ -470,44 +539,58 @@ class CaptchaManager:
             return token
         return None
 
-    def _trigger_refill(self, need: int) -> None:
+    def _trigger_refill(self, need: int, tag: str | None = None) -> None:
         # fire-and-forget；_refilling 防重入，强引用防 GC
-        task = asyncio.create_task(self._refill_batch(need))
+        task = asyncio.create_task(self._refill_batch(need, tag))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _evict_expired(self) -> None:
-        kept: list[_Token] = []
-        while True:
-            try:
-                token = self._pool.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._pool_size = max(0, self._pool_size - 1)
-            if not token.expired() and len(kept) < POOL_MAX:
-                kept.append(token)
-        for token in kept:
-            self._put(token)
+    async def _evict_expired(self, tag: str | None = None) -> None:
+        tags = [tag] if tag else list(self._pools)
+        for one in tags:
+            pool = self._pools.get(one)
+            if pool is None:
+                continue
+            kept: list[_Token] = []
+            while True:
+                try:
+                    token = pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._pool_sizes[one] = max(0, self._size(one) - 1)
+                if not token.expired() and len(kept) < POOL_MAX:
+                    kept.append(token)
+            for token in kept:
+                self._put(token, one)
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
         """取一枚可用 token：池内直取 → 池空竞速现解 → 宽限窗口等补货。
+
+        `egress_tag` 必须是本次请求真实使用的出口（`proxy` / `direct`），
+        否则拿到的 token 与请求 IP 不一致，上游会判 unusual activity。
+        只有热路径出口有池；其它出口现解。
 
         返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
         取用即打点 _last_take_at——闲置停解由任意请求唤醒（对齐 zapi wake）。
         """
         self._last_take_at = time.monotonic()
-        # 1) 池内直取（亚毫秒；取出即触发后台补货）
-        token = self._pop_fresh()
-        if token is not None:
-            self._trigger_refill(1)
-            return token.param, token.region
+        tag = egress_tag or self.hot_egress()
+        pooled = tag == self.hot_egress()
 
-        # 2) 池空/全过期：竞速现解（对齐 zapi takeToken：空池到达本身即扩容信号）
-        config = await self.fetch_config()
-        token = await self._solve_raced(config)
+        # 1) 池内直取（仅热路径出口有池；亚毫秒，取出即触发后台补货）
+        if pooled:
+            token = self._pop_fresh(tag)
+            if token is not None:
+                self._trigger_refill(1, tag)
+                return token.param, token.region
+
+        # 2) 池空/全过期/非热路径出口：竞速现解（对齐 zapi takeToken：
+        #    空池到达本身即扩容信号）
+        config = await self.fetch_config(tag)
+        token = await self._solve_raced(config, tag)
         if token is not None:
             self._mark_issued(token)
-            self._trigger_refill(1)
+            self._trigger_refill(1, tag)
             return token.param, token.region
 
         # 3) 竞速无果：宽限窗口内等后台落库（竞速败者/超时者的迟到成功也会入库；
@@ -516,13 +599,13 @@ class CaptchaManager:
             grace_deadline = time.monotonic() + settings.CAPTCHA_TAKE_GRACE
             while time.monotonic() < grace_deadline:
                 await asyncio.sleep(0.4)
-                token = self._pop_fresh()
+                token = self._pop_fresh(tag)
                 if token is not None:
-                    self._trigger_refill(1)
+                    self._trigger_refill(1, tag)
                     return token.param, token.region
         raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
 
-    def try_take_now(self) -> tuple[str, str | None] | None:
+    def try_take_now(self, egress_tag: str | None = None) -> tuple[str, str | None] | None:
         """热路径同步取码（C 档 CAPTCHA_ATTACH_PLAN 用）：仅池内直取，绝不现解。
 
         与 get_verify_param 的差别：池空返回 None（请求按无验证码形态发出，
@@ -530,14 +613,14 @@ class CaptchaManager:
         （C 档开启时每请求都是流量信号，池水位由后台循环维持）。
         """
         self._last_take_at = time.monotonic()
-        token = self._pop_fresh()
+        token = self._pop_fresh(egress_tag or self.hot_egress())
         if token is None:
             return None
-        self._trigger_refill(1)
+        self._trigger_refill(1, token.egress)
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
-    async def _solve_raced(self, config: dict) -> _Token | None:
+    async def _solve_raced(self, config: dict, tag: str | None = None) -> _Token | None:
         """空池竞速：并行 EMPTY_TAKE_RACE 路求解，首个成功即回、其余入库。
 
         全部失败或总死线 RACE_DEADLINE 内无胜者 → None（错误已记 _last_error）。
@@ -555,7 +638,7 @@ class CaptchaManager:
         async def racer() -> None:
             nonlocal served, failed
             try:
-                token = await self._solve_one(config)
+                token = await self._solve_one(config, tag)
             except Exception as err:  # noqa: BLE001 - 单路失败不拖垮竞速
                 self._last_error = str(err)
                 token = None
@@ -567,7 +650,7 @@ class CaptchaManager:
             if served or win.done():
                 # 已有胜者，或调用方已按死线超时离开：铸出有效 token 一律
                 # 入库（此前 win.done() 分支会把迟到成功整个丢弃）
-                self._put(token)
+                self._put(token, tag)
                 return
             served = True  # 事件循环单线程，查改之间无 await，此判原子
             win.set_result(token)
@@ -585,7 +668,7 @@ class CaptchaManager:
             )
             return None
 
-    async def _solve_one(self, config: dict) -> _Token | None:
+    async def _solve_one(self, config: dict, tag: str = egress.DIRECT) -> _Token | None:
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
@@ -593,7 +676,7 @@ class CaptchaManager:
         last_err: str | None = None
         for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
             try:
-                param = await self._run_solver(scene, region, prefix)
+                param = await self._run_solver(scene, region, prefix, tag)
             except Exception as err:  # noqa: BLE001
                 last_err = str(err)
                 param = None
@@ -606,9 +689,9 @@ class CaptchaManager:
                     logs.warn("captcha", last_err)
                     continue
                 if attempt > 1:
-                    logs.ok("captcha", f"求解成功（第 {attempt} 次尝试）")
+                    logs.ok("captcha", f"求解成功（第 {attempt} 次尝试，出口={tag}）")
                 self._note_mint_success()
-                return _Token(param, region)
+                return _Token(param, region, tag)
             if last_err is None:
                 # 求解器退出但无 param：用 stderr 末段代替沉默的"无结果"
                 last_err = f"求解器无输出 (exit 诊断: {self._last_solver_stderr or 'stderr 为空'})"
@@ -619,7 +702,9 @@ class CaptchaManager:
         self._note_mint_failure()
         return None
 
-    async def _run_solver(self, scene: str, region: str, prefix: str) -> str | None:
+    async def _run_solver(
+        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT
+    ) -> str | None:
         solver = settings.CAPTCHA_SOLVER_JS
         runtime = os.path.basename(str(settings.NODE_PATH))
         if not solver.exists():
@@ -628,14 +713,20 @@ class CaptchaManager:
             raise RuntimeError(
                 f"未找到求解器 {solver}，请先在 captcha_node 下执行 npm install"
             )
-        # 强制直连求解：token 求解出口必须与 billing/claim 一致（claim 已改直连，
-        # 见 _billing_request 注释）；剥离代理变量后 chrome 不带 --proxy-server，
-        # 出口确定，不受 hub env 的 US 代理影响。
+        # 出口必须与取用该 token 的请求一致（见 app/egress.py）：
+        #   direct → 剥掉代理变量，chrome 不带 --proxy-server
+        #   proxy  → 注入代理变量，solver 用它作 --proxy-server
         solver_env = {**os.environ, "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH)}
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)
         t0 = time.monotonic()
+        if tag == egress.PROXY:
+            proxy = egress.proxy_url()
+            if not proxy:
+                raise RuntimeError("请求走代理但 env 未配置代理地址，无法对齐验证码出口")
+            solver_env["HTTP_PROXY"] = proxy
+            solver_env["HTTPS_PROXY"] = proxy
         proc = await asyncio.create_subprocess_exec(
             settings.NODE_PATH, str(solver), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
@@ -678,19 +769,33 @@ class CaptchaManager:
         return param
 
     # ── 失效 ─────────────────────────────────────────────────────────────────
-    def invalidate(self) -> None:
-        """上游返回验证码挑战时清空整池（该批 token/指纹已不可信）。"""
+    def invalidate(self, tag: str | None = None) -> None:
+        """上游返回验证码挑战时清空该出口的池（该批 token/指纹已不可信）。
+
+        默认只清热路径出口：只按出口清，避免把另一条通道（如 claim 的直连池）
+        一起废掉。传 `tag=None` 且需要全清时用 `invalidate_all()`。
+        """
+        self._drain(tag or self.hot_egress())
+
+    def invalidate_all(self) -> None:
+        for tag in list(self._pools):
+            self._drain(tag)
+
+    def _drain(self, tag: str) -> None:
+        pool = self._pools.get(tag)
+        if pool is None:
+            return
         drained = 0
         while True:
             try:
-                self._pool.get_nowait()
+                pool.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._pool_size = max(0, self._pool_size - 1)
+            self._pool_sizes[tag] = max(0, self._size(tag) - 1)
             drained += 1
         self._issued.clear()
         if drained:
-            logs.warn("captcha", f"验证码失效，清空池 {drained} 枚")
+            logs.warn("captcha", f"验证码失效（{tag} 出口），清空池 {drained} 枚")
 
 
 captcha_manager = CaptchaManager()

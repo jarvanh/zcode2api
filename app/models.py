@@ -5,6 +5,7 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 
 from . import settings
 
@@ -24,6 +25,65 @@ class Status:
     COOLING = "cooling"      # 临时限流（冷却中）
     INVALID = "invalid"      # 凭证失效 / 鉴权失败
     DISABLED = "disabled"    # 手动禁用
+
+
+def expires_epoch(value) -> float | None:
+    """把上游 `expires_at` 归一成 epoch 秒。
+
+    两种形态都出现过：线上 accounts.db 里是 **epoch 秒**（如 1793375999），
+    mock 与部分快照里是 **ISO8601 字符串**（`"2026-01-01T00:00:00Z"`）。原实现
+    从不解析该字段（只看 remaining），所以「过期」从未被判过；写入归一函数后
+    两种形态都能安全比较。兼容：epoch 秒、epoch 毫秒、ISO8601（带 Z / 偏移 /
+    无时区按 UTC / 纯日期）、空值。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number <= 0:
+            return None
+        return number / 1000.0 if number > 1e11 else number  # 毫秒时间戳
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        pass
+    else:
+        return number / 1000.0 if number > 1e11 else number
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def window_usable(window: dict, now: float) -> bool:
+    """额度窗口是否还有效：剩余 > 0 **且**未过期。
+
+    `remaining` 缺失视为「未知但有量」（上游有的窗口只给 total/used）；
+    `expires_at` 缺失/无法解析视为不过期（一次性/永久池）。
+    """
+    if not isinstance(window, dict) or not window:
+        return False
+    remaining = window.get("remaining")
+    if remaining is not None and (remaining or 0) <= 0:
+        return False
+    expires_at = expires_epoch(window.get("expires_at"))
+    return expires_at is None or expires_at > now
+
+
+def window_expired(window: dict, now: float) -> bool:
+    """窗口是否已过有效期（只看 expires_at；无/不可解析 = 不过期）。"""
+    if not isinstance(window, dict):
+        return False
+    expires_at = expires_epoch(window.get("expires_at"))
+    return expires_at is not None and expires_at <= now
 
 
 def _account_id(name: str) -> str:
@@ -83,6 +143,10 @@ class Account:
     recent_results: list = field(default_factory=list)  # 最近请求结果 tick（True 成功/False 失败），最新在末尾
     last_used_at: float | None = None
     last_checked_at: float | None = None
+    # 额度快照的「可信时间」：只在 billing/balance **成功取到数据**、quota 被真正
+    # 写过的那一刻更新。与 last_checked_at（含失败/去抖，仅用于节流）区分开——
+    # 过期判定只认这个（见 quota_expired：过期后还没成功查过 = 未知，不封号）。
+    quota_verified_at: float | None = None
     cooling_until: float | None = None
     last_error: str | None = None
     created_at: float = field(default_factory=time.time)
@@ -462,6 +526,41 @@ class Account:
         # plan 被封且无可用回退腿：仍维持 plan（否则本号直接无通道）
         return not self.has_apikey_fallback()
 
+    def quota_expired(self, now: float | None = None) -> bool:
+        """权益是否已全部失效（每个额度窗口都「过期」或「剩余为 0」）。
+
+        2026-10-31 线上实证：老号 `GLM-5.3-Flash` 本地记录 `remaining=1e8` 但
+        `expires_at=10-03`（28 天前），上游一律回 `{"code":1005,"msg":"exceed
+        quota limit"}` —— 只看 remaining 会把过期窗口当可用，等于让每个请求都
+        先撞一次必然失败的 1005。
+
+        口径：`quota` 为空 = **未知**（新号/尚未刷新），不判过期，否则会把可用
+        账号挡在门外；只有取到记录且**每一个**窗口都不可用时才判 True。
+
+        追加口径（2026-11-03）：额度窗口是**滚动日窗**，快照天然会过时——快照若
+        取自最新到期时间**之前**，它没有资格判死。「有余额但全部过期」必须由
+        **过期之后的一次成功查询**确认（`quota_verified_at > 最新 expires_at`），
+        否则按未知处理、继续让账号参与轮询。实证：trial 号日窗
+        `expires_at=11-02 23:59:59`，11-03 00:39 上游照回 200（新窗到 11-03
+        23:59:59），而本地因 `quota_refresh_interval=0` 永不刷新，旧逻辑把能用的号
+        永久封成 503。反例（要保住的行为）：老号 `expires_at` 在 28 天前、且过期后
+        成功查过 → 仍判过期，不会每次请求先撞一次必然失败的 1005。
+        """
+        if not self.quota:
+            return False
+        now = now or time.time()
+        if any(window_usable(w, now) for w in self.quota.values()):
+            return False
+        # 余额本身已归零 = 确定耗尽，与快照新旧无关（赠送池由调用方另判）
+        if not any((w.get("remaining") or 0) > 0 for w in self.quota.values()):
+            return True
+        # 有余额、但每个窗口都过了期：可能只是快照停在上一轮日窗 → 需确认
+        ends = [e for e in (expires_epoch(w.get("expires_at")) for w in self.quota.values()) if e]
+        if not ends:
+            return True
+        verified = self.quota_verified_at
+        return bool(verified and verified > max(ends))
+
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
 
@@ -514,6 +613,11 @@ class Account:
 
         JWT 失效 / 风控禁用后，若同账号有 API Key，仍可选中并走回退通道；
         手动 enabled=False 永远不选。model 非空时同时检查该模型的冷却。
+
+        额度快照已判「全部窗口过期/为零」（quota_expired）时也不选：这类账号
+        本地看着有余额、上游只会回 1005，选中它等于每次请求都先烧一次必然
+        失败的调用（且会挤掉真正可用的账号的轮询位）。额度未知（空快照）或
+        快照早于最新到期时间（滚动日窗待实查）不在此列。
         """
         if not self.enabled:
             return False
@@ -526,7 +630,10 @@ class Account:
         if self.status == Status.EXHAUSTED:
             return False
         if self.status in (Status.INVALID, Status.DISABLED):
+            # 回退通道（api.z.ai + API Key）花的是 Key 自己的额度，与套餐快照无关
             return self.has_apikey_fallback()
+        if self.status == Status.EXHAUSTED or self.quota_expired(now):
+            return False
         if self.status == Status.COOLING:
             now = now or time.time()
             return bool(self.cooling_until and now >= self.cooling_until)
@@ -538,6 +645,25 @@ class Account:
             return False
         now = now or time.time()
         return bool(self.cooling_until and now < self.cooling_until)
+
+    def plan_kind(self) -> str:
+        """当前套餐类型：start-plan（体验/免费档）/ coding-plan / ""（未知）。
+
+        上游 plan_id 形如 `zcode-v3-start-plan-0817` / `zcode-v3-coding-plan-…`，
+        取自 billing 的 plans[]（`quota.fetch_quota` 落库到 account.plans）。
+        后台据此区分体验号与付费号；路由/限流如需按套餐分流也从这里取。
+        """
+        for plan in [self.plan, *(self.plans or [])]:
+            if not isinstance(plan, dict):
+                continue
+            blob = " ".join(
+                str(plan.get(k) or "").lower() for k in ("plan_id", "name", "description")
+            )
+            if "start-plan" in blob or "start plan" in blob:
+                return "start-plan"
+            if "coding-plan" in blob or "coding plan" in blob:
+                return "coding-plan"
+        return ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -622,6 +748,7 @@ class Account:
             "plans": self.plans,
             "model_cooling": self.model_cooling,
             "model_fail_count": self.model_fail_count,
+            "plan_kind": self.plan_kind(),
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,
@@ -631,6 +758,10 @@ class Account:
             "recent_results": self.recent_results,
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
+            "quota_verified_at": self.quota_verified_at,
+            # 轮询是否会选中它（额度判死/冷却/停用都在这里体现）：后台排障时
+            # 「状态 active 但不发请求」最常见的原因就是这一项为 false
+            "selectable": self.is_selectable(),
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,

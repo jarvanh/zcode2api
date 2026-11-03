@@ -36,8 +36,11 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hashlib
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 
 Sections = dict  # 侧车 zcode_sections_3172.json 的加载形态
@@ -91,6 +94,11 @@ def _custom_system_text(system: object) -> str | None:
 
     字符串原样（trim 后空 = 无）；数组取 text 块 \n\n 连接。全部为空视为无
     custom（走默认三块身份路径，对齐 bundle !!o）。
+
+    严格三块（上游 2026-11-02 实弹，与本实现的形状结论一致）：网关校验的是
+    system 的**块结构**（cli_prefix 必须独立成首块），而非逐字内容——实测末块
+    内容可任意（空串 / 仅前缀 / 无前缀均 200）。外来 system 文本只许并入末块
+    内部；追加成第 4 块、或另起独立块，都会破坏形态 → 405 3012。
     """
     if system is None:
         return None
@@ -239,6 +247,34 @@ def apply_start_plan_system(body: dict, model: str | None = None, account=None) 
     return True
 
 
+def _is_date_turn_text(text: object) -> bool:
+    """注入的「当前日期」user 轮的标记（幂等判定与会话指纹共用同一真相源）。"""
+    return isinstance(text, str) and "<system-reminder>" in text and "Today's date is" in text
+
+
+def apply_current_date_turn(body: dict) -> bool:
+    """把官方 meta_user 的「当前日期」附件补进首条 user 轮（3.17.1 起不在 system 块里）。
+
+    形态：`<system-reminder>\nToday's date is YYYY-MM-DD.\n</system-reminder>` 的独立 user 轮。
+    幂等：首条消息已是该形态则跳过。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "user":
+        content = first.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            if _is_date_turn_text(content[0].get("text")):
+                return False
+    date_text = f"<system-reminder>\nToday's date is {time.strftime('%Y-%m-%d')}.\n</system-reminder>"
+    body["messages"] = [
+        {"role": "user", "content": [{"type": "text", "text": date_text}]},
+        *messages,
+    ]
+    return True
+
+
 def apply_cache_control(body: dict) -> bool:
     """最后一条非 system 消息的最后一个 block 加 ephemeral 缓存标记。幂等。"""
     messages = body.get("messages")
@@ -280,6 +316,66 @@ def apply_user_id(body: dict, user_id: str) -> bool:
     return True
 
 
+def attribution_user_id(device_mid: str | None, session_id: str | None) -> str:
+    """官方 attribution 的 metadata.user_id 形态：JSON 字符串 blob。
+
+    bundle `Bdt` / vlelyanin transform.js 实证：
+      `{"device_id": <mid>, "account_uuid": "", "session_id": <sid>}`
+    （旧版直塞 JWT sub 是错误形态）
+    """
+    blob = {
+        "device_id": device_mid or "",
+        "account_uuid": "",
+        "session_id": session_id or "",
+    }
+    return json.dumps(blob, separators=(",", ":"))
+
+
+def conversation_session_id(body: dict, account_id: str = "") -> str | None:
+    """同一会话的稳定 session_id（同首轮 → 同 id），无首轮文本返回 None。
+
+    官方客户端的 `x-session-id` 与 metadata blob 的 `session_id` 在会话内
+    稳定，prompt cache 的命中依赖它。hub 无会话态，用「会话首条 user 文本」
+    做指纹：多轮请求里首轮文本不变，因此同一会话自然拿到同一 id。
+
+    加入 account_id 隔离命名空间，避免不同账号/不同租户撞同一个 id
+    （id 会随请求上报给上游，跨号相同是额外的关联信号）。
+
+    ⚠️ 必须跳过注入的日期轮（2026-11-03 复现的缺陷）：`transform_body` 会把
+    日期轮插到 messages[0] 且**原地**改写 body，而重试/换号路径会对同一个
+    body 对象再次调用 `build_request`——不跳过的话，第二次起指纹就落在日期
+    文本上，同一账号同一天所有会话撞成同一个 id（跨会话关联信号 + cache 键
+    漂移）。跳过规则对「前插任意个匹配轮」幂等，指纹与首次调用一致。
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    text = ""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            candidate = content
+        elif isinstance(content, list):
+            candidate = ""
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" \
+                        and isinstance(block.get("text"), str):
+                    candidate = block["text"]
+                    break
+        else:
+            candidate = ""
+        if _is_date_turn_text(candidate):
+            continue  # 日期轮（自己的或同形前插轮）：不是会话内容
+        text = candidate
+        break
+    if not text.strip():
+        return None
+    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:32]
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"zcode-hub:{account_id}:{digest}"))
+
+
 def jwt_user_id(jwt_token: str | None) -> str | None:
     """从 JWT payload 解 user_id（sub / user_id 字段），失败返回 None。
 
@@ -299,16 +395,28 @@ def jwt_user_id(jwt_token: str | None) -> str | None:
     return str(user_id) if user_id else None
 
 
-def transform_body(body: dict, user_id: str | None = None, model: str | None = None, account=None) -> dict:
+def transform_body(
+    body: dict,
+    user_id: str | None = None,
+    model: str | None = None,
+    account=None,
+    device_mid: str | None = None,
+    session_id: str | None = None,
+) -> dict:
     """按 anthropic 通道变换 body（原地修改并返回）。变换失败静默保持原样。
 
-    account 透传（Environment 段与身份头同源）；context_prefix 在此注入
-    （官方客户端始终携带）。
+    account 透传（Environment 段与身份头同源）；日期轮在此注入（官方客户端
+    始终携带）。attribution 优先用 device_mid/session_id 组官方 blob，user_id
+    （JWT sub）仅兜底。
     """
     try:
         apply_start_plan_system(body, model, account)
         apply_cache_control(body)
-        if user_id:
+        apply_current_date_turn(body)
+        attribution = attribution_user_id(device_mid, session_id) if (device_mid or session_id) else None
+        if attribution:
+            apply_user_id(body, attribution)
+        elif user_id:
             apply_user_id(body, user_id)
         ctx = build_context_prefix_message()
         msgs = body.get("messages")

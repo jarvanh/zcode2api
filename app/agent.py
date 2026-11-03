@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from . import body_transform, constants, endpoint_routing, settings
 from .captcha import captcha_manager
@@ -110,10 +111,23 @@ def build_request(
         raise RuntimeError(f"未知提供商: {provider}")
 
     if provider == "zai" and use_plan:
-        # JWT 通道：LLM 身份头（g6n，无 Device-Mid、UA 带 SDK 后缀）+ 追踪头
+        # JWT 通道：LLM 身份头（g6n：无 Device-Mid、UA 带 SDK 后缀）+ 追踪头。
+        # 会话粘性（2.7.x 并入）：同首轮文本 → 同 session_id，官方会话内稳定，
+        # 上游 prompt cache 依赖它。必须在 transform_body 之前算——日期轮会插到
+        # messages[0] 改变首轮内容。device_mid/session_id 同时喂 attribution blob，
+        # 与 x-session-id 同值（不一致会构成指纹矛盾）。
+        from .fingerprint import profile_for
+
+        profile = profile_for(account)
+        session_id = body_transform.conversation_session_id(body, account.id) or str(uuid.uuid4())
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
-        body = body_transform.transform_body(body, user_id, model, account=account)
+        body = body_transform.transform_body(
+            body, user_id, model,
+            account=account,
+            device_mid=profile.device_mid,
+            session_id=session_id,
+        )
         # 端点映射跟随（fail-open）：按上游 agent/configs 快照改写 URL；
         # 标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）
         target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
@@ -121,10 +135,17 @@ def build_request(
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
+            # start-plan 网关的 harness 要求：mid-conversation system 能力位，
+            # 官方客户端 LLM 调用恒带（vlelyanin / TriDefender 双源一致）。
+            "anthropic-beta": "mid-conversation-system-2026-04-07",
             **build_llm_identity_headers(account),
-            **build_trace_headers(),
+            **build_trace_headers(session_id),
             **extra_headers,
         }
+        # 官方 anthropic SDK 同时下发 x-api-key（与 Bearer 同值）；
+        # 缺失会被 start-plan 网关视为非客户端流量（vlelyanin 实证）。
+        if account.jwt_token:
+            headers["x-api-key"] = account.jwt_token
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
         headers = {

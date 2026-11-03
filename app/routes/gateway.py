@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import secrets
 import threading
 import time
@@ -18,15 +19,18 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 
-from .. import constants, dedup, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, settings
+from .. import business_error, constants, dedup, diaglog, egress, freshness, logs, reqlog, riskmetrics, session_ctx, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota, refresh_accounts
+from ..responses_compat import ResponsesStreamConverter, chat_to_response, responses_to_chat
 from ..store import store
+from ..token_estimate import estimate_input_tokens_after_transform
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
@@ -125,8 +129,13 @@ def _normalize_body(body: dict) -> dict:
     if isinstance(model, str) and "/" in model:
         model = "/".join(model.split("/")[1:])
     if isinstance(model, str):
-        model = MODEL_NAME_MAP.get(model.lower(), model)
-        body["model"] = model
+        # 先按大小写别名改写，再兜底「已退役型号」→ 当前主力型号。上游对退役名
+        # 一律 3006（model not allowed），原样透传只会让客户端拿必然失败的结果。
+        mapped = MODEL_NAME_MAP.get(model.lower(), model)
+        mapped = constants.RETIRED_MODEL_ALIASES.get(mapped, mapped)
+        if mapped != model:
+            logs.warn("gateway", f"模型 {model} → {mapped}（别名/退役型号改写）")
+            body["model"] = mapped
 
     # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间并记录钳制动作
     raw = body.get("max_tokens")
@@ -193,6 +202,10 @@ def _is_exhausted(status_code: int, text: str) -> bool:
     if status_code == 429:
         return False
     if status_code in constants.EXHAUST_HTTP_STATUSES:
+        return True
+    # 业务码优先：Plan 通道 1005/1113 实测形态 {"code":1005,"msg":"exceed quota limit"}
+    data = _safe_json(text)
+    if isinstance(data, dict) and data.get("code") in constants.EXHAUST_BUSINESS_CODES:
         return True
     low = text.lower()
     return any(k in low for k in _EXHAUST_KEYWORDS)
@@ -302,6 +315,17 @@ def _is_risk_control(status_code: int, text: str) -> bool:
         return True
     low = text.lower()
     return any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS)
+
+
+def _is_concurrency_hit(text: str) -> bool:
+    """429 body 是否为 3009「模型并发已满」（区别于真频控，等待策略不同）。
+
+    业务码必须解析后精确比较：logid 是 20 位随机数字，裸子串 "3009" 会撞车
+    （constants.CONCURRENCY_BUSINESS_CODE 注记的同款教训）；非 JSON 形态退回
+    文案匹配兜底。
+    """
+    code = business_error.business_code(_safe_json(text))
+    return code == constants.CONCURRENCY_BUSINESS_CODE or "concurrency limit" in text.lower()
 
 
 def _parse_retry_after(value: str | None) -> int | None:
@@ -607,7 +631,7 @@ async def list_models():
 async def messages(request: Request):
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse(
@@ -1042,11 +1066,25 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
     return _no_quota_response(req_id, model_name, last_error or "所有 bigmodel 账号均不可用", wait)
 
 
-@router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
-async def chat_completions(request: Request):
+async def _run_compat_endpoint(request: Request, kind: str, translate,
+                               stream_hook, finalize):
+    """OpenAI 风格端点公共骨架（/v1/chat/completions 与 /v1/responses 共用）。
+
+    流程：解析 JSON → translate(payload) 得 anthropic body → 归一 → 调度
+    （多账号/重试/验证码与 /v1/messages 同一条路径）→ 按客户端要求走流式或
+    非流式消费。三方差异全部参数化：
+      translate(payload)  -> (anthropic_body | None, err | None)
+      stream_hook(up, model, req_id) -> StreamingResponse
+      finalize(data, model) -> dict   # 非流式：anthropic message → 客户端格式
+
+    fork 增强（2.6.x 并入）：bigmodel/ 前缀模型直通、套餐外模型即时拒绝（3006）、
+    X-Probe 探测打标、early flush（复用 /v1/messages 同一套宽限语义）。
+    """
     try:
         payload = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
+        # ClientDisconnect：客户端在读请求体阶段断开——回包无人收，仅为不刷
+        # starlette 完整堆栈（err.log 曾每次断开一条 Traceback）
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
@@ -1057,7 +1095,7 @@ async def chat_completions(request: Request):
         if model_name in constants.BIGMODEL_OPENAI_MODELS:
             return await _bigmodel_openai_chat(payload, requested_model)
 
-    body, err = openai_to_anthropic(payload)
+    body, err = translate(payload)
     if err or body is None:
         return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
 
@@ -1082,7 +1120,7 @@ async def chat_completions(request: Request):
 
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
-    reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
+    reqlog.begin(req_id, kind, str(body.get("model") or "-"),
                  bool(payload.get("stream")), _last_user_text(body))
     session_ctx.tag(req_id, body)
 
@@ -1134,7 +1172,7 @@ async def chat_completions(request: Request):
     model = str(body.get("model") or "")
     if payload.get("stream"):
         try:
-            return _openai_stream_response(result, model, req_id)
+            return stream_hook(result, model, req_id)
         except asyncio.CancelledError:
             await result.close()
             raise
@@ -1171,7 +1209,68 @@ async def chat_completions(request: Request):
                      input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
                      cache_read=_cache_read(usage))
     record_usage(model, usage.get("input_tokens"), usage.get("output_tokens"))
-    return JSONResponse(anthropic_to_openai(data, model))
+    return JSONResponse(finalize(data, model))
+
+
+@router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
+async def chat_completions(request: Request):
+    """OpenAI Chat Completions 兼容端点（openai_compat 双向转换）。"""
+    return await _run_compat_endpoint(
+        request, "chat",
+        translate=openai_to_anthropic,
+        stream_hook=_openai_stream_response,
+        finalize=anthropic_to_openai,
+    )
+
+
+def _translate_responses(payload: dict) -> tuple[dict | None, str | None]:
+    """Responses → Chat Completions → Anthropic 两跳翻译。"""
+    chat, err = responses_to_chat(payload)
+    if err or chat is None:
+        return None, err
+    return openai_to_anthropic(chat)
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_gateway_key)])
+async def responses(request: Request):
+    """OpenAI Responses API 兼容端点（入站 Responses → chat → anthropic，出站反向）。
+
+    调度、重试、换号、验证码与 /v1/chat/completions 完全一致（公共骨架
+    `_run_compat_endpoint`），只在两头做形状翻译。
+    """
+    return await _run_compat_endpoint(
+        request, "responses",
+        translate=_translate_responses,
+        stream_hook=_responses_stream_response,
+        finalize=lambda data, model: chat_to_response(anthropic_to_openai(data, model), model),
+    )
+
+
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_gateway_key)])
+async def count_tokens(request: Request):
+    """Anthropic count_tokens 端点：本地确定性估算。
+
+    上游（Plan 通道与 api.z.ai）**没有**这个端点（2026-11-02 实测 404），但
+    Anthropic SDK / Claude Code 会先调它做上下文预算，缺了会直接中断会话。
+    这里只做估算：不占账号额度、不打上游、不需要可用账号（池空也能回）。
+
+    估算对象是 **transform 之后**的形状（含官方 system 三块 + 日期轮，
+    线上标定固定开销 ≈400 tok）——2026-11-03 实测：只算客户端原始 body 时
+    6 tok 的请求实际计费 341，预算严重失真。
+    """
+    try:
+        body = await request.json()
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}},
+            status_code=400,
+        )
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return JSONResponse({"error": {"message": "必须提供 model 参数", "type": "invalid_request_error"}}, status_code=400)
+    return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
 
 
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
@@ -1275,6 +1374,46 @@ def _dedup_note(fp: str, result, stream: bool) -> None:
     dedup.note_result(fp, result.status_code, getattr(result, "body", b"") or b"", stream)
 
 
+def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
+    """上游 Anthropic SSE → Responses 事件族（经 chat chunk 中转，复用两套转换器）。"""
+    chat_conv = StreamConverter(model)
+    resp_conv = ResponsesStreamConverter(model)
+
+    async def _iter():
+        try:
+            for out in resp_conv.start():
+                yield out
+            async for line in up.resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+                evt = _safe_json(data_str)
+                if not isinstance(evt, dict):
+                    continue
+                for chunk in chat_conv.feed_events(evt):
+                    for out in resp_conv.feed_chunk(chunk):
+                        yield out
+            for out in resp_conv.done():
+                yield out
+            logs.req_ok(req_id)
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                             input_tokens=chat_conv.usage.get("prompt_tokens"),
+                             output_tokens=chat_conv.usage.get("completion_tokens"))
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        finally:
+            await up.close()
+
+    return StreamingResponse(_iter(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
 async def _dispatch(req_id, body, incoming_headers, port, provider):
     """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
 
@@ -1356,7 +1495,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             slot_box[0] = account.id
         try:
             result = await _try_account(
-                req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
+                req_id, account, body, incoming_headers, plan_channel, needs_captcha,
+                slot_box,
             )
         except BaseException:
             if slot_box[0] is not None:
@@ -1478,6 +1618,38 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,
     )
+
+
+def _business_error_code(data: dict) -> int | None:
+    """HTTP 200 承载的业务错误码（Plan 通道实测形态 `{"code":1005,"msg":...}`）。
+
+    实现在 `app.business_error`（gateway / quota 共用一份判定，避免两处漂移）。
+    """
+    return business_error.business_code(data)
+
+
+def _status_for_business_code(code: int) -> int:
+    """业务码 → 等价 HTTP 状态（复用下方已有的错误分支，不另起一套处置）。
+
+    这里**不写死映射表**：风控码与额度码都取自 constants，改常量即同步生效，
+    不会出现「常量加了 1113、映射忘了」这类静默漂移（单测把两边对齐钉住）。
+    """
+    if code == constants.RISK_BUSINESS_CODE:
+        return constants.RISK_CONTROL_HTTP_STATUSES[0]
+    if code in constants.EXHAUST_BUSINESS_CODES:
+        return constants.EXHAUST_HTTP_STATUSES[0]
+    return 400
+
+
+def _buffered_response(resp: httpx.Response, raw: bytes) -> httpx.Response:
+    """把已读净的正文包成内存响应，供下游按原语义消费。
+
+    去掉 content-encoding/content-length/transfer-encoding：正文已是解码后的
+    字节，保留这些头会让下游再解一次（httpx 对内存响应仍会解 content-encoding）。
+    """
+    drop = ("content-encoding", "content-length", "transfer-encoding")
+    headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in drop]
+    return httpx.Response(resp.status_code, headers=headers, content=raw)
 
 
 def _release_slot(account_id: str) -> None:
@@ -1781,7 +1953,7 @@ class _Upstream:
 
     __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "model", "on_close", "_closed")
 
-    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
+    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient | None,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
                  model: str = "-", on_close=None) -> None:
         self.resp = resp
@@ -1795,12 +1967,18 @@ class _Upstream:
         self._closed = False
 
     async def close(self) -> None:
-        """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。"""
+        """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。
+
+        cm/client 可能为 None（200 业务错误的正文已读净并包成内存响应），
+        只释放仍然存在的部分。
+        """
         if self._closed:
             return
         self._closed = True
-        await self.cm.__aexit__(None, None, None)
-        await self.client.aclose()
+        if self.cm is not None:
+            await self.cm.__aexit__(None, None, None)
+        if self.client is not None:
+            await self.client.aclose()
         if self.on_close is not None:
             try:
                 self.on_close()
@@ -1833,8 +2011,8 @@ class _Upstream:
                                  headers={"Cache-Control": "no-cache"})
 
 
-async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
-                       slot_box: list | None = None):
+async def _try_account(req_id, account, body, incoming_headers, plan_channel,
+                       needs_captcha, slot_box: list | None = None):
     """尝试用单个账号转发，含验证码续期与可配置重试。
 
     错误处理策略（参数见 settings，均可用环境变量调整）：
@@ -1856,6 +2034,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     retries_5xx = 0
     force_fallback = False  # 本请求瞬态走 Key 回退（不改账号持久化状态）
     model_name = str(body.get("model") or "-")
+    # 结构上是否 Plan 通道（决定「能不能用验证码」）；needs_captcha 只表示「这一趟带不带」
+    # 验证码必须与本次 Plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
+    captcha_egress = egress.egress_for(settings.UPSTREAM["zai"]) if plan_channel else None
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
@@ -1863,7 +2044,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         if needs_captcha:
             _park_slot(slot_box)
             try:
-                verify_param, verify_region = await captcha_manager.get_verify_param(port)
+                # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
+                # 换出口使用会被上游判 unusual activity（3012）。
+                verify_param, verify_region = await captcha_manager.get_verify_param(
+                    egress_tag=egress.egress_for(settings.UPSTREAM["zai"])
+                )
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
                 reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
@@ -1921,31 +2106,68 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
+        text: str | None = None
 
-        if status_code >= 400:
-            text = (await resp.aread()).decode("utf-8", "ignore")
+        # 200 承载业务错误：Plan 通道对额度/风控类拒绝直接回 HTTP 200 +
+        # {"code":1005|3012,"msg":...}（2026-10-30 实测，content-type application/json）。
+        # 不识别有两个后果：① 当成成功洗掉 risk_strikes / 冷却 / last_error，把仍在
+        # 标记期的账号拉回 ACTIVE（「冷却期零上游流量」不变量被绕开）；② 错误体当正文
+        # 透传，客户端拿到「200 但没有 message」。JSON 正文一次读净：合法响应改走内存
+        # 流（下游消费逻辑不变），业务错误码映射成等价 HTTP 状态走下面统一分支。
+        if status_code < 400 and resp.headers.get("content-type", "").startswith("application/json"):
+            raw = await resp.aread()
             await cm.__aexit__(None, None, None)
             await client.aclose()
+            cm = client = None  # 已关闭，_Upstream.close 容忍 None
+            decoded = raw.decode("utf-8", "ignore")
+            data = _safe_json(decoded)
+            code = _business_error_code(data) if isinstance(data, dict) else None
+            if code is None:
+                resp = _buffered_response(resp, raw)
+            else:
+                text = decoded
+                status_code = _status_for_business_code(code)
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} HTTP 200 承载业务错误 code={code}"
+                    f"（按 {status_code} 处置）：{' '.join(text.split())[:160]}",
+                )
             diaglog.record_failure(req_id, account_name=account.name, mode=account.mode,
                                    model=str(body.get("model") or ""), url=url,
                                    status=status_code, text=text, request_body=body)
 
-            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
-            challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
+        if status_code >= 400:
+            if text is None:
+                text = (await resp.aread()).decode("utf-8", "ignore")
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
+
+            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。Plan 通道上
+            # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
+            challenge = _detect_captcha_challenge(resp, text) if plan_channel and not force_fallback else None
             if challenge:
-                captcha_manager.invalidate()
+                captcha_manager.invalidate(egress.egress_for(settings.UPSTREAM["zai"]))
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")
                     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
                     return _NEXT_ACCOUNT
-                logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
+                if not needs_captcha:
+                    # 按配置本不该带码，但上游明确要码 → 下一趟补码
+                    needs_captcha = True
+                    logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），补码重试")
+                else:
+                    logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
             # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
             # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控
             # 账号持续施压）；冷却期零上游流量（is_cooling 全通道门禁）。
             if _is_risk_control(status_code, text):
+                # 405 一律按风控计（RISK_CONTROL_HTTP_STATUSES），所以必须把上游
+                # body 留一段在日志里——否则分不清是 3012 标记、验证码挑战还是
+                # WAF/签名拒绝，strikes 花完了仍不知道上游在拒什么。
+                snippet = " ".join(text.split())[:200]
                 account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
                 penalty_note = _apply_risk_strike(
                     account, f"3012/unusual activity HTTP {status_code}", req_id,
@@ -1956,10 +2178,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 第 2 个不同账号也命中才确认波次。确认后本请求不再换号（下轮
                 # 入口拦截），API Key 回退除外（api.z.ai 通道与被拦的 plan 通道无关）。
                 wave_confirmed = _risk_wave_confirm(account.provider, account.id)
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(
                         req_id,
-                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切 API Key 回退",
+                        f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
+                        f"{penalty_note}，切 API Key 回退；上游body={snippet!r}",
                     )
                     needs_captcha = False
                     force_fallback = True
@@ -1967,13 +2190,15 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 if wave_confirmed:
                     logs.warn(
                         req_id,
-                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，"
-                        f"确认频道级波次（多账号连中），全池暂停 {settings.RISK_WAVE_PAUSE}s+，本请求不再换号",
+                        f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
+                        f"{penalty_note}，确认频道级波次（多账号连中），全池暂停 {settings.RISK_WAVE_PAUSE}s+，"
+                        f"本请求不再换号；上游body={snippet!r}",
                     )
                 else:
                     logs.warn(
                         req_id,
-                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
+                        f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
+                        f"{penalty_note}，切换下一个；上游body={snippet!r}",
                     )
                 return _NEXT_ACCOUNT
 
@@ -1990,7 +2215,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             if status_code == 401:
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切 API Key 回退")
                     needs_captcha = False
                     force_fallback = True
@@ -2002,7 +2227,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切 API Key 回退")
                     needs_captcha = False
                     force_fallback = True
@@ -2031,7 +2256,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         req_id,
                         f"账号 {account.name} 429 为 1113 无余额，{model_key} 冷却，跳过等待重试",
                     )
-                    if needs_captcha and account.has_apikey_fallback():
+                    if plan_channel and not force_fallback and account.has_apikey_fallback():
                         needs_captcha = False
                         force_fallback = True
                         retries_429 = 0
@@ -2073,19 +2298,35 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     return _NEXT_ACCOUNT
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
-                    wait = _parse_retry_after(resp.headers.get("retry-after")) or settings.RETRY_429_WAIT
-                    logs.warn(
-                        req_id,
-                        f"账号 {account.name} 被限流 429，{wait}s 后重试"
-                        f"（{retries_429}/{settings.RETRY_429_TIMES}）",
-                    )
+                    # 3009「model concurrency limit exceeded」= 并发争用，不是频控：
+                    # 上游不给 Retry-After，槽位通常几秒内释放。等默认 60s 会把
+                    # 客户端白白吊死。短退避 + 抖动打散重试。
+                    concurrency_hit = _is_concurrency_hit(text)
+                    wait = _parse_retry_after(resp.headers.get("retry-after"))
+                    if wait is None:
+                        if concurrency_hit:
+                            wait = settings.RETRY_429_CONCURRENCY_WAIT + random.randint(0, 2)
+                        else:
+                            wait = settings.RETRY_429_WAIT
+                    if concurrency_hit:
+                        logs.warn(
+                            req_id,
+                            f"账号 {account.name} 模型并发已满（3009），{wait}s 后重试"
+                            f"（{retries_429}/{settings.RETRY_429_TIMES}）",
+                        )
+                    else:
+                        logs.warn(
+                            req_id,
+                            f"账号 {account.name} 被限流 429，{wait}s 后重试"
+                            f"（{retries_429}/{settings.RETRY_429_TIMES}）",
+                        )
                     _park_slot(slot_box)
                     await _sleep(wait)
                     if not _reacquire_slot(account, slot_box):
                         logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
                         return _NEXT_ACCOUNT
                     continue
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     account.record_result(False, "Plan 通道 429 耗尽，切 API Key 回退")
                     logs.warn(req_id, f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退")
                     needs_captcha = False

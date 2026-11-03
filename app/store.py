@@ -16,11 +16,32 @@ import time
 import uuid
 from contextlib import closing
 
-from . import settings
+from . import logs, settings
 from .models import PROVIDERS, Account, Status
 
 _TBL = "accounts"
 _META = "meta"
+
+
+def _parse_hours(raw: str) -> list[int]:
+    """解析领取窗口（北京时间小时，逗号分隔；空/* = 全天 → []）。升序去重，脏值跳过。"""
+    raw = str(raw or "").strip()
+    if raw in ("", "*"):
+        return []
+    hours: list[int] = []
+    for part in raw.replace("，", ",").split(","):
+        part = part.strip()
+        try:
+            hour = int(part)
+        except ValueError:
+            continue  # 脏值跳过，不让一个坏配置挂掉领取轮
+        if 0 <= hour <= 23 and hour not in hours:
+            hours.append(hour)
+    return sorted(hours)
+
+
+# 已告警过的坏配置值（解析发生在每次循环唤醒/设置读取，去重避免刷屏）
+_HOURS_WARNED: set[str] = set()
 
 
 class Store:
@@ -239,6 +260,25 @@ class Store:
             return max(0, int(self.get_setting("claim_round_stagger", settings.CLAIM_ROUND_STAGGER)))
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_STAGGER
+
+    def claim_round_hours(self) -> list[int]:
+        """自动领取窗口：北京时间小时升序列表；空 = 全天（不限时）。运行时可改。
+
+        上游套餐按天投放（用户侧实证：每天 19:00 放量），窗口外轮询只会空转
+        preview。窗口锚定**北京时钟**而非 host 时区（host 换成 UTC 也不漂）；
+        中国无夏令时，固定 +8 即精确。
+        """
+        raw = str(self.get_setting("claim_round_hours", settings.CLAIM_ROUND_HOURS) or "").strip()
+        hours = _parse_hours(raw)
+        if not hours and raw not in ("", "*"):
+            # 配置写了但一个有效小时都没有（env 笔误 / 手改 DB——管理端 PUT 有校验
+            # 不会产生这种值）：**不允许坏配置静默升级成「全天轮询」**，回落默认并留痕。
+            fallback = _parse_hours(settings.CLAIM_ROUND_HOURS)
+            if raw not in _HOURS_WARNED:
+                _HOURS_WARNED.add(raw)
+                logs.warn("store", f"claim_round_hours={raw!r} 无有效小时，按默认处理 → {fallback or '全天'}")
+            return fallback
+        return hours
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
