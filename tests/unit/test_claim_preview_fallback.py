@@ -124,7 +124,7 @@ class TestProbeUnlistedPlans:
         """preview 空 ≠ 无可领：收割到的 id 必须真去打一次 claim。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id, "plan_name": "ZCODE WEEKEND BUILD"}
 
@@ -143,7 +143,7 @@ class TestProbeUnlistedPlans:
         """已持有的 id 必定 1003：不打、也不占用每日预算。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id}
 
@@ -161,7 +161,7 @@ class TestProbeUnlistedPlans:
         """1005 名额等待期的 id 与 preview 主路同语义跳过。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id}
 
@@ -175,7 +175,7 @@ class TestProbeUnlistedPlans:
     async def test_daily_budget_caps_attempts(self, fresh_app, monkeypatch):
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             raise ClaimError("该套餐已经领取过", code=1003)
 
@@ -195,7 +195,7 @@ class TestProbeUnlistedPlans:
         """1001 = 套餐已下线：探测阶段即剔除，不进入验证码环节。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id}
 
@@ -210,7 +210,7 @@ class TestProbeUnlistedPlans:
         """探测已持有（本地 plans 陈旧）→ 不打真实领取。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id}
 
@@ -241,7 +241,7 @@ class TestProbeUnlistedPlans:
         """官方渠道（横幅 feed）报过名的 id 不占每日预算、排在猜测之前。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id, "plan_name": "BANNER PLAN"}
 
@@ -263,7 +263,7 @@ class TestProbeUnlistedPlans:
         """核心回归：没有任何历史/持有 id 时，日期候选也能触发领取。"""
         claims: list[str] = []
 
-        async def fake_claim(account, plan_id=None):
+        async def fake_claim(account, plan_id=None, **kwargs):
             claims.append(plan_id)
             return {"plan_id": plan_id, "plan_name": "ZCODE GLOBAL BUILD"}
 

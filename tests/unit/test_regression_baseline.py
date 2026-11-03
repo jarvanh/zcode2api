@@ -290,9 +290,38 @@ class TestBillingBlockReason:
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         acc.enabled = False
+        acc.status = Status.DISABLED
         msg = billing_block_reason(acc, action="上游刷新") or ""
         assert "停用" in msg
         assert "重新授权" not in msg
+
+    def test_manual_disable_still_claimable(self):
+        """手动停用的好票：对话轮询不选，但领取必须放行（2026-11-03 漏领教训）。"""
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.enabled = False
+        acc.status = Status.DISABLED
+        assert acc.allows_claim() is True
+        assert acc.is_selectable() is False, "停用账号绝不参与对话轮询"
+        assert billing_block_reason(acc, allow_disabled=True) is None
+
+    def test_risk_banned_not_claimable_even_if_allowed(self):
+        """风控 strikes 封禁（enabled=True）与手动停用同状态不同语义：不放行。"""
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        for _ in range(4):
+            acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
+        assert acc.status == Status.DISABLED and acc.enabled
+        assert acc.allows_claim() is False
+        assert billing_block_reason(acc, allow_disabled=True)
+
+    def test_invalid_never_claimable(self):
+        from app.claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.enabled = False
+        acc.status = Status.INVALID
+        assert acc.allows_claim() is False
+        assert billing_block_reason(acc, allow_disabled=True) == AUTH_EXPIRED_MESSAGE
 
     def test_risk_cooling(self):
         from app.claim import billing_block_reason

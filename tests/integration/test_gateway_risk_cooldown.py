@@ -789,8 +789,12 @@ class TestCooldownBehavior:
         assert acc.status == Status.COOLING
         assert acc.is_cooling() is True
 
-    async def test_fetch_quota_skips_invalid_and_disabled(self, gateway_client, fresh_app):
-        """废 JWT / 风控禁用直调 fetch_quota 也不得打 billing、不得洗成 active。"""
+    async def test_fetch_quota_skips_invalid_and_risk_banned(self, gateway_client, fresh_app):
+        """废 JWT / 风控封禁直调 fetch_quota 也不得打 billing、不得洗成 active。
+
+        手动停用的好票例外（见 test_fetch_quota_allows_manually_disabled）：
+        它要能刷新领到的新包，否则停用账号领了包面板也看不见。
+        """
         from app import quota
         from tests.conftest import seed_account
 
@@ -806,6 +810,7 @@ class TestCooldownBehavior:
         assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
         assert acc.status == Status.INVALID
 
+        # 风控 strikes 封禁：enabled=True + DISABLED，绝不能刷新
         acc.status = Status.DISABLED
         acc.enabled = True
         fresh_app.update_account(acc)
@@ -815,13 +820,22 @@ class TestCooldownBehavior:
         assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
         assert acc.status == Status.DISABLED
 
-        acc.status = Status.ACTIVE
+    async def test_fetch_quota_allows_manually_disabled(self, gateway_client, fresh_app):
+        """手动停用（enabled=False）的好票：领取后必须能刷新出新包读数。"""
+        from app import quota
+        from tests.conftest import seed_account
+
+        _client, mock = gateway_client
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-off-q")
         acc.enabled = False
+        acc.status = Status.DISABLED
         fresh_app.update_account(acc)
+
         before = len(mock.state.calls)
         res = await quota.fetch_quota(acc)
-        assert "error" in res
-        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert "billing" in res and "error" not in res
+        assert [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert acc.enabled is False, "刷新不得把停用账号重新启用"
 
     async def test_captcha_refill_gate_follows_account_state(self, fresh_app):
         """refill 门控：存在可选 jwt 账号才预热；全冷却/封禁（含重启后，状态已落库）关门。"""

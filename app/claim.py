@@ -63,17 +63,25 @@ _CLAIM_FAIL = {
 }
 
 
-def billing_block_reason(account: Account, *, action: str = "领取") -> str | None:
-    """JWT 不可打 billing 时的用户文案；可打则返回 None。"""
+def billing_block_reason(account: Account, *, action: str = "领取",
+                         allow_disabled: bool = False) -> str | None:
+    """JWT 不可打 billing 时的用户文案；可打则返回 None。
+
+    allow_disabled=True 放行「手动停用的好票」（enabled=False，JWT 仍有效）：
+    停用只表示不参与对话轮询，billing 写入凭证照常可用。INVALID / 冷却 /
+    风控 strikes 封禁仍一律拦住（封禁与手动停用的区别见 allows_claim）。
+    """
     if account.is_cooling():
         return f"账号冷却中（风控/限流），已跳过{action}"
     if account.mode != "jwt" or not (account.jwt_token or "").strip():
         return f"非 Coding Plan 账号，已跳过{action}"
+    if account.status == Status.INVALID:
+        return AUTH_EXPIRED_MESSAGE
     if not account.enabled:
-        return f"账号已停用，已跳过{action}"
+        return None if allow_disabled else f"账号已停用，已跳过{action}"
     if account.status == Status.DISABLED:
         return f"账号风控封禁，已跳过{action}"
-    if account.status == Status.INVALID or not account.uses_plan_channel():
+    if not account.uses_plan_channel():
         return AUTH_EXPIRED_MESSAGE
     return None
 
@@ -374,7 +382,8 @@ def _candidate_plan_ids(account: Account) -> list[str]:
 
 async def _probe_unlisted_plans(account: Account,
                                skip_plan_ids: set[str] | None = None,
-                               priority_ids: set[str] | None = None) -> list[dict]:
+                               priority_ids: set[str] | None = None,
+                               *, allow_disabled: bool = False) -> list[dict]:
     """preview 空时按候选 plan_id 发现并领取（投放空窗兜底）。
 
     候选先做无验证码存在性探测：只有 3007（缺验证码=存在且未持有）才走真实
@@ -426,7 +435,7 @@ async def _probe_unlisted_plans(account: Account,
     outcomes: list[dict] = []
     for pid in verified:
         try:
-            result = await claim(account, pid)
+            result = await claim(account, pid, allow_disabled=allow_disabled)
         except ClaimError as err:
             if err.code == 1001:
                 _forget_plan_id(pid)
@@ -576,6 +585,10 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
     skip_plan_ids：本轮跳过领取的套餐 id（1005 名额等待期由 ClaimRoundManager
     记忆传入）；preview 仍照常执行，新套餐发现不受影响。
 
+    自动路径一律 allow_disabled=True：停用（enabled=False）但票据仍有效的账号
+    也要领包（2026-11-03 实证：停用导致 1103 投放漏领）；废票/冷却/风控封禁
+    仍由 billing_block_reason 拦住，不会对它们发 billing 写请求。
+
     激活上报时序（2.6.6 根因修复）：上报必须先于 preview——活动投放疑似以
     当日激活信号为资格（constants.ACTIVATION_ELEMENTS 注释、09-06 实证），
     「先 preview 后补上报」会在新的一天形成 preview 恒空 → 永不激活的死锁。
@@ -596,11 +609,12 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
             logs.warn("claim", f"账号 {account.name} 激活上报异常: {err}")
 
     try:
-        plans = await preview_plans(account)
+        plans = await preview_plans(account, allow_disabled=True)
     except ClaimError as err:
         logs.info("claim", f"账号 {account.name} 无可领套餐（{err}），转兜底候选")
         outcomes.extend(await _probe_unlisted_plans(
-            account, skip_plan_ids, priority_ids=set(await _banner_candidate(account))))
+            account, skip_plan_ids, priority_ids=set(await _banner_candidate(account)),
+            allow_disabled=True))
         return outcomes
     except Exception as err:  # noqa: BLE001
         logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
@@ -609,7 +623,8 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
     if not plans:
         banner_ids = await _banner_candidate(account)
         probed = await _probe_unlisted_plans(account, skip_plan_ids,
-                                             priority_ids=set(banner_ids))
+                                             priority_ids=set(banner_ids),
+                                             allow_disabled=True)
         if probed:
             outcomes.extend(probed)
             return outcomes
@@ -624,7 +639,7 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
             skipped += 1
             continue
         try:
-            result = await claim(account, plan["plan_id"])
+            result = await claim(account, plan["plan_id"], allow_disabled=True)
             outcomes.append({"account_id": account.id, "account_name": account.name,
                              "ok": True, **result})
             logs.ok("claim", f"账号 {account.name} 自动领取成功: "
@@ -647,9 +662,9 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
     return outcomes
 
 
-async def preview_plans(account: Account) -> list[dict]:
+async def preview_plans(account: Account, *, allow_disabled: bool = False) -> list[dict]:
     """拉取账号当前可领取套餐，按优先级降序。"""
-    blocked = billing_block_reason(account, action="上游查询")
+    blocked = billing_block_reason(account, action="上游查询", allow_disabled=allow_disabled)
     if blocked:
         raise ClaimError(blocked)
     from .fingerprint import profile_for
@@ -680,7 +695,8 @@ async def preview_plans(account: Account) -> list[dict]:
     return plans
 
 
-async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, str, list]:
+async def _auto_pick_plan(account: Account, plan_id: str | None,
+                         *, allow_disabled: bool = False) -> tuple[str, str, list]:
     """plan_id 为空时 preview 自动选优先级最高套餐。返回 (plan_id, plan_name, grants)。
 
     preview 空时降级到收割候选（preview 历史列出过 / 池内任一号已入账的 id）——
@@ -689,7 +705,7 @@ async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, s
     """
     if plan_id:
         return plan_id, "", []
-    plans = await preview_plans(account)
+    plans = await preview_plans(account, allow_disabled=allow_disabled)
     if not plans:
         # 横幅 feed 先行：官方活动第二投放列表（挂横幅期间 preview 看不到）。
         # 候选同样先做免码探测：直接返回第一个 id 会把「不存在」的猜测交给
@@ -810,6 +826,8 @@ async def claim_with_captcha(
     verify_param: str,
     region: str | None,
     plan_id: str | None = None,
+    *,
+    allow_disabled: bool = False,
 ) -> dict:
     """手动领取：verify_param 由用户浏览器内阿里 SDK 滑块产生，本端只做转发。
 
@@ -817,13 +835,14 @@ async def claim_with_captcha(
     """
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
-    blocked = billing_block_reason(account)
+    blocked = billing_block_reason(account, allow_disabled=allow_disabled)
     if blocked:
         raise ClaimError(blocked)
     if not (verify_param or "").strip():
         raise ClaimError("缺少验证码参数，请先完成人机验证")
 
-    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id or None)
+    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id or None,
+                                                      allow_disabled=allow_disabled)
     headers = _claim_headers(account, verify_param.strip(), region)
     body = await _post_claim(account, headers, plan_id)
     outcome = _claim_outcome(body, plan_id, plan_name, grants)
@@ -831,7 +850,8 @@ async def claim_with_captcha(
     return outcome
 
 
-async def claim(account: Account, plan_id: str | None = None) -> dict:
+async def claim(account: Account, plan_id: str | None = None, *,
+                allow_disabled: bool = False) -> dict:
     """领取套餐。plan_id 缺省时自动选优先级最高的可领套餐。
 
     返回 _claim_outcome 形态（含 server_time/starts_at/ends_at，可能为 None）；
@@ -840,11 +860,12 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     """
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
-    blocked = billing_block_reason(account)
+    blocked = billing_block_reason(account, allow_disabled=allow_disabled)
     if blocked:
         raise ClaimError(blocked)
 
-    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
+    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id,
+                                                      allow_disabled=allow_disabled)
     verify_param, verify_region = await captcha_manager.get_verify_param()
     config = await captcha_manager.fetch_config()
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
@@ -866,9 +887,10 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
 class ClaimRoundManager:
     """后台周期自动领取轮（默认 1 小时，2.6.5 整改；对齐 zcode-switch 用户触发语义）。
 
-    每轮对全部可打 billing 的 JWT 账号执行 auto_claim_all_plans（每日一次激活
-    上报先于 preview + 逐个领取可领套餐）；冷却/停用/风控禁用/失效账号由
-    allows_billing() 先行过滤，保证「冷却期零上游 billing 流量」不变量。
+    每轮对全部可领取的 JWT 账号执行 auto_claim_all_plans（每日一次激活
+    上报先于 preview + 逐个领取可领套餐）；冷却/失效/风控封禁账号由
+    allows_claim() 先行过滤（停用的好票仍参与领取），保证「冷却期零上游
+    billing 流量」不变量。
     1005（今日名额用完）按服务端 next_at 退避：等待期该套餐不打 claim
     （省 captcha 求解与上游写流量），preview 照常保留新套餐发现
     （docs/development/05「按服务端 next window 退避」语义落地）。
@@ -904,11 +926,11 @@ class ClaimRoundManager:
 
         accounts = [
             a for a in store.list_accounts("zai")
-            if a.mode == "jwt" and a.allows_billing()
+            if a.mode == "jwt" and a.allows_claim()
         ]
         if not accounts:
             if not self._empty_warned:
-                logs.warn("claim", "无可服务账号（全部禁用/冷却/失效），本轮跳过")
+                logs.warn("claim", "无可领取账号（全部冷却/失效/封禁），本轮跳过")
                 self._empty_warned = True
             return
         self._empty_warned = False

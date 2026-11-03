@@ -283,8 +283,9 @@ async def refresh(payload: dict = Body(default=None)):
     else:
         ids = set(payload.get("ids") or [])
         pool = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
-    # 失效 / 风控禁用 / 冷却 一律不打 billing（冷却期零上游流量 + 废 JWT 不再 401）
-    targets = [a for a in pool if a.allows_billing()]
+    # 失效 / 风控封禁 / 冷却 一律不打 billing（冷却期零上游流量 + 废 JWT 不再 401）；
+    # 手动停用的好票要能手动刷新（allows_claim），否则领到的新包在面板看不见
+    targets = [a for a in pool if a.allows_claim()]
     skipped_cooling = sum(1 for a in pool if a.is_cooling())
     skipped_invalid = len(pool) - len(targets) - skipped_cooling
     summary = await refresh_accounts(targets)
@@ -538,7 +539,7 @@ async def claim_preview(account_id: str | None = None):
     ids = [account_id] if account_id else None
     out = []
     for acc in _jwt_accounts(ids):
-        blocked = billing_block_reason(acc, action="上游查询")
+        blocked = billing_block_reason(acc, action="上游查询", allow_disabled=True)
         if blocked:
             out.append({"account_id": acc.id, "account_name": acc.name,
                         "plans": [], "error": blocked,
@@ -575,17 +576,18 @@ async def claim(payload: dict = Body(default=None)):
     if not candidates:
         return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
 
-    # 冷却 / 失效 JWT 不领取（billing/claim 是上游写流量，废票只会 401）
+    # 冷却 / 失效 JWT 不领取（billing/claim 是上游写流量，废票只会 401）；
+    # 手动停用的好票仍要领取（allows_claim 放行，停用不丢每日套餐）
     outcomes = [
         {"account_id": a.id, "account_name": a.name, "ok": False,
-         "message": billing_block_reason(a) or AUTH_EXPIRED_MESSAGE}
-        for a in candidates if not a.allows_billing()
+         "message": billing_block_reason(a, allow_disabled=True) or AUTH_EXPIRED_MESSAGE}
+        for a in candidates if not a.allows_claim()
     ]
     for acc in candidates:
-        if not acc.allows_billing():
+        if not acc.allows_claim():
             continue
         try:
-            result = await do_claim(acc, plan_id)
+            result = await do_claim(acc, plan_id, allow_disabled=True)
         except ClaimError as err:
             logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
             outcome = {"account_id": acc.id, "account_name": acc.name,
@@ -645,14 +647,15 @@ async def claim_manual(payload: dict = Body(...)):
     acc = store.find("zai", account_id)
     if not acc or acc.mode != "jwt" or not acc.jwt_token:
         raise HTTPException(404, "JWT 账号不存在")
-    blocked = billing_block_reason(acc)
+    blocked = billing_block_reason(acc, allow_disabled=True)
     if blocked:
         return {"outcomes": [{"account_id": acc.id, "account_name": acc.name,
                               "ok": False, "message": blocked}],
                 "summary": {"ok": 0, "fail": 1}}
 
     try:
-        result = await claim_with_captcha(acc, verify_param, region, plan_id)
+        result = await claim_with_captcha(acc, verify_param, region, plan_id,
+                                          allow_disabled=True)
     except ClaimError as err:
         return {"outcomes": [{"account_id": acc.id, "account_name": acc.name,
                               "ok": False, "message": str(err)}],

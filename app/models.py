@@ -205,6 +205,25 @@ class Account:
         """
         return self.uses_plan_channel() and not self.is_cooling(now)
 
+    def allows_claim(self, now: float | None = None) -> bool:
+        """是否允许打 billing 领取（自动领取轮 / 手动领取）。
+
+        比 allows_billing() 宽一档：**手动停用**（enabled=False，JWT 仍有效）的
+        账号不参与对话轮询，但上游投放照常能领——停用不该连带丢掉每日套餐
+        （2026-11-03 实证：1103 投放时 zai-131/175 因停用漏领）。仍然排除：
+        - INVALID：凭证失效，打 billing 必 401；
+        - COOLING：冷却期零上游 billing 流量不变量；
+        - enabled=True 且 status=DISABLED：风控 strikes 封禁（与手动停用区分），
+          继续施压只会加重封禁。
+        """
+        if self.mode != "jwt" or not (self.jwt_token or "").strip():
+            return False
+        if self.status == Status.INVALID or self.is_cooling(now):
+            return False
+        if not self.enabled:
+            return True
+        return self.status != Status.DISABLED
+
     # ── 通道级风控（lane-scoped penalty）─────────────────────────────────────
     @staticmethod
     def lane_key(channel: str, model: str) -> str:
