@@ -1042,6 +1042,14 @@ class ClaimRoundManager:
                 self._empty_warned = True
             return
         self._empty_warned = False
+        # 轮次执行前先轻量核验官方最新版本（若有新版本且开启 auto_sync，自动对齐指纹）
+        try:
+            from .version_tracker import version_tracker
+
+            await version_tracker.check_and_sync()
+        except Exception as err:  # noqa: BLE001
+            logs.info("claim", f"轮次前官方版本核验跳过（{err}）")
+
         now_ms = time.time() * 1000
         # 错峰标记按轮重置：每轮首个账号不等，只错峰后续相邻账号
         self._round_visited = False

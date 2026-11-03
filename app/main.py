@@ -14,6 +14,7 @@ from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import model_probe, monitor, risk_lane_probe
 from .routes import admin_api, gateway, pages
+from .version_tracker import version_tracker
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -138,7 +139,9 @@ async def lifespan(app: FastAPI):
     risk_lane_probe.start()   # plan-lane 风控冷却探测轮（RISK_LANE_PROBE = 关闭）
     captcha_manager.start()   # 验证码预解池后台补充
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
-    endpoint_routing.start()  # 端点映射跟随轮（agent/configs mapping，fail-open）
+    endpoint_routing.start()  # 端点映射跟随轮（agent/configs mapping，fail-open；fork 增强）
+    version_tracker.init_from_store()
+    version_tracker.start()   # 官方版本自动探测与同步（上游 2.7.16）
     _run_install_sequence_on_start()
     _warn_version_drift()
     base = f"http://{_display_host()}:{settings.PORT}"
@@ -156,6 +159,7 @@ async def lifespan(app: FastAPI):
         await risk_lane_probe.stop()
         await claim_round.stop()
         await endpoint_routing.stop()
+        await version_tracker.stop()
         await captcha_manager.close()
 
 

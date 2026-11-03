@@ -117,6 +117,20 @@ AVAILABLE_MODELS = constants.AVAILABLE_MODELS
 _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 
 
+def _messages_egress() -> str:
+    """messages 通道有效出口 tag（同时驱动 captcha 签发出口，见 app/egress.py）。
+
+    ZCODE_MESSAGES_FORCE_DIRECT=true 强制直连：2026-11-04 线上实证 env 代理
+    出口（GCP IP）被上游持续标记——messages 走代理 17h+ 零成功（3012
+    unusual activity），而同账号 billing/claim/telemetry 直连全部正常。
+    统一全链路出口，消除「CN billing + US messages」双 IP 异常信号；
+    置 false 恢复历史行为（走 env 代理）。
+    """
+    if settings.MESSAGES_FORCE_DIRECT:
+        return egress.DIRECT
+    return egress.egress_for(settings.UPSTREAM["zai"])
+
+
 def _detect_provider(body: dict, headers) -> str:
     model = body.get("model") or ""
     if model.startswith("bigmodel/") or headers.get("x-provider") == "bigmodel":
@@ -673,6 +687,13 @@ async def messages(request: Request):
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
                  bool(body.get("stream")), _last_user_text(body))
     session_ctx.tag(req_id, body)
+    # 客户端指纹（上游 2.7.17，2026-11-04 排障加装）：周期短探测打线上时无法
+    # 定位来源——CF 隧道绕过 nginx 无访问日志、hub 也不记录调用方。真实客户端
+    # IP 以 CF-Connecting-IP 为准（经 cloudflared），直连本机时回退
+    # X-Forwarded-For / 本地环回。UA 截断防日志爆炸。
+    _client_ip = (incoming_headers.get("cf-connecting-ip")
+                  or incoming_headers.get("x-forwarded-for") or "local")
+    logs.info(req_id, f"client={_client_ip} ua={incoming_headers.get('user-agent', '?')[:72]}")
 
     if body.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
@@ -1492,7 +1513,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         plan_channel = provider == "zai" and account.uses_plan_channel()
         needs_captcha = (plan_channel and account.plan_lane_available(model_key)
                          and await captcha_manager.model_requests_need_captcha(
-                             egress.egress_for(settings.UPSTREAM["zai"])))
+                             _messages_egress()))
 
         slot_box: list[str | None] = [None]
         if limit > 0:
@@ -2041,7 +2062,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     model_name = str(body.get("model") or "-")
     # 结构上是否 Plan 通道（决定「能不能用验证码」）；needs_captcha 只表示「这一趟带不带」
     # 验证码必须与本次 Plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
-    captcha_egress = egress.egress_for(settings.UPSTREAM["zai"]) if plan_channel else None
+    captcha_egress = _messages_egress() if plan_channel else None
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
@@ -2052,7 +2073,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                 # 换出口使用会被上游判 unusual activity（3012）。
                 verify_param, verify_region = await captcha_manager.get_verify_param(
-                    egress_tag=egress.egress_for(settings.UPSTREAM["zai"])
+                    egress_tag=_messages_egress()
                 )
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
@@ -2075,10 +2096,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        # 账号级出口代理（zai 主链路 + fallback 同 client）：未配置 = 直连不变。
+        # 账号级出口代理（zai 主链路 + fallback 同 client）：未配置 = 直连不变；
         # billing/claim/验证码不在此列（刻意直连，见 claim._billing_request）。
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
-                                   **account.proxy_kwargs())
+        # ZCODE_MESSAGES_FORCE_DIRECT 时账号代理照常生效（2.7.16 语义：该开关只
+        # 压制 env/系统代理，账号级显式代理仍是账号自己的出口决策）。
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+            trust_env=not settings.MESSAGES_FORCE_DIRECT,
+            **account.proxy_kwargs())
         # 打标：本请求已发起上游调用（含连接失败/4xx/5xx）；调度层放弃的行
         # 无此标记，监控端据此区分「调度失败·未达上游」与「上游失败」
         reqlog.mark_upstream(req_id)
@@ -2151,7 +2176,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
             challenge = _detect_captcha_challenge(resp, text) if plan_channel and not force_fallback else None
             if challenge:
-                captcha_manager.invalidate(egress.egress_for(settings.UPSTREAM["zai"]))
+                captcha_manager.invalidate(_messages_egress())
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")

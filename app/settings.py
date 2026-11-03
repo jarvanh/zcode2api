@@ -291,6 +291,18 @@ UPSTREAM = {
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 官方更新清单端点（测试时指向 Mock 上游）
+ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST_URL)
+# 官方版本自动探测间隔（秒，默认 12 小时）
+VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)
+# 是否自动将客户端伪装对齐至官方最新版本
+AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
+# messages 通道强制直连（2026-11-04 线上实证：env 代理出口 GCP IP 被上游持续
+# 标记——messages 走代理 17h+ 零成功（3012 unusual activity），而同账号
+# billing/claim/telemetry 直连全部正常。切直连统一全链路出口，消除
+# 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
+# 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
+MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
 # 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
 ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
@@ -304,7 +316,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.10"
+APP_VERSION = "2.9.11"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
