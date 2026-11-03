@@ -231,6 +231,8 @@ return pool[idx]
 
 - 只有 **zai + JWT(Plan 通道)** 账号能查额度:`allows_billing()` 要求
   `uses_plan_channel()`,数据源是上游 `/billing/current` + `/billing/balance`。
+  手动停用(`enabled=False` 但票据有效)的账号由 `allows_claim()` 放行,
+  领取后能刷出新包读数;废 JWT / 风控封禁仍然不查。
 - **API Key 回退账号(zai apiKey / bigmodel)查不到额度是设计限制,不是故障**:
   上游 Key 通道不提供这些 billing 接口。此类账号后台额度区显示为空,
   但 `use_count` / 最近请求 tick 仍正常累计,可据此判断在不在服务。

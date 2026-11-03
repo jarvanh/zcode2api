@@ -1,7 +1,8 @@
 """ClaimRoundManager 单测：门控过滤、1005 退避、停服截止。
 
 不跑真实 loop（睡眠周期），直接驱动 _round() / stop() 验证：
-- 仅 allows_billing() 的 JWT 账号进入轮次（冷却/停用/风控禁用跳过）
+- 仅 allows_claim() 的 JWT 账号进入轮次（冷却/失效/风控封禁跳过，
+  手动停用的好票仍领取）
 - 有新套餐入账才触发额度刷新
 - 1005+next_at 的套餐在等待期跳过领取（preview 照常、不耗 captcha），
   next_at 过后恢复重试，成功/其余失败清除退避
@@ -19,14 +20,19 @@ from app.claim import ClaimRoundManager
 
 
 class _FakeAccount:
-    def __init__(self, aid: str, *, billing: bool):
+    def __init__(self, aid: str, *, billing: bool, claim: bool | None = None):
         self.id = aid
         self.name = f"acct-{aid}"
         self.mode = "jwt"
         self._billing = billing
+        # 默认与 billing 同势；单独指定用于「停用的好票」（billing=False, claim=True）
+        self._claim = billing if claim is None else claim
 
     def allows_billing(self) -> bool:
         return self._billing
+
+    def allows_claim(self) -> bool:
+        return self._claim
 
 
 def _fake_store(accounts, *, stagger: int = 0):
@@ -51,19 +57,22 @@ def _fake_store(accounts, *, stagger: int = 0):
 
 
 @pytest.mark.asyncio
-async def test_round_only_visits_billing_allowed_accounts(monkeypatch):
+async def test_round_visits_claimable_accounts_including_disabled(monkeypatch):
     visited: list[str] = []
     refreshed: list[str] = []
     accounts = [
         _FakeAccount("ok-1", billing=True),
-        _FakeAccount("cooling", billing=False),
-        _FakeAccount("banned", billing=False),
+        _FakeAccount("cooling", billing=False, claim=False),
+        _FakeAccount("banned", billing=False, claim=False),
+        # 停用的好票：不参与对话轮询（billing=False），但领取不能落下
+        _FakeAccount("disabled-good", billing=False, claim=True),
         _FakeAccount("ok-2", billing=True),
     ]
 
     async def fake_auto_claim(acc, *, skip_plan_ids=None):
         visited.append(acc.id)
-        return [{"account_id": acc.id, "ok": acc.id == "ok-1"}] if acc.id == "ok-1" else []
+        return ([{"account_id": acc.id, "ok": True}]
+                if acc.id in ("ok-1", "disabled-good") else [])
 
     async def fake_refresh(batch):
         refreshed.extend(a.id for a in batch)
@@ -78,8 +87,9 @@ async def test_round_only_visits_billing_allowed_accounts(monkeypatch):
     manager = ClaimRoundManager()
     await manager._round()
 
-    assert visited == ["ok-1", "ok-2"], "冷却/停用账号必须先被 allows_billing 过滤"
-    assert refreshed == ["ok-1"], "仅真正领到套餐的账号触发额度刷新"
+    assert visited == ["ok-1", "disabled-good", "ok-2"], \
+        "冷却/风控封禁账号过滤，但停用的好票必须进轮次"
+    assert refreshed == ["ok-1", "disabled-good"], "领到套餐的账号（含停用）立即刷新"
 
 
 @pytest.mark.asyncio
@@ -241,10 +251,10 @@ async def test_auto_claim_generic_exception_appends_outcome(monkeypatch):
     async def fake_activation(a):
         return None
 
-    async def fake_preview(a):
+    async def fake_preview(a, **kwargs):
         return [{"plan_id": "p-1", "name": "P", "grants": [], "priority": 0}]
 
-    async def fake_claim(a, plan_id=None):
+    async def fake_claim(a, plan_id=None, **kwargs):
         raise RuntimeError("solver exploded")
 
     monkeypatch.setattr(claim_module, "report_activation_events", fake_activation)
@@ -271,7 +281,7 @@ async def test_activation_daily_gate_and_ordering(monkeypatch):
         order.append("activation")
         return None
 
-    async def fake_preview(a):
+    async def fake_preview(a, **kwargs):
         order.append("preview")
         return []
 
@@ -305,7 +315,7 @@ async def test_activation_failure_retries_next_round(monkeypatch):
         calls.append(1)
         return "上游 500"
 
-    async def fake_preview(a):
+    async def fake_preview(a, **kwargs):
         return []
 
     monkeypatch.setattr(claim_module, "report_activation_events", failing_activation)
@@ -333,7 +343,7 @@ async def test_activation_reports_again_next_day(monkeypatch):
         calls.append(1)
         return None
 
-    async def fake_preview(a):
+    async def fake_preview(a, **kwargs):
         return []
 
     monkeypatch.setattr(claim_module, "report_activation_events", fake_activation)
@@ -366,13 +376,13 @@ async def test_auto_claim_skip_plan_ids_skips_claim_only(monkeypatch):
     async def fake_activation(a):
         return None
 
-    async def fake_preview(a):
+    async def fake_preview(a, **kwargs):
         return [
             {"plan_id": "p-held", "name": "Held", "grants": [], "priority": 1},
             {"plan_id": "p-new", "name": "New", "grants": [], "priority": 0},
         ]
 
-    async def fake_claim(a, plan_id=None):
+    async def fake_claim(a, plan_id=None, **kwargs):
         claimed.append(plan_id)
         return {"plan_id": plan_id, "plan_name": plan_id, "grants": [],
                 "starts_at": None, "ends_at": None, "server_time": None}

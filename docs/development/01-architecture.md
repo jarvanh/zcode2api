@@ -138,7 +138,7 @@ client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
 ```
 入池（Web/CLI）、后台「领取」或周期领取轮（ClaimRoundManager，
 claim_round_interval 默认 600s，meta 表可改，0 = 关）：
-  JWT 且 allows_billing → 激活上报 → GET billing/preview（Bearer JWT + 每账号 X-Device-Mid）
+  JWT 且 allows_claim（手动停用的好票也要领；废 JWT/冷却/风控封禁仍排除）→ 激活上报 → GET billing/preview（Bearer JWT + 每账号 X-Device-Mid）
   ├─ 无可领套餐 → 结束
   ├─ 有可领 → 取验证码 verifyParam → POST billing/claim
   │    ├─ 1003 已领取 / 1002 结束 → 记失败文案
