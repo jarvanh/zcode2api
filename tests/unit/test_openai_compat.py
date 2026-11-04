@@ -281,3 +281,103 @@ class TestJsonModeAndEffort:
             "reasoning_effort": "unlimited",
         })
         assert "output_config" not in body
+
+
+class TestCacheUsageAccounting:
+    """缓存命中必须正确传给下游（2026-11-04 实测缺陷）。
+
+    上游 Anthropic 口径 input_tokens 不含缓存，OpenAI 口径 prompt_tokens 含；
+    下游 OmniRoute 用 `??` 链读命中数，0 会短路，因此真实值必须写进全部别名。
+    """
+
+    def test_non_stream_hit_exposes_all_aliases(self):
+        usage = anthropic_to_openai({
+            "id": "msg_1", "model": "GLM-5.3-Flash", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "OK"}],
+            # 实测第 2 次同前缀：input=43 + cache=47552 → 真实输入 47595
+            "usage": {"input_tokens": 43, "output_tokens": 16,
+                      "cache_read_input_tokens": 47552,
+                      "cache_creation_input_tokens": 0},
+        }, "GLM-5.3-Flash")["usage"]
+        assert usage["prompt_tokens"] == 47595
+        assert usage["total_tokens"] == 47595 + 16
+        assert usage["cached_tokens"] == 47552
+        assert usage["cache_read_input_tokens"] == 47552
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 47552
+        # 写入量为 0 时不伪造 cache_creation 别名
+        assert "cache_creation_input_tokens" not in usage
+
+    def test_non_stream_miss_does_not_fabricate(self):
+        usage = anthropic_to_openai({
+            "id": "msg_2", "model": "m", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {"input_tokens": 46699, "output_tokens": 16,
+                      "cache_read_input_tokens": 0},
+        }, "m")["usage"]
+        assert usage["prompt_tokens"] == 46699
+        assert "cached_tokens" not in usage
+        assert "prompt_tokens_details" not in usage
+
+    def test_non_stream_nested_details_fallback(self):
+        usage = anthropic_to_openai({
+            "id": "msg_3", "model": "m", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "OK"}],
+            "usage": {"input_tokens": 100, "output_tokens": 5,
+                      "prompt_tokens_details": {"cached_tokens": 900}},
+        }, "m")["usage"]
+        assert usage["prompt_tokens"] == 1000
+        assert usage["cached_tokens"] == 900
+
+    def test_stream_hit_in_final_usage(self):
+        conv = StreamConverter("m")
+        conv.feed_events({"type": "message_start", "message": {
+            "id": "msg_s", "usage": {"input_tokens": 43, "cache_read_input_tokens": 47552}}})
+        events = conv.feed_events({"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn"},
+                                   "usage": {"output_tokens": 20}})
+        usage = events[-1]["usage"]
+        assert usage["prompt_tokens"] == 47595
+        assert usage["completion_tokens"] == 20
+        assert usage["cached_tokens"] == 47552
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 47552
+        # 网关自身 reqlog 读 conv.usage，口径必须与对外一致
+        assert conv.usage["prompt_tokens"] == 47595
+
+    def test_stream_prompt_tokens_from_message_delta(self):
+        """回归：GLM 流式在 message_start 不给 input_tokens，实测 8346 条流水 in 全为 0。"""
+        conv = StreamConverter("m")
+        conv.feed_events({"type": "message_start", "message": {"id": "msg_t", "usage": {"input_tokens": 0}}})
+        assert conv.usage["prompt_tokens"] == 0
+        events = conv.feed_events({"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn"},
+                                   "usage": {"input_tokens": 43, "output_tokens": 8,
+                                             "cache_read_input_tokens": 47552}})
+        usage = events[-1]["usage"]
+        # 实测：message_delta 的 input_tokens=43 不含缓存，真实输入 43+47552=47595
+        assert usage["prompt_tokens"] == 47595
+        assert usage["cached_tokens"] == 47552
+        assert conv.usage["prompt_tokens"] == 47595
+
+    def test_stream_miss_keeps_zero_without_aliases(self):
+        conv = StreamConverter("m")
+        conv.feed_events({"type": "message_start", "message": {
+            "id": "msg_u", "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0}}})
+        events = conv.feed_events({"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn"},
+                                   "usage": {"output_tokens": 3}})
+        usage = events[-1]["usage"]
+        assert usage["prompt_tokens"] == 1000
+        assert "cached_tokens" not in usage
+        assert "cache_read_input_tokens" not in usage
+
+    def test_stream_cache_creation_alias(self):
+        conv = StreamConverter("m")
+        conv.feed_events({"type": "message_start", "message": {
+            "id": "msg_v", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 4096}}})
+        events = conv.feed_events({"type": "message_delta",
+                                   "delta": {"stop_reason": "end_turn"},
+                                   "usage": {"output_tokens": 1}})
+        usage = events[-1]["usage"]
+        assert usage["cache_creation_input_tokens"] == 4096
+        assert usage["prompt_tokens_details"]["cache_creation_tokens"] == 4096
+        assert usage["prompt_tokens"] == 10 + 4096

@@ -30,6 +30,70 @@ def _as_int(value: object) -> int | None:
         return None
 
 
+def _cache_usage(usage: dict) -> dict:
+    """提取缓存 token（读/写）。
+
+    上游 Anthropic 口径：`input_tokens` **不含**缓存部分，命中量在
+    `cache_read_input_tokens`、写入量在 `cache_creation_input_tokens`。
+    部分实现（GLM 部分通道）改放 `prompt_tokens_details.cached_tokens` /
+    `cached_tokens`，按优先级兼容。
+    """
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    cached = _as_int(usage.get("cache_read_input_tokens"))
+    if cached is None:
+        cached = _as_int(details.get("cached_tokens"))
+    if cached is None:
+        cached = _as_int(usage.get("cached_tokens"))
+    creation = _as_int(usage.get("cache_creation_input_tokens"))
+    if creation is None:
+        creation = _as_int(details.get("cache_creation_tokens"))
+    return {"cached": cached or 0, "creation": creation or 0}
+
+
+def _cache_usage_fields(cache: dict) -> dict:
+    """把缓存量写成 OpenAI 口径的全部别名字段。
+
+    下游（OmniRoute 等）读命中数用的是 `??` 链：
+      cacheRead ?? cached_tokens ?? cache_read_input_tokens
+        ?? prompt_tokens_details.cached_tokens ?? 0
+    JS 的 `??` 只在 null/undefined 时继续，**0 会被当成有效值立即返回**。
+    因此这里只在真实值 > 0 时才写别名（真 miss 保持缺省，由下游哨 0 处理），
+    绝不凭猜测伪造命中。
+    """
+    out: dict = {}
+    cached, creation = cache.get("cached") or 0, cache.get("creation") or 0
+    if cached > 0:
+        out["cached_tokens"] = cached
+        out["cache_read_input_tokens"] = cached
+        out["prompt_tokens_details"] = {"cached_tokens": cached}
+    if creation > 0:
+        out["cache_creation_input_tokens"] = creation
+        details = out.setdefault("prompt_tokens_details", {})
+        if isinstance(details, dict):
+            details["cache_creation_tokens"] = creation
+    return out
+
+
+def _openai_usage(usage: dict, input_tokens: int, output_tokens: int) -> dict:
+    """Anthropic usage → OpenAI usage。
+
+    OpenAI 的 `prompt_tokens` **包含**命中与写入的缓存 token，而 Anthropic 的
+    `input_tokens` 只算未命中部分；直接透传会把输入量算少（实测同一前缀：
+    input=46699+cache=896 与 input=43+cache=47552 的真实输入恒为 47595）。
+    """
+    cache = _cache_usage(usage)
+    prompt = input_tokens + cache["cached"] + cache["creation"]
+    result = {
+        "prompt_tokens": prompt,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt + output_tokens,
+    }
+    result.update(_cache_usage_fields(cache))
+    return result
+
+
 def _text_from_content(content: object) -> str:
     """OpenAI content（str | 分块数组）→ 纯文本。"""
     if isinstance(content, str):
@@ -244,7 +308,7 @@ def anthropic_to_openai(data: dict, model: str) -> dict:
             "message": message,
             "finish_reason": _STOP_REASON_MAP.get(data.get("stop_reason"), "stop"),
         }],
-        "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok, "total_tokens": in_tok + out_tok},
+        "usage": _openai_usage(usage, in_tok, out_tok),
     }
 
 
@@ -265,11 +329,36 @@ class StreamConverter:
         self.finish_reason: str | None = None
         # None = 上游未上报（未知），0 = 真实为零；两者语义不同
         self.usage = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+        # 上游 Anthropic 口径的未命中输入量；对外 prompt_tokens 需叠加缓存量。
+        self._input_raw: int | None = None
+        # 缓存读写量；部分上游在 message_delta 才下发，逐次采用正值。
+        self.cache = {"cached": 0, "creation": 0}
         self._tool_seq = 0
 
+    def _adopt_cache(self, usage: dict) -> None:
+        """采用上游下发的缓存量。只接受正值：已拿到的命中数不被后续 0 抹掉。"""
+        cache = _cache_usage(usage)
+        if cache["cached"] > 0:
+            self.cache["cached"] = cache["cached"]
+        if cache["creation"] > 0:
+            self.cache["creation"] = cache["creation"]
+
     def _sync_usage_total(self) -> None:
-        p, c = self.usage["prompt_tokens"], self.usage["completion_tokens"]
-        self.usage["total_tokens"] = (p or 0) + (c or 0) if p is not None or c is not None else None
+        """按 OpenAI 口径重算 prompt/total：prompt_tokens 含缓存读写量。"""
+        cached = self.cache["cached"] + self.cache["creation"]
+        completion = self.usage["completion_tokens"]
+        if self._input_raw is not None:
+            self.usage["prompt_tokens"] = self._input_raw + cached
+        elif cached:
+            self.usage["prompt_tokens"] = cached
+        prompt = self.usage["prompt_tokens"]
+        self.usage["total_tokens"] = (prompt or 0) + (completion or 0) if prompt is not None or completion is not None else None
+
+    def usage_out(self) -> dict:
+        """对外 usage：基础三字段 + 缓存全别名（下游 ?? 链需要）。"""
+        out = dict(self.usage)
+        out.update(_cache_usage_fields(self.cache))
+        return out
 
     def start_event(self) -> dict:
         return self._chunk_event({"role": "assistant", "content": ""})
@@ -292,8 +381,9 @@ class StreamConverter:
             u = msg.get("usage") or {}
             prompt = _as_int(u.get("input_tokens"))
             if prompt is not None:
-                self.usage["prompt_tokens"] = prompt
-                self._sync_usage_total()
+                self._input_raw = prompt
+            self._adopt_cache(u)
+            self._sync_usage_total()
             return []
         if etype == "content_block_start":
             block = evt.get("content_block") or {}
@@ -320,10 +410,17 @@ class StreamConverter:
         if etype == "message_delta":
             delta = evt.get("delta") or {}
             self.finish_reason = _STOP_REASON_MAP.get(delta.get("stop_reason"), "stop")
-            out = _as_int((evt.get("usage") or {}).get("output_tokens"))
+            u = evt.get("usage") or {}
+            out = _as_int(u.get("output_tokens"))
             if out is not None:
                 self.usage["completion_tokens"] = out
-                self._sync_usage_total()
+            # 部分上游（GLM 流式实测）在 message_start 给 input_tokens=0 或缺失，
+            # 真正的输入量随 message_delta 一起下发；不补采则 prompt_tokens 恒为 0。
+            prompt = _as_int(u.get("input_tokens"))
+            if prompt is not None and (self._input_raw is None or (self._input_raw == 0 and prompt > 0)):
+                self._input_raw = prompt
+            self._adopt_cache(u)
+            self._sync_usage_total()
             return [self._chunk_event({}, finish_reason=self.finish_reason)]
         return []  # content_block_stop / message_stop / ping / error 等无需产出
 
@@ -336,7 +433,7 @@ class StreamConverter:
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
         if finish_reason is not None:
-            payload["usage"] = dict(self.usage)
+            payload["usage"] = self.usage_out()
         return payload
 
 
