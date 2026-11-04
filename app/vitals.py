@@ -201,15 +201,17 @@ def snapshot(minutes: int = 10) -> dict:
 
 
 async def _loop() -> None:
-    """1s 心跳：loop_lag = 实际间隔 − 预期（越大说明 loop 被同步块拖住）。"""
-    expected = time.monotonic() + _TICK
+    """1s 心跳：loop_ms = 本轮 sleep 的实际超出量（越大说明 loop 被同步块拖住）。
+
+    ⚠️ 不能用「expected 累加器」：采样本身（/proc 扫描）有耗时，固定步长
+    累加会把这点误差永久带进后续每一轮，读数变成单调递增的时钟漂移 ——
+    线上实测 4 分钟内 0.2 → 4823ms，全是假告警（2026-11-04）。
+    改为每轮独立计量：sleep 前后各取一次 monotonic，差值减去预期 _TICK。
+    """
     while True:
+        t0 = time.monotonic()
         await asyncio.sleep(_TICK)
-        lag_ms = round((time.monotonic() - expected) * 1000, 1)
-        expected += _TICK
-        if lag_ms < 0:          # 被提前唤醒：重锚，防累积假延迟
-            expected = time.monotonic() + _TICK
-            lag_ms = 0.0
+        lag_ms = round(max(0.0, (time.monotonic() - t0 - _TICK) * 1000), 1)
         try:
             sample(lag_ms)
         except Exception as err:  # noqa: BLE001 - 心跳异常不许掉线

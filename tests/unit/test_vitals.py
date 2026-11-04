@@ -214,3 +214,34 @@ class TestHeartbeat:
             await vitals.stop()
             await vitals.stop()
         asyncio.run(scenario())
+
+
+class TestLoopLagNoDrift:
+    """2026-11-04 线上实测：expected 累加器会把采样耗时永久累积，4 分钟内
+    loop_ms 从 0.2 单调涨到 4823ms，把 cron 值守刷成假告警。"""
+
+    def test_sustained_heartbeat_lag_stays_bounded(self):
+        import asyncio
+
+        async def scenario():
+            # 压缩 tick 到 5ms，跑 30 轮足以暴露累加漂移（漂移会单调涨到 >1000ms）
+            original = vitals._TICK
+            vitals._TICK = 0.005
+            try:
+                task = vitals.start()
+                assert task is not None
+                await asyncio.sleep(0.25)
+                await vitals.stop()
+                vals = [s["loop_ms"] for s in vitals.snapshot(minutes=1)["series"]
+                        if isinstance(s.get("loop_ms"), (int, float))]
+                assert len(vals) >= 10, f"样本不足: {len(vals)}"
+                # 独立计量下每轮 lag 都是「本轮超出量」，不得形成递增趋势：
+                # 后 1/3 的均值不应显著高于前 1/3（累加器会让后者高一个数量级）
+                n = len(vals) // 3
+                early, late = sum(vals[:n]) / n, sum(vals[-n:]) / n
+                assert late < early + 50, f"loop_ms 出现时钟漂移: early={early} late={late}"
+                assert max(vals) < 200, f"单轮 lag 异常大（不应累积）: max={max(vals)}"
+            finally:
+                vitals._TICK = original
+
+        asyncio.run(scenario())
