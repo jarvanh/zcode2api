@@ -203,6 +203,10 @@ class TestCaptchaEgressSeparation:
         captured: dict[str, dict] = {}
 
         class _FakeProc:
+            # 真 asyncio 子进程必有 .pid（captcha 起 solver 后要向 vitals 登记
+            # 进程观测）；桩缺这个属性会掩盖接线错误。
+            pid = 424242
+
             async def communicate(self):
                 return b"VERIFY_PARAM=mock\n", b""
 

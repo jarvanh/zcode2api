@@ -737,7 +737,7 @@ async def messages(request: Request):
                  path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
                  probe=_probe_flag.get(), model_req=requested_model,
                  **_body_meta(body))
-    session_ctx.tag(req_id, body)
+    session_ctx.tag(req_id, body, bool(body.get("stream")))
     # 客户端指纹（上游 2.7.17，2026-11-04 排障加装）：周期短探测打线上时无法
     # 定位来源——CF 隧道绕过 nginx 无访问日志、hub 也不记录调用方。真实客户端
     # IP 以 CF-Connecting-IP 为准（经 cloudflared），直连本机时回退
@@ -1055,7 +1055,7 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Re
                  path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
                  probe=is_probe_request(request.headers), model_req=requested_model,
                  **_body_meta(payload))
-    session_ctx.tag(req_id, payload)
+    session_ctx.tag(req_id, payload, stream)
     tried: set[str] = set()
     last_error = ""
     t0 = time.time()
@@ -1215,7 +1215,7 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
                  path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
                  probe=_probe_flag.get(), model_req=requested_model,
                  **_body_meta(body))
-    session_ctx.tag(req_id, body)
+    session_ctx.tag(req_id, body, bool(payload.get("stream")))
 
     if payload.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头

@@ -466,3 +466,157 @@ class TestDedupAndLatencySplit:
         assert t["disc_rate"] == round(1 / 3 * 100, 1)
         assert "conc" in agg                     # 历史响应带并发曲线
 
+
+
+class TestAccountHealth:
+    """近端健康窗口：P95 要分钟级新鲜度，磁盘按天聚合不够。"""
+
+    def test_per_account_buckets(self):
+        for acc, ok in [("zai-131", True), ("zai-131", False), ("zai-176", True)]:
+            rid = f"h-{acc}-{ok}"
+            reqlog.begin(rid, "messages", "m", False, "")
+            reqlog.mark_account(rid, acc, "jwt")
+            if ok:
+                reqlog.finish_ok(rid, t_first=0.5)
+            else:
+                reqlog.finish_error(rid, "429", status=429, t_first=0.2)
+        h = reqlog.health(hours=1)
+        rows = {a["account"]: a for a in h["accounts"]}
+        assert rows["zai-131"]["calls"] == 2
+        assert rows["zai-131"]["ok"] == 1 and rows["zai-131"]["fail"] == 1
+        assert rows["zai-131"]["c429"] == 1
+        assert rows["zai-131"]["ttfb_p50"] is not None
+        assert rows["zai-176"]["calls"] == 1
+
+    def test_risk_and_quota_kinds_counted(self):
+        reqlog.begin("k1", "messages", "m", False, "")
+        reqlog.mark_account("k1", "zai-175", "jwt")
+        reqlog.finish_error("k1", "风控", status=405, kind="risk")
+        reqlog.begin("k2", "messages", "m", False, "")
+        reqlog.mark_account("k2", "zai-175", "jwt")
+        reqlog.finish_error("k2", "额度", status=402, kind="quota")
+        rows = {a["account"]: a for a in reqlog.health()["accounts"]}
+        assert rows["zai-175"]["risk"] == 1 and rows["zai-175"]["quota"] == 1
+
+    def test_inflight_not_counted(self):
+        """未收口请求不进健康窗口（ok 未知，混进去会压歪成功率）。"""
+        reqlog.begin("u1", "messages", "m", False, "")
+        reqlog.mark_account("u1", "zai-131", "jwt")
+        assert reqlog.health()["events"] == 0
+
+    def test_window_boundary_respects_hours(self, monkeypatch):
+        reqlog.begin("w1", "messages", "m", False, "")
+        reqlog.finish_ok("w1")
+        with reqlog._lock:
+            reqlog._recent[-1]["ts"] -= 7200        # 假装两小时前
+        assert reqlog.health(hours=1)["events"] == 0
+        assert reqlog.health(hours=3)["events"] == 1
+
+    def test_p95_not_pinned_to_max_on_small_sample(self):
+        reqlog.begin("p1", "m", "m", False, "")
+        reqlog.finish_ok("p1", t_first=0.1)
+        a = reqlog.health()["accounts"][0]
+        assert a["ttfb_p50"] == 0.1 and a["ttfb_p95"] == 0.1
+
+    def test_recent_counts_for_watchdog(self):
+        reqlog.begin("r1", "m", "m", False, "")
+        reqlog.finish_error("r1", "风控", status=405, kind="risk")
+        reqlog.begin("r2", "m", "m", False, "")
+        reqlog.finish_error("r2", "5xx", status=502)
+        reqlog.begin("r3", "m", "m", False, "")
+        reqlog.finish_error("r3", "429", status=429)
+        c = reqlog.recent_counts(minutes=10)
+        assert c["risk"] == 1 and c["c5xx"] == 1 and c["c429"] == 1
+        assert c["total"] == 3 and c["window_min"] == 10
+
+    def test_reset_clears_recent(self):
+        reqlog.begin("z1", "m", "m", False, "")
+        reqlog.finish_ok("z1")
+        reqlog._reset_for_tests()
+        assert reqlog.health()["events"] == 0
+
+
+class TestTrendAggregates:
+    """历史聚合新增：唯一客户端数 / 会话数 / 缓存命中量。"""
+
+    def test_clients_and_sessions_unique(self):
+        for i, (ip, sess) in enumerate([("1.1.1.1", "s1"), ("1.1.1.1", "s1"),
+                                        ("2.2.2.2", "s2")]):
+            rid = f"c{i}"
+            reqlog.begin(rid, "messages", "m", False, "", client_ip=ip)
+            reqlog.tag_session(rid, sess, repeat=bool(i))
+            reqlog.finish_ok(rid)
+        agg = reqlog.history(days=1)
+        assert agg["totals"]["clients_n"] == 2
+        assert agg["totals"]["sess_n"] == 2
+
+    def test_cache_rate(self):
+        reqlog.begin("x1", "messages", "m", False, "")
+        reqlog.finish_ok("x1", input_tokens=1000, cache_read=250)
+        t = reqlog.history(days=1)["totals"]
+        assert t["cache"] == 250 and t["cache_rate"] == 25.0
+
+    def test_cache_rate_none_when_input_unknown(self):
+        reqlog.begin("x2", "messages", "m", False, "")
+        reqlog.finish_ok("x2", cache_read=100)     # 无 input_tokens：分母未知
+        t = reqlog.history(days=1)["totals"]
+        assert t["cache"] == 100 and t["cache_rate"] is None
+
+    def test_daily_rows_carry_trend_fields(self):
+        reqlog.begin("d1", "messages", "m", False, "", client_ip="9.9.9.9")
+        reqlog.finish_ok("d1", input_tokens=100, cache_read=10)
+        day = reqlog.history(days=1)["daily"][-1]
+        assert day["clients_n"] == 1 and day["cache"] == 10
+
+    def test_group_rows_expose_cache(self):
+        reqlog.begin("g1", "messages", "glm", False, "")
+        reqlog.mark_account("g1", "acc", "jwt")
+        reqlog.finish_ok("g1", input_tokens=200, cache_read=50)
+        models = reqlog.history(days=1)["models"]
+        row = next(r for r in models if r["name"] == "glm")
+        assert row["cache"] == 50 and row["cache_rate"] == 25.0
+
+
+class TestWindowAndShapeAggregates:
+    """5min idle 窗口占比 + 请求形状分位（截断率要对照 max_tokens 才读得懂）。"""
+
+    def test_window_in_out_rates(self):
+        for rid, w in [("w1", "in"), ("w2", "in"), ("w3", "out"), ("w4", "")]:
+            reqlog.begin(rid, "messages", "m", False, "")
+            reqlog.tag_session(rid, "sess-x", repeat=bool(w), window=w)
+            reqlog.finish_ok(rid)
+        t = reqlog.history(days=1)["totals"]
+        assert t["sw_in"] == 2 and t["sw_out"] == 1
+        assert t["sw_in_rate"] == round(2 / 3 * 100, 1)   # 流式（空）不进分母
+
+    def test_window_rate_none_when_only_stream(self):
+        reqlog.begin("s1", "messages", "m", True, "")
+        reqlog.tag_session("s1", "k", False, "")
+        reqlog.finish_ok("s1")
+        assert reqlog.history(days=1)["totals"]["sw_in_rate"] is None
+
+    def test_shape_percentiles(self):
+        for i, (msgs, mt) in enumerate([(1, 100), (5, 4096), (9, 8192), (2, 200)]):
+            rid = f"sh{i}"
+            reqlog.begin(rid, "messages", "m", False, "", msgs=msgs, max_tokens=mt)
+            reqlog.finish_ok(rid)
+        t = reqlog.history(days=1)["totals"]
+        # _pctile 用降序取整下标（与 ttfb 同口径）：4 样本 p95 → idx 2 = 第二大
+        assert t["msgs_p50"] == 2 and t["msgs_p95"] == 5
+        assert t["maxtok_p50"] == 200 and t["maxtok_p95"] == 4096
+
+    def test_shape_none_when_unknown(self):
+        """旧历史行没有形状字段：分位必须是 None，不能假装 0。"""
+        reqlog.begin("u1", "messages", "m", False, "")
+        reqlog.finish_ok("u1")
+        t = reqlog.history(days=1)["totals"]
+        assert t["msgs_p50"] is None and t["maxtok_p95"] is None
+
+    def test_window_persisted_to_disk(self, tmp_path):
+        from pathlib import Path
+
+        reqlog.begin("p1", "messages", "m", False, "")
+        reqlog.tag_session("p1", "k1", True, "in")
+        reqlog.finish_ok("p1")
+        row = _json.loads(next(Path(tmp_path).glob("reqlog-*.jsonl")).read_text().strip())
+        assert row["sw"] == "in"

@@ -59,12 +59,13 @@
     <div class="cap-hd">
       <div>
         <div class="cap-title">实时并发</div>
-        <div class="cap-sub" id="conc-sub">四口径各自独立：在途含排队/等待，占槽只算真正压在账号上的；峰值事件驱动精确采样 · 1s 心跳</div>
+        <div class="cap-sub">四口径各自独立：在途含排队/等待，占槽只算真正压在账号上的 · 峰值事件驱动精确采样 · 1s 心跳</div>
       </div>
       <div class="cap-meta" id="conc-meta"></div>
     </div>
     <div class="stat-grid" id="conc-grid"></div>
     <div class="hist-chart conc-chart" id="conc-chart"></div>
+    <div class="vitals-row" id="vitals-row"></div>
   </div>
 
   <div class="dist-bar" id="dist-bar"></div>
@@ -87,6 +88,7 @@
       <button class="mon-tab" data-tab="channel" onclick="setTab('channel')">渠道</button>
       <button class="mon-tab" data-tab="client" onclick="setTab('client')">客户端</button>
       <button class="mon-tab" data-tab="daily" id="tab-daily" onclick="setTab('daily')">每日</button>
+      <button class="mon-tab" data-tab="health" id="tab-health" onclick="setTab('health')">号池健康</button>
       <button class="mon-tab active" data-tab="live" onclick="setTab('live')" id="tab-live">实时 <span class="mon-tab-count" id="live-count">0</span></button>
     </div>
     <div class="section-meta" id="last-updated"></div>
@@ -102,7 +104,7 @@
 let entries = [];      // 实时层：内存环形日志
 let hist = null;       // 历史层：/monitoring/history 聚合结果
 let tab = 'live';
-const state = { range: 'today', status: 'all', q: '', keep: 500 };
+const state = { range: 'today', status: 'all', q: '', keep: 500, accounts: [] };
 let pollTimer = null;
 
 // 7 / 30 天走磁盘历史聚合；其余走内存实时日志
@@ -283,14 +285,14 @@ function detailHtml(e){
     ${kv('模型', e.model_req&&e.model_req!==e.model?`${e.model_req} → ${e.model}`:e.model)}
     ${kv('账号 / 凭证', `${e.account||'—'}${e.mode?' · '+e.mode:''}`)}
     ${kv('通道 / 出口', `${e.channel||'—'}${e.egress?' · '+e.egress:''}`)}
-    ${kv('请求形状', e.msgs!=null?`${e.msgs} 条消息${e.max_tokens?` · max_tokens ${e.max_tokens}`:''}`:'')}
+    ${kv('请求形状', e.msgs!=null?`${e.msgs} 条消息${e.max_tokens?` · max_tokens ${e.max_tokens}`:''}`:'')}${e.stop_reason==='max_tokens'||e.stop_reason==='length'?`<span class="vital is-bad" title="撞 max_tokens 预算：结合上面的 max_tokens 判断是客户端给小了还是上游真的长">输出被截断</span>`:''}
     ${kv('耗时', [e.t_first!=null?`首字 ${fmtSec(e.t_first)}`:'',e.t_total!=null?`总 ${fmtSec(e.t_total)}`:'',e.t_up!=null?`净上游 ${fmtSec(e.t_up)}`:'',tps].filter(Boolean).join(' · '), true)}
     ${kv('Token', `输入 ${fmtTok(e.input_tokens)} · 输出 ${fmtTok(e.output_tokens)}${e.cache_read?` · 缓存 ${fmtTok(e.cache_read)}`:''}`)}
     ${kv('等待', waits.join(' · ')||'无')}
     ${kv('重试', retries.join(' · ')||'无')}
     ${kv('错误', `${e.err_kind||''}${e.err_code?` / 业务码 ${e.err_code}`:''}${e.error?` · ${e.error}`:''}`.trim(), true)}
     ${kv('上游追踪', e.upstream_id)}
-    ${kv('会话', e.sess?`${e.sess}${e.sess_repeat?' · 复见':''}`:'')}
+    ${kv('会话', e.sess?`${e.sess}${e.sess_repeat?' · 复见':''}${e.sess_window?` · 窗口${e.sess_window==='in'?'内':'外'}`:''}`:'')}${e.sess_window==='out'?'<span class="vital dim" title="同会话间隔超 5 分钟，上游 prompt 缓存必然重建：cache_read 上不去属正常">缓存窗口已断</span>':''}
     ${kv('探测', e.probe?'是（X-Probe）':'')}
     ${att?`<div class="mon-att-list wide"><div class="mon-k">尝试梯子</div>${att}</div>`:''}
   </div>`;
@@ -426,6 +428,39 @@ function errBlock(errors){
   </div>`;
 }
 
+// ── 号池健康（近端逐号窗口：P95 要分钟级新鲜度，磁盘按天粒度不够）──────
+let health=null;
+
+function renderHealth(){
+  const rows=(health&&health.accounts)||[];
+  const q=state.q.trim().toLowerCase();
+  const list=rows.filter(r=>!q||String(r.account).toLowerCase().includes(q));
+  const head=`<div class="mon-head mon-grid-health"><span>账号</span><span>状态</span><span>调用</span><span>成功率</span><span>429</span><span>5xx</span><span>风控</span><span>额度</span><span>P95 首字</span><span>最近请求</span></div>`;
+  const body=list.map(r=>{
+    const acc=(state.accounts||[]).find(a=>a.name===r.account)||{};
+    const st=acc.status||'—';
+    const badge=st==='active'?'badge-active':(st==='exhausted'||st==='cooling'?'badge-cooling':'badge-invalid');
+    const strike=(acc.risk_strikes?`<span class="mon-retry" title="风控 strike（退避周期内累计命中）">R${acc.risk_strikes}</span>`:'')
+      +(acc.rate_strikes?`<span class="mon-retry" title="429 重试梯耗尽次数（熔断依据）">L${acc.rate_strikes}</span>`:'')
+      +(acc.net_strikes?`<span class="mon-retry" title="连接失败次数（net 短退避）">N${acc.net_strikes}</span>`:'');
+    return `<div class="mon-row mon-grid-health"${acc.last_error?` title="${esc(acc.last_error)}"`:''}>
+      <span class="mon-name" title="${esc(acc.last_error||'')}">${esc(r.account)}${strike}</span>
+      <span><span class="badge ${badge}">${esc(st)}</span></span>
+      <span class="mon-num">${r.calls}</span>
+      <span class="mon-num">${r.calls?Math.round(r.ok/r.calls*100)+'%':'—'}</span>
+      <span class="mon-num"${r.c429?' style="color:var(--amber)"':''}>${r.c429}</span>
+      <span class="mon-num"${r.c5xx?' style="color:var(--red)"':''}>${r.c5xx}</span>
+      <span class="mon-num"${r.risk?' style="color:var(--red);font-weight:700"':''}>${r.risk}</span>
+      <span class="mon-num"${r.quota?' style="color:var(--amber)"':''}>${r.quota}</span>
+      <span class="mon-num">${r.ttfb_p95!=null?fmtSec(r.ttfb_p95):'—'}</span>
+      <span class="mon-time">${fmtTs(r.last)}</span>
+    </div>`;
+  }).join('');
+  $('list').innerHTML=list.length
+    ? `<div class="acct-table">${head}${body}</div><div class="health-foot">窗口近 ${health.hours} 小时 · 事件 ${health.events} 条（内存近端，重启清零）· 徽标 R=风控 L=限流梯 N=连接失败，悬停看 last_error</div>`
+    : `<div class="empty-state">${q?'没有匹配的近端账号':'近 '+((health&&health.hours)||1)+' 小时没有该号池请求'}</div>`;
+}
+
 function renderHistDaily(){
   const daily=hist.daily||[];
   const max=Math.max(...daily.map(d=>d.calls),1);
@@ -464,9 +499,12 @@ function render(){
   else{
     const list=filtered();
     renderStats(list);
-    if(tab==='live')renderLive();else if(tab==='daily')renderAgg('account');else renderAgg(tab);
+    if(tab==='live')renderLive();else if(tab==='daily')renderAgg('account');
+    else if(tab==='health')renderHealth();else renderAgg(tab);
   }
   renderDist();
+  // 健康表在上面的视图分支里已渲染，且 1s 心跳（renderConc）也会重画 ——
+  // 这里再调一次是重复渲染
   $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
 }
 
@@ -478,10 +516,14 @@ function syncMode(){
   $('tab-live').title=h?'磁盘历史只存已收口请求（无在途），实时页签仅用于 1 小时 / 今天':'';
   $('tab-daily').classList.toggle('is-disabled',!h);
   $('tab-daily').title=h?'':'每日聚合需要磁盘历史，请切到 7 / 30 天';
+  // 号池健康读近端事件（分钟级新鲜度），历史模式没有逐号 P95 概念 → 禁用
+  $('tab-health').classList.toggle('is-disabled',h);
+  $('tab-health').title=h?'号池健康取近端实时事件（P95 要分钟级新鲜度），1 小时 / 今天 视图可用':'';
   $('status-sel').style.display=h?'none':'';
   $('btn-clear').style.display=h?'none':'';
   $('live-dot').textContent=h?'历史聚合':'实时监控中';
   if(h&&tab==='live')tab='account';
+  if(h&&tab==='health')tab='account';
   if(!h&&tab==='daily')tab='account';
 }
 
@@ -500,7 +542,7 @@ function setRange(v){
 }
 function syncTabs(){document.querySelectorAll('.mon-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
 function setTab(t){
-  if(isHist()&&t==='live')return;
+  if(isHist()&&(t==='live'||t==='health'))return;
   if(!isHist()&&t==='daily')return;
   tab=t;syncTabs();render();
 }
@@ -514,6 +556,7 @@ async function load(){
     const res=await api('GET','/monitoring');
     entries=res.entries||[];
     state.keep=res.keep||500;
+    health=res.health||null;
   }
   render();
 }
@@ -524,8 +567,13 @@ let conc=null;
 let concTimer=null;
 
 async function loadConc(){
-  conc=await api('GET','/monitoring/concurrency');
+  const c=await api('GET','/monitoring/concurrency');
+  conc=c.conc||c;
+  vitals=c.vitals||vitals;
+  if(c.accounts)state.accounts=c.accounts;
   renderConc();
+  renderVitals();
+  if(tab==='health')renderHealth();
 }
 
 function concCell(label,val,sub,color,tip){
@@ -566,6 +614,32 @@ function renderConc(){
   }).join('');
 }
 
+// ── 进程体征行（随并发心跳一起取，省一个轮询器）────────────────────
+let vitals=null;
+
+function vcell(label,val,tip,red){
+  return `<span class="vital${red?' is-bad':''}" title="${esc(tip)}">${label} <b>${val}</b></span>`;
+}
+
+function renderVitals(){
+  const box=$('vitals-row');
+  if(!box)return;
+  if(!vitals||!vitals.now){box.innerHTML=tab==='health'?'':'<span class="vital dim">体征采样未就绪</span>';return;}
+  const v=vitals.now;
+  const rss=v.rss_mb==null?'未知':v.rss_mb+'MB';
+  // 异常态标红：僵尸堆积 / solver 后代膨胀（2026-10-05 那次 92 个 Chromium 的形态）
+  const badZ=v.zombies>0, badB=v.browser_procs>6, lag=v.loop_ms!=null&&v.loop_ms>500;
+  box.innerHTML=[
+    vcell('RSS',rss,'常驻内存：缓涨=泄漏嫌疑，骤增=大 body 缓冲（非 Linux 显示未知）'),
+    vcell('solver',v.solvers,'验证码 solver 子进程数（只登记不回收，回收权在 asyncio）',v.solvers>4),
+    vcell('浏览器进程',v.browser_procs,'solver 的全部后代（真 Chromium 及 renderer）——kill 链断时这里先于 RSS 起跳',badB),
+    vcell('僵尸',v.zombies,'已退出未被回收：持续 >0 说明 watcher/kill 链断了，会拖住优雅停机',badZ),
+    vcell('令牌池',v.pool,'验证码预解池最深一档水位'),
+    vcell('loop 延迟',(v.loop_ms==null?'—':v.loop_ms+'ms'),'事件循环被同步块拖住的时长：>500ms 说明有阻塞调用压着'),
+    `<span class="vital dim" title="采样进程 pid（Linux /proc 口径）">pid ${vitals.pid}</span>`,
+  ].join('');
+}
+
 // ── 分布条：上游码直方图 / stop_reason / 去重挡下 / 断开率 ─────────────────
 function chip(label,val,tip,color){
   return `<span class="dist-chip"${color?` style="color:${color}"`:''}${tip?` title="${esc(tip)}"`:''}>${label} <b>${val}</b></span>`;
@@ -581,6 +655,9 @@ function renderDist(){
     if(t.dedup)chips.push(chip('去重挡下',t.dedup,'不进调度的重放/合并请求数：零号压力，今天少烧的号就在这'));
     if(t.disc)chips.push(chip('客户端断开',`${t.disc} · ${t.disc_rate}%`,'499 占比高=客户端超时短于网关 TTFB','var(--red)'));
     if(t.net!=null)chips.push(chip('净上游均耗时',fmtSec(t.net),'总耗时 − 排队/重试等待：524 归因看这个'));
+    if(t.sw_in||t.sw_out)chips.push(chip('缓存窗口内',`${t.sw_in_rate}%`,`同会话间隔<5min 的复见请求占比（in ${t.sw_in} / out ${t.sw_out}）：窗口外 cache_read 上不去属正常`,''));
+    if(t.msgs_p95!=null)chips.push(chip('P95 消息数',t.msgs_p95,'请求形状 P95：判断该提 max_tokens 还是缩上下文'));
+    if(t.maxtok_p95!=null)chips.push(chip('P95 max_tokens',fmtTok(t.maxtok_p95),'预算 P95：配合截断率看'));
   }else{
     let dd=0, disc=0, done=0, netSum=0, netN=0;
     for(const e of filtered()){
@@ -599,8 +676,9 @@ function renderDist(){
     .map(([c,n])=>chip(`码 ${c}`,n,'上游状态码'+(c.includes('/')?'（含业务码）':'')+' 分布：按码设阈值比看文案准'));
   const stopRows=Object.entries(stops).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([s,n])=>{
     const cut=s==='max_tokens'||s==='length';
-    return chip(cut?`截断 ${s}`:s,n,
-      cut?'撞 max_tokens 预算的占比高=客户端预算给小了或改写有问题':(s==='refusal'?'上游内容策略拒绝':'stop_reason 分布'),'');
+    const total=Object.values(stops).reduce((a,b)=>a+b,0)||1;
+    return chip(cut?`截断 ${s}`:s,`${n}${cut?`（${(n/total*100).toFixed(1)}%）`:''}`,
+      cut?'撞 max_tokens 预算：占比高=客户端预算给小了或改写有问题；对照 P95 请求形状决定是提 max_tokens 还是缩上下文':'stop_reason 分布','');
   });
   const all=[...chips,...codeRows,...stopRows];
   $('dist-bar').innerHTML=all.length?all.join('')+'<span class="dist-note">码分布 / 截断率 / 去重收益</span>':'';

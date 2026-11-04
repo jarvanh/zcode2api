@@ -68,7 +68,8 @@ zcode-hub/
 │   ├── diaglog.py         # 失败请求诊断留存（双侧现场，3 天，/admin/api/diaglog）
 │   ├── session_ctx.py     # 会话亲和观测（observe 档：sess/cache_read 入 reqlog）
 │   ├── riskmetrics.py     # 风控事件按天统计（405/429/net/wave，risk-*.jsonl）
-│   └── reqlog.py          # 内存环形请求日志
+│   ├── reqlog.py          # 内存环形请求日志 + 并发仪表（四口径/峰值/分钟曲线）
+│   └── vitals.py          # 进程体征采样（RSS/solver 与 Chromium 后代/僵尸/池/loop 延迟）
 ├── captcha_node/          # Bun 主路径 solver-bun.ts + vendored captcha-happy.ts；回退 node solver.js
 ├── frontend/              # 后台静态页（accounts / settings / login）
 ├── tests/

@@ -86,11 +86,14 @@
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零）+ 并发快照。行字段含来源（client_ip/ua/path/probe）、通道与出口（channel/egress）、尝试梯子明细（att）、等待拆解（wait_q/rl/5xx/cap）、错误分类（err_kind/err_code）、净上游耗时（t_up）与去重标记（dedup） |
-| `GET /admin/api/monitoring/concurrency` | 实时并发四口径（client 在途 / slot 上游占槽 / queue 排队 / per 每账号 n÷limit）+ 启动以来峰值 + 当日分钟曲线（事件驱动精确采样，1s 心跳） |
+| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零）+ 并发快照 + 近端健康窗口。行字段含来源（client_ip/ua/path/probe）、通道与出口（channel/egress）、尝试梯子明细（att）、等待拆解（wait_q/rl/5xx/cap）、错误分类（err_kind/err_code）、净上游耗时（t_up）与去重标记（dedup） |
+| `GET /admin/api/monitoring/concurrency` | **面板 1s 心跳包**：并发四口径（client 在途 / slot 上游占槽 / queue 排队 / per 每账号 n÷limit）+ 启动峰值 + 当日分钟曲线 + `vitals` 进程体征 + `accounts` 运行侧徽标（同拍快照，交叉判读不错位） |
 | `GET /admin/api/monitoring/concurrency/history?days=N` | 磁盘并发曲线：逐日峰值 + 最近一天分钟级（峰值不因重启丢；单文件 ≤1440 行，随 HISTORY_DAYS 清理） |
-| `GET /admin/api/monitoring/history?days=N` | 磁盘历史聚合（1–30 天）：按天曲线 + accounts/models/channels/clients 分组 + 错误 TOP（只回统计不回明细） |
-| `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比/首见 vs 复见的 cache_read 均值对比 |
+| `GET /admin/api/monitoring/health?hours=N` | 近端逐号健康窗口（上限 24h）：P50/P95 首字、429/5xx/风控/额度计数。与 history 分工：那边按天读磁盘看趋势，这边答「这个号现在还能不能用」（P95 要分钟级新鲜度） |
+| `GET /admin/api/monitoring/vitals` | 进程体征：RSS / solver 与 Chromium 后代进程数 / 僵尸数 / 令牌池水位 / 事件循环延迟（Linux /proc 口径，零新依赖，不抢子进程回收权） |
+| `GET /admin/api/monitoring/watch` | **值守脚本单一数据源**：conc + recent(10min 风控/5xx/429) + vitals + health + accounts；只出数不做阈值判断（阈值与降噪在主机侧 cron，token 不入仓） |
+| `GET /admin/api/monitoring/history?days=N` | 磁盘历史聚合（1–30 天）：按天曲线 + accounts/models/channels/clients 分组 + 错误 TOP + 码直方图/stop_reason/去重数/断开率/净耗时/唯一客户端与会话数，并内嵌 `conc` 并发曲线（只回统计不回明细） |
+| `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比 + cache_read **三档**均值（首见 / 窗口内复见 / 窗口外复见）。判读看 `cache_read_repeat_in_avg` 对 `cache_read_first_avg`；窗口外那档只用来解释「整体复见为何不涨」。旧字段 `cache_read_repeat_avg` 保持混档原义（向后兼容） |
 | `POST /admin/api/monitoring/clear` | 清空监控 |
 | `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency` |
 | `PUT /admin/api/settings` | 改密钥、刷新间隔、并发上限（改后即生效，落 meta 表；并发 0 = 不限）。前端回填的掩码（含 `…` 或 `••••`）忽略不覆盖；网关 key 传空字符串表示关闭校验 |

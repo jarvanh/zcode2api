@@ -31,7 +31,7 @@ import time
 
 import httpx
 
-from . import captcha_ledger, constants, egress, logs, settings
+from . import captcha_ledger, constants, egress, logs, settings, vitals
 from .store import store
 
 # 池参数：真浏览器求解重（10–40s/枚），默认 min1/max2 见 settings 注释
@@ -755,6 +755,10 @@ class CaptchaManager:
             # Chromium 都起不来，Cloudflare 侧表现为 524 超时）。
             start_new_session=True,
         )
+        # 体征登记：solver 及其 Chromium 后代的堆积形态（2026-10-05 实测 92 个
+        # 孤儿浏览器吃 27.6GB RSS）由 app/vitals 每秒观测；只登记不收割——
+        # 回收权属于 asyncio 子进程 watcher，抢 wait 会让停机挂死。
+        vitals.register_child(proc.pid)
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
         except TimeoutError:

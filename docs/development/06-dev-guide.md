@@ -88,6 +88,9 @@ stdout_logfile=/personal/zcode-hub/logs/out.log
 
 | 症状 | 排查 |
 |------|------|
+| 「请求慢」归因 | 监控页行点开看 `t_up`（净上游耗时 = 总耗时 − 排队/429/5xx/铸码等待）：净耗时大=上游慢，等待大=号池调度在等；再对照并发面板四口径（在途高但占槽 0 = 全在等，不在跑）。逼近 CDN 100s 红线（524）优先看等待拆解 |
+| 优雅停机挂住 / restart 超时被 SIGKILL | 监控页体征行看 `僵尸` 与 `浏览器进程`：僵尸持续 >0 = asyncio 子进程回收链断了；solver 后代膨胀 = Chromium 未被 `_kill_solver_tree` 收干净（2026-10-05 形态：92 进程 / 27.6GB，RSS 曲线早于日志可见）。app/vitals 只登记不 waitpid，回收权始终在 asyncio watcher |
+| 告警刷屏 / 该报的没报 | 值守脚本 `~/.openclaw/workspace/tools/zcode2api-watch-dog.sh`：去重键是「触发规则集合」而非全文（数值每轮变，按全文算会让抑制窗口形同虚设）；号池全灭走独立 6h 窗口（日额度耗尽是设计内状态，北京 23:00 重置）。排障用 `WATCH_DRY=1 WATCH_JSON_FILE=预设.json bash ...` 离线跑判定 |
 | 全部请求 503 no_available_account | `GET /admin/api/pool` 看状态分布；`billing` 端点 401 多为 JWT 过期（需重登）而非无额度 |
 | 验证码连续失败 | 先查 `GET /admin/api/captcha/ledger?days=7` 按路线看成功率与均耗时，定位是哪条路线在塌；再确认 `captcha_node/node_modules` 已装、bun 在 `~/.bun/bin/bun`；`ZCODE_CAPTCHA_TIMEOUT` 调大；pe 字节码失速时看日志 stderr 末段诊断（solver stderr 已捕获） |
 | 额度一直是 0 / 401 | WAF 拦截：检查是否带全套身仿真头；错峰参数是否被调成 0 |

@@ -7,7 +7,8 @@
 observe 档（SESSION_OBSERVE，默认开）绝不改变任何请求行为：
   - 会话键 = sha256(model + system + 首条 user 消息)[0:16]——无状态前缀哈希，
     同一会话的请求（system 稳定 + 首条消息即会话起点）稳定落在同键；
-  - 每请求在 reqlog 行上落 sess（会话键）与 sess_repeat（24h 内非首见）；
+  - 每请求在 reqlog 行上落 sess（会话键）、sess_repeat（24h 内非首见）与
+    sess_window（5min idle 窗口归属：in/out/空）；
   - 响应侧落 cache_read（上游回传的缓存命中 token 数，reqlog.finish_ok）；
   - summary() 聚合近 N 天：首见 vs 复见请求的 cache_read 均值对比——
     复见显著更高才值得做 enforce 档（转发稳定 session id）。
@@ -35,6 +36,11 @@ from . import settings
 
 _TTL = 24 * 3600
 _MAX_KEYS = 4096
+
+# 上游 prompt cache 的 idle 窗口（官方形态：同一会话连续请求间隔 <5min 才复用
+# system prompt 缓存）。超过即认定窗口已断，缓存必然重建 —— 这是 cache_read
+# 高低的**解释变量**：复见但窗口外，cache_read 上不去属正常，不是缓存坏了。
+_IDLE_WINDOW = 5 * 60
 
 _lock = threading.Lock()
 _seen: dict[str, float] = {}  # sess_key → last_seen（monotonic）
@@ -65,8 +71,16 @@ def session_key(body: dict) -> str | None:
         return None
 
 
-def observe(body: dict) -> tuple[str, bool] | None:
-    """判定 (sess_key, repeat)。repeat = 该键 24h 内出现过。"""
+def observe(body: dict) -> tuple[str, bool, str] | None:
+    """判定 (sess_key, repeat, window)。
+
+    repeat = 该键 24h 内出现过（会话归属）；
+    window = "in"  —— 复见且间隔 <5min：缓存窗口仍在，system prompt 可复用；
+             "out" —— 复见但间隔 ≥5min：窗口已断，本次缓存必然重建；
+             ""    —— 首见（无上一请求可比）或流式（调用方不写该字段）。
+    流式在本档**不参与窗口判定**：长会话流式两次请求间隔超 5min 是常态，
+    判成 out 是假阴性，会污染 sw_in_rate 的解读（见 tag()）。
+    """
     key = session_key(body)
     if key is None:
         return None
@@ -78,7 +92,9 @@ def observe(body: dict) -> tuple[str, bool] | None:
             cutoff = now - _TTL
             for k in [k for k, t in _seen.items() if t <= cutoff][: len(_seen) - _MAX_KEYS]:
                 _seen.pop(k, None)
-    return key, prev is not None and (now - prev) < _TTL
+    if prev is None or (now - prev) >= _TTL:
+        return key, False, ""
+    return key, True, ("in" if (now - prev) < _IDLE_WINDOW else "out")
 
 
 def _stable_session_id(key: str) -> str:
@@ -103,12 +119,18 @@ def current_session() -> str | None:
     return entry[1] if entry else None
 
 
-def tag(req_id: str, body: dict) -> None:
+def tag(req_id: str, body: dict, stream: bool = False) -> None:
     """观测 + enforce 装载（best-effort，观测绝不影响请求可用性）。
 
     observe：写 reqlog 在途条目（SESSION_OBSERVE 门控）；
     enforce：把 (会话键, 稳定 session id) 挂到本请求 context，供
     build_request 经 current_session() 取用（SESSION_AFFINITY 门控）。
+
+    stream=True 时**不写窗口字段**（sess/sess_repeat 照写）：窗口判定要求同
+    会话间隔 <5min，而长会话流式两次请求间隔超 5min 是常态，判 out 属于
+    假阴性，会把 sw_in_rate 的解释力打掉。宁可留空（面板显示「—」）也不出
+    假数。三个入口调用点都显式传 stream（不用 body 默认值推断：
+    /v1/messages 的 payload 与转换后 body 分属两个对象，猜错即漏标）。
     """
     if not (settings.SESSION_OBSERVE or settings.SESSION_AFFINITY):
         return
@@ -121,7 +143,7 @@ def tag(req_id: str, body: dict) -> None:
         if settings.SESSION_OBSERVE:
             from . import reqlog
 
-            reqlog.tag_session(req_id, obs[0], obs[1])
+            reqlog.tag_session(req_id, obs[0], obs[1], "" if stream else obs[2])
     except Exception:  # noqa: BLE001 - 纯观测绝不影响请求
         pass
 
@@ -133,11 +155,17 @@ def reset_for_tests() -> None:
 
 
 def summary(days: int = 7) -> dict:
-    """聚合近 N 天 reqlog：首见 vs 复见请求的 cache_read 均值对比。
+    """聚合近 N 天 reqlog：首见 / 窗口内复见 / 窗口外复见 三档 cache_read 对比。
 
     判读：复见的 cache_read 均值显著高于首见（且复见占比高）才值得做
     enforce 档（转发稳定 session id）；差异不大则本观测就是终点——省掉
     一次无意义的自创节奏。纯读盘 best-effort。
+
+    为什么拆三档（2026-11-04）：旧口径把「复见」混成一档，会把窗口外
+    （间隔 ≥5min，缓存必然已重建）的请求算进来拉低均值 —— 于是
+    「复见 ≈ 首见」既可能是 enforce 真没用，也可能只是节奏太散。三档拆开
+    才分得清：看 `cache_read_repeat_in_avg` 对 `cache_read_first_avg`，
+    窗口外那一档只用来解释「为什么整体复见不涨」。
     """
     from datetime import datetime, timedelta, timezone
 
@@ -146,7 +174,10 @@ def summary(days: int = 7) -> dict:
     bj = timezone(timedelta(hours=8))
     first_vals: list[int] = []
     repeat_vals: list[int] = []
+    repeat_in_vals: list[int] = []
+    repeat_out_vals: list[int] = []
     requests = 0
+    win_in = win_out = 0
     sessions: set[str] = set()
     now_day = datetime.now(bj)
     for i in range(days):
@@ -167,10 +198,23 @@ def summary(days: int = 7) -> dict:
                 continue
             requests += 1
             sessions.add(r["sess"])
+            if r.get("sw") == "in":
+                win_in += 1
+            elif r.get("sw") == "out":
+                win_out += 1
             cr = r.get("cache_read")
             if not isinstance(cr, (int, float)):
                 continue
-            (repeat_vals if r.get("sess_repeat") else first_vals).append(int(cr))
+            if r.get("sess_repeat"):
+                repeat_vals.append(int(cr))
+                # 旧数据无 sw 字段：归入「未知」，**不**塞进 in 档 —— 否则
+                # 会把窗口内均值往有利方向偏，得出「enforce 有效」的假结论
+                if r.get("sw") == "in":
+                    repeat_in_vals.append(int(cr))
+                elif r.get("sw") == "out":
+                    repeat_out_vals.append(int(cr))
+            else:
+                first_vals.append(int(cr))
 
     def _avg(vals: list[int]) -> float | None:
         return round(sum(vals) / len(vals), 1) if vals else None
@@ -183,6 +227,14 @@ def summary(days: int = 7) -> dict:
         if (first_vals or repeat_vals) else None,
         "cache_read_first_avg": _avg(first_vals),
         "cache_read_repeat_avg": _avg(repeat_vals),
+        # 三档判读口径（新字段向后兼容：旧调用方读 repeat_avg 照旧）
+        "cache_read_repeat_in_avg": _avg(repeat_in_vals),
+        "cache_read_repeat_out_avg": _avg(repeat_out_vals),
+        "window_in": win_in,
+        "window_out": win_out,
+        "window_in_rate": round(win_in / (win_in + win_out) * 100, 1) if (win_in + win_out) else None,
         "first_samples": len(first_vals),
         "repeat_samples": len(repeat_vals),
+        "repeat_in_samples": len(repeat_in_vals),
+        "repeat_out_samples": len(repeat_out_vals),
     }

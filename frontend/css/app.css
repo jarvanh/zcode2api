@@ -447,3 +447,17 @@ select.input option{background:var(--panel);color:var(--ink)}
 .dist-note{margin-left:auto;color:var(--ink-mute);font-size:10.5px;letter-spacing:.04em}
 @media (max-width:960px){.dist-note{display:none}.conc-chart{height:84px}}
 .mon-dedup{display:inline-block;margin-left:5px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--blue-a14);color:var(--blue);font-weight:600}
+/* ── 进程体征行 + 号池健康（2026-11-04 第三批）── */
+.vitals-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--hairline-soft)}
+.vital{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:8px;background:var(--panel-2);border:1px solid var(--hairline-soft);font-size:11px;color:var(--ink-mute);font-family:var(--mono)}
+.vital b{color:var(--ink-dim);font-weight:600}
+.vital.is-bad{border-color:var(--red);background:rgba(230,80,80,.12)}
+.vital.is-bad b{color:var(--red)}
+.vital.dim{opacity:.65}
+.mon-grid-health{grid-template-columns:minmax(150px,1.4fr) 92px 64px 84px 56px 56px 56px 56px 96px 130px}
+.health-foot{padding:9px 16px;font-size:11px;color:var(--ink-mute);border:1px solid var(--hairline-soft);border-top:none;border-radius:0 0 10px 10px;background:var(--panel)}
+@media (max-width:960px){
+  .mon-grid-health{grid-template-columns:minmax(120px,1.4fr) 84px 56px 72px 56px 56px 1fr}
+  .mon-grid-health > :nth-child(n+8){display:none}
+  .vitals-row{gap:6px}
+}

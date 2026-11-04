@@ -489,3 +489,95 @@ class TestDedupReplayClosesEntry:
         # 实时并发读数不得被滞留条目污染
         conc = (await client.get("/admin/api/monitoring/concurrency", headers=ADMIN_AUTH)).json()
         assert conc["now"]["client"] == 0
+
+
+@pytest.mark.integration
+class TestHealthAndVitalsEndpoints:
+    """号池健康 / 进程体征 / 值守数据源三个端点的契约。"""
+
+    async def test_monitoring_carries_health(self, gateway_client, fresh_app):
+        """主刷新端点内含健康窗口：前端不必为 P95 再开一个定时器。"""
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E1_JWT, name="mon-mh")
+        await client.post("/v1/messages", json={
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
+        })
+        data = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()
+        assert "health" in data and "conc" in data
+        assert any(a["account"] == "mon-mh" for a in data["health"]["accounts"])
+
+    async def test_conc_packet_carries_vitals_and_accounts(self, gateway_client, fresh_app):
+        """1s 心跳一次往返拿齐并发+体征+账号徽标（同拍快照，交叉判读不错位）。"""
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E2_JWT, name="mon-vt")
+        data = (await client.get("/admin/api/monitoring/concurrency",
+                                 headers=ADMIN_AUTH)).json()
+        assert {"now", "peak", "minutes", "vitals", "accounts"} <= set(data)
+        for key in ("rss_mb", "solvers", "zombies", "browser_procs", "pool", "loop_ms"):
+            assert key in data["vitals"]["now"]
+        assert any(a["name"] == "mon-vt" for a in data["accounts"])
+
+    async def test_health_endpoint_shape(self, gateway_client, fresh_app):
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E1_JWT, name="mon-h")
+        await client.post("/v1/messages", json={
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
+        })
+        data = (await client.get("/admin/api/monitoring/health", headers=ADMIN_AUTH)).json()
+        assert {"hours", "since", "accounts", "events"} <= set(data)
+        row = next(a for a in data["accounts"] if a["account"] == "mon-h")
+        assert row["calls"] >= 1 and row["ok"] >= 1
+        assert row["ttfb_p95"] is not None
+
+    async def test_health_hours_clamped(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/health?hours=9999",
+                                 headers=ADMIN_AUTH)).json()
+        assert data["hours"] == 24.0
+
+    async def test_vitals_endpoint_shape(self, gateway_client):
+        client, _ = gateway_client
+        from app import vitals
+
+        vitals.sample(loop_lag_ms=1.0)
+        data = (await client.get("/admin/api/monitoring/vitals", headers=ADMIN_AUTH)).json()
+        for key in ("now", "series", "tick", "linux", "pid"):
+            assert key in data
+        for key in ("rss_mb", "solvers", "zombies", "browser_procs", "pool", "loop_ms"):
+            assert key in data["now"]
+
+    async def test_watch_endpoint_is_single_source_for_dog(self, gateway_client, fresh_app):
+        """值守脚本靠这一个端点拿齐判定材料（含账号 strikes 与状态字符串）。"""
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E2_JWT, name="mon-watch")
+        await client.post("/v1/messages", json={
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
+        })
+        data = (await client.get("/admin/api/monitoring/watch", headers=ADMIN_AUTH)).json()
+        assert {"conc", "recent", "vitals", "health", "accounts"} <= set(data)
+        acc = next(a for a in data["accounts"] if a["name"] == "mon-watch")
+        # Status 是字符串常量类：必须是纯字符串（曾因 .value 让端点 500）
+        assert isinstance(acc["status"], str)
+        assert {"risk_strikes", "rate_strikes", "net_strikes", "enabled"} <= set(acc)
+        assert "total" in data["recent"]
+
+    async def test_history_exposes_trend_fields(self, gateway_client, fresh_app):
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E3_JWT, name="mon-trend")
+        await client.post("/v1/messages", json={
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
+        }, headers={"CF-Connecting-IP": "5.6.7.8"})
+        t = (await client.get("/admin/api/monitoring/history?days=1",
+                             headers=ADMIN_AUTH)).json()["totals"]
+        for key in ("cache", "cache_rate", "clients_n", "sess_n"):
+            assert key in t

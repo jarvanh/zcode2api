@@ -59,6 +59,11 @@ def _clip(value, limit: int) -> str:
 _lock = threading.Lock()
 _entries: deque = deque(maxlen=KEEP)
 _inflight: dict[str, dict] = {}
+# 终态事件轻量副本（账号健康窗口与阈值值守的共用源）：只留排障要的 6 个字段，
+# 与 500 条实时层解耦 —— 健康度要的是「近 1 小时全量」，500 条在高流量下只
+# 覆盖几分钟，不够算 P95。上限 8000 条约等于单进程数小时流量，内存 <2MB。
+HEALTH_KEEP = 8000
+_recent: deque = deque(maxlen=HEALTH_KEEP)
 
 _hist_lock = threading.Lock()
 _last_prune_day = ""
@@ -360,6 +365,7 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "cache_read": None,
         "sess": None,
         "sess_repeat": None,
+        "sess_window": "",
         "upstream_id": "",
         "stop_reason": None,
         "t_up": None,
@@ -373,13 +379,19 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         _bump_minute_locked()
 
 
-def tag_session(req_id: str, sess_key: str, repeat: bool) -> None:
-    """会话亲和观测（observe 档，app/session_ctx.py）：会话键 + 是否复见。"""
+def tag_session(req_id: str, sess_key: str, repeat: bool, window: str = "") -> None:
+    """会话亲和观测（observe 档，app/session_ctx.py）：会话键 + 是否复见 + 窗口归属。
+
+    window ∈ {"", "in", "out"}：空=流式（本档不观测，24h 内至少一个 idle >30min
+    属常态，判「窗口外」是假阴性）；in=落在 5min idle 窗口内，system prompt
+    缓存可复用；out=窗口已断，缓存必然重建。
+    """
     with _lock:
         entry = _inflight.get(req_id)
         if entry is not None:
             entry["sess"] = sess_key
             entry["sess_repeat"] = bool(repeat)
+            entry["sess_window"] = _clip(window, 4)
 
 
 def mark_account(req_id: str, account_name: str, mode: str) -> None:
@@ -525,6 +537,9 @@ def finish_ok(req_id: str, t_first: float | None = None,
         if stop_reason:
             entry["stop_reason"] = _clip(stop_reason, 20)
         entry["t_up"] = _net_up(entry)
+        _recent.append({"ts": entry["ts"], "acc": entry.get("account") or "",
+                        "ok": True, "status": entry.get("status"),
+                        "tf": entry.get("t_first"), "kind": ""})
         row = dict(entry)
     _persist(row)
 
@@ -547,6 +562,10 @@ def finish_error(req_id: str, error: str, status: int | None = None,
             entry["err_kind"] = _clip(kind, 20)
         entry["t_up"] = _net_up(entry)
         _conc["client"] = len(_inflight)
+        _recent.append({"ts": entry["ts"], "acc": entry.get("account") or "",
+                        "ok": False, "status": entry.get("status"),
+                        "tf": entry.get("t_first"),
+                        "kind": entry.get("err_kind") or ""})
         row = dict(entry)
     _persist(row)
 
@@ -562,6 +581,7 @@ def _reset_for_tests() -> None:
     with _lock:
         _entries.clear()
         _inflight.clear()
+        _recent.clear()
         _queue_now = 0
         _conc.clear()
         _conc.update({"client": 0, "slot": 0, "queue": 0, "limit": 0, "per": {}})
@@ -571,6 +591,64 @@ def _reset_for_tests() -> None:
         _conc_day = ""
         _conc_flushed = -1
         _pending_flush.clear()
+
+
+def health(hours: float = 1.0) -> dict:
+    """近 hours 小时的逐账号健康窗口（面板「号池健康」页签数据源）。
+
+    与 history() 的区别：history 读磁盘聚合 7/30 天看趋势，这里读内存近端
+    事件算「现在这个号还能不能用」——P95 需要分钟级新鲜度，磁盘聚合粒度
+    （按天）不够；重启清零可接受（重启后一小时内自然重建）。
+    """
+    cutoff = time.time() - hours * 3600
+    with _lock:
+        rows = [r for r in _recent if r["ts"] >= cutoff]
+    per: dict[str, dict] = {}
+    for r in rows:
+        key = r["acc"] or "—"
+        b = per.setdefault(key, {"account": key, "calls": 0, "ok": 0, "fail": 0,
+                                 "c429": 0, "c5xx": 0, "risk": 0, "quota": 0,
+                                 "tf": [], "last": 0.0})
+        b["calls"] += 1
+        if r["ok"]:
+            b["ok"] += 1
+        else:
+            b["fail"] += 1
+        st = r.get("status") or 0
+        if st == 429:
+            b["c429"] += 1
+        elif st >= 500:
+            b["c5xx"] += 1
+        if r.get("kind") == "risk":
+            b["risk"] += 1
+        if r.get("kind") == "quota":
+            b["quota"] += 1
+        if isinstance(r.get("tf"), (int, float)):
+            b["tf"].append(float(r["tf"]))
+        if r["ts"] > b["last"]:
+            b["last"] = r["ts"]
+    out = []
+    for b in per.values():
+        tf = sorted(b.pop("tf"))
+        p50 = tf[len(tf) // 2] if tf else None
+        p95 = tf[min(len(tf) - 1, int((len(tf) - 1) * 0.95))] if tf else None
+        b["ttfb_p50"] = round(p50, 3) if p50 is not None else None
+        b["ttfb_p95"] = round(p95, 3) if p95 is not None else None
+        out.append(b)
+    out.sort(key=lambda x: (-x["calls"], x["account"]))
+    return {"hours": hours, "since": cutoff, "accounts": out, "events": len(rows)}
+
+
+def recent_counts(minutes: float = 10.0) -> dict:
+    """近 minutes 的失败分类计数（阈值值守数据源：风控 surge / 5xx surge）。"""
+    cutoff = time.time() - minutes * 60
+    with _lock:
+        rows = [r for r in _recent if r["ts"] >= cutoff]
+    risk = sum(1 for r in rows if r.get("kind") == "risk")
+    c5xx = sum(1 for r in rows if (r.get("status") or 0) >= 500)
+    c429 = sum(1 for r in rows if (r.get("status") or 0) == 429)
+    return {"window_min": minutes, "risk": risk, "c5xx": c5xx, "c429": c429,
+            "total": len(rows)}
 
 
 def snapshot() -> list[dict]:
@@ -644,6 +722,10 @@ def _persist(entry: dict) -> None:
             "ua": entry.get("ua") or "",
             "probe": bool(entry.get("probe")),
             "stream": bool(entry.get("stream")),
+            # 请求形状：面板详情用内存值，历史聚合只能读盘 —— 必须落盘，
+            # 否则 msgs_p95/maxtok_p95 在历史视图恒为 None（踩过）
+            "msgs": entry.get("msgs"),
+            "mt": entry.get("max_tokens"),
             "t_first": entry.get("t_first"),
             "t_total": entry.get("t_total"),
             "in": entry.get("input_tokens"),
@@ -660,6 +742,9 @@ def _persist(entry: dict) -> None:
             "5xx": round(float(entry.get("wait_5xx") or 0), 2),
             "cap": round(float(entry.get("wait_cap") or 0), 2),
             "trace": entry.get("upstream_id") or "",
+            # 跨轮转（>24h 环形）窗口归属：与 session_ctx 的 24h 判定同口径，
+            # 否则「窗口内 / 窗口外」在历史层永远算不出来
+            "sw": entry.get("sess_window") or "",
             "stop": entry.get("stop_reason") or "",
             "up_t": entry.get("t_up"),
             "dd": entry.get("dedup") or "",
@@ -682,7 +767,10 @@ def _persist(entry: dict) -> None:
 def _new_bucket(key: str = "") -> dict:
     return {"name": key, "calls": 0, "ok": 0, "fail": 0, "in": 0, "out": 0,
             "probe": 0, "wait": 0.0, "retry": 0, "net_sum": 0.0, "net_n": 0,
-            "codes": {}, "stops": {}, "dedup": 0, "disc": 0,
+            "codes": {}, "stops": {}, "dedup": 0, "disc": 0, "cache": 0,
+            "sw_in": 0, "sw_out": 0,
+            "msgs": [], "maxtok": [],
+            "clients": set(), "sess": set(),
             "ttfb_sum": 0.0, "ttfb_n": 0, "total_sum": 0.0, "total_n": 0,
             "last": 0.0}
 
@@ -723,15 +811,37 @@ def _acc(bucket: dict, row: dict) -> None:
     stop = row.get("stop")
     if stop:
         bucket["stops"][stop] = bucket["stops"].get(stop, 0) + 1
+    bucket["cache"] += int(row.get("cache_read") or 0)
+    if row.get("ip"):
+        bucket["clients"].add(row["ip"])
+    if row.get("sess"):
+        bucket["sess"].add(row["sess"])
+    if row.get("sw") == "in":
+        bucket["sw_in"] += 1
+    elif row.get("sw") == "out":
+        bucket["sw_out"] += 1
+    if isinstance(row.get("msgs"), int):
+        bucket["msgs"].append(row["msgs"])
+    if isinstance(row.get("mt"), int):   # 磁盘短键 mt（见 _persist），出参名 maxtok_*
+        bucket["maxtok"].append(row["mt"])
     ts = row.get("ts") or 0
     if ts > bucket["last"]:
         bucket["last"] = ts
+
+
+def _pctile(values: list, p: float) -> int | None:
+    """小样本分位（与 ttfb 同一套口径）：空样本返回 None，不假装是 0。"""
+    if not values:
+        return None
+    a = sorted(values)
+    return a[min(len(a) - 1, int((len(a) - 1) * p))]
 
 
 def _finalize(bucket: dict) -> dict:
     done = bucket["ok"] + bucket["fail"]
     codes = bucket["codes"]
     stops = bucket["stops"]
+    sw_seen = bucket["sw_in"] + bucket["sw_out"]
     return {
         "name": bucket["name"],
         "calls": bucket["calls"],
@@ -746,6 +856,18 @@ def _finalize(bucket: dict) -> dict:
         "net": round(bucket["net_sum"] / bucket["net_n"], 3) if bucket["net_n"] else None,
         "dedup": bucket["dedup"],
         "disc": bucket["disc"],
+        "cache": bucket["cache"],
+        "cache_rate": round(bucket["cache"] / bucket["in"] * 100, 1) if bucket["in"] else None,
+        "clients_n": len(bucket["clients"]),
+        "sess_n": len(bucket["sess"]),
+        # 5min idle 窗口：in 占比越高，system prompt 缓存复用越充分
+        "sw_in": bucket["sw_in"],
+        "sw_out": bucket["sw_out"],
+        "sw_in_rate": round(bucket["sw_in"] / sw_seen * 100, 1) if sw_seen else None,
+        "msgs_p50": _pctile(bucket["msgs"], 0.5),
+        "msgs_p95": _pctile(bucket["msgs"], 0.95),
+        "maxtok_p50": _pctile(bucket["maxtok"], 0.5),
+        "maxtok_p95": _pctile(bucket["maxtok"], 0.95),
         "disc_rate": round(bucket["disc"] / bucket["calls"] * 100, 1) if bucket["calls"] else None,
         # 直方图按频次降序取前 8（429/5xx 与业务码混排，设阈值看的是码不是文案）
         "codes": [{"code": c, "count": n} for c, n in

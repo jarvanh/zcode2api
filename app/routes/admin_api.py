@@ -8,7 +8,18 @@ import time
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import captcha_ledger, dedup, diaglog, freshness, logs, reqlog, riskmetrics, session_ctx, usage_stats
+from .. import (
+    captcha_ledger,
+    dedup,
+    diaglog,
+    freshness,
+    logs,
+    reqlog,
+    riskmetrics,
+    session_ctx,
+    usage_stats,
+    vitals,
+)
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError
@@ -840,14 +851,25 @@ async def usage_summary():
 
 @router.get("/monitoring")
 async def monitoring():
-    """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
-    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP, "conc": reqlog.conc_snapshot()}
+    """网关请求环形日志（内存态，重启清零）+ 并发快照 + 近端健康窗口。
+
+    health 放在这里而非单独轮：它与 entries 同属「实时层」，5s 一跳的新鲜度
+    已够（P95 要的是分钟级，不是秒级），省前端一个定时器与一次往返。
+    """
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP,
+            "conc": reqlog.conc_snapshot(), "health": reqlog.health(1.0)}
 
 
 @router.get("/monitoring/concurrency")
 async def monitoring_concurrency():
-    """实时并发四口径快照 + 启动以来峰值 + 当日分钟曲线（面板 1s 轮询）。"""
-    return reqlog.conc_snapshot()
+    """1s 心跳的数据包：并发四口径 + 峰值 + 分钟曲线 + 进程体征 + 账号徽标。
+
+    合成一个端点而不是拆三个：面板要的是「同拍快照」（在途数与 RSS 必须属于
+    同一时刻，否则「占槽高但 solver 为 0」这类交叉判读会错位），也少三次往返。
+    accounts 只读 store 内存表（无磁盘 IO），供「号池健康」页签拼 strike 徒标。
+    """
+    return {**reqlog.conc_snapshot(), "vitals": vitals.snapshot(),
+            "accounts": _account_watch_rows()}
 
 
 @router.get("/monitoring/concurrency/history")
@@ -864,6 +886,51 @@ async def monitoring_history(days: int = 7):
     data/reqlog-<日期>.jsonl 做聚合，仅回传统计而非明细（30 天可达数万条）。
     """
     return reqlog.history(days)
+
+
+def _account_watch_rows() -> list[dict]:
+    """账号运行侧徽标（健康页签与值守脚本共用）。
+
+    Status 是字符串常量类（非 Enum）：直接 str(a.status)，不得 .value
+    （写成 .value 会让端点整体 500，集成测试钉住）。
+    """
+    return [{"name": a.name, "provider": a.provider, "status": str(a.status),
+             "enabled": bool(a.enabled),
+             "risk_strikes": round(float(a.risk_strikes or 0), 2),
+             "rate_strikes": round(float(a.rate_strikes or 0), 2),
+             "net_strikes": round(float(a.net_strikes or 0), 2),
+             "last_error": (a.last_error or "")[:200]}
+            for a in store.list_accounts()]
+
+
+@router.get("/monitoring/health")
+async def monitoring_health(hours: float = 1.0):
+    """近 hours 小时的逐账号健康窗口（P50/P95 首字、429/5xx/风控/额度计数）。
+
+    与 /monitoring/history 的分工：那边按天读磁盘看趋势，这边读内存近端事件
+    答「这个号现在还能不能用」——P95 需要分钟级新鲜度，按天粒度不够。
+    """
+    return reqlog.health(max(0.1, min(hours, 24.0)))
+
+
+@router.get("/monitoring/vitals")
+async def monitoring_vitals():
+    """进程体征：RSS / solver 与 Chromium 进程数 / 令牌池水位 / 事件循环延迟。"""
+    return vitals.snapshot()
+
+
+@router.get("/monitoring/watch")
+async def monitoring_watch():
+    """值守脚本（主机侧 cron）的单一数据源：一次拿齐阈值判定所需。
+
+    阈值判定与告警发送刻意放在仓库外（token 不入公开仓；告警降噪逻辑与
+    gateway-admission-sentinel 同范式）。这里只出数，不出判断。
+    """
+    return {"conc": reqlog.conc_snapshot(),
+            "recent": reqlog.recent_counts(10.0),
+            "vitals": vitals.snapshot(minutes=5),
+            "health": reqlog.health(1.0),
+            "accounts": _account_watch_rows()}
 
 
 @router.post("/monitoring/clear")
