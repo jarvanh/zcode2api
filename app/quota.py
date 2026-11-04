@@ -14,6 +14,7 @@ import httpx
 
 from . import business_error, constants, logs, settings
 from .models import Account, Status, expires_epoch, window_expired, window_usable
+from .quota_windows import pending_plan_start
 from .store import store
 
 _DEVICE_MID: str | None = None
@@ -90,9 +91,39 @@ def _bonus_active(plan: dict, now: float) -> bool:
         # 日窗用完但 5 亿一次性池仍在的账号被误标 exhausted（2026-10-31 实证）
         eff = e.get("effective_at") or e.get("starts_at") or 0
         ends = e.get("ends_at") or e.get("expires_at") or 0
+        # 与 quota_windows.pending_plan_start 同口径：上游秒/毫秒都可能下发，
+        # 不归一则毫秒 effective_at 永远判「未生效」（2026-11-04 补）。
+        try:
+            eff = float(eff)
+            ends = float(ends)
+        except (TypeError, ValueError):
+            continue
+        eff = eff / 1000 if eff > 1e12 else eff
+        ends = ends / 1000 if ends > 1e12 else ends
         if eff and eff <= now and (not ends or now <= ends):
             return True
     return False
+
+
+def quota_recoverable(account: Account, quota_map: dict, now: float) -> tuple[bool, bool]:
+    """共享真源：账号此刻是否有可用额度，返回 (has_daily, has_bonus)。
+
+    - has_daily：传入的窗口快照里存在「余额 > 0 且未过期」的窗口；
+    - has_bonus：plan / plans 里存在**已到 effective_at 且未过 ends_at** 的
+      one_time 赠送授权（balance 不含这类额度，故必须单独判）。
+
+    两处调用方共用，防止口径漂移：
+      ① `fetch_quota` 用本次拉到的 quota_map 判「耗尽 / 恢复」；
+      ② `QuotaMonitor._activate_due` 用账号里的旧 quota_map 做**到点本地激活**
+         （零上游流量：effective_at 是上游已落库的承诺，到点即可信）。
+    2026-11-04 实证：旧窗口全部过期但 entitlement effective_at=23:00，
+    23:00:00 起 has_bonus 即变 True，无需先打 billing。
+    """
+    has_daily = any(window_usable(w, now) for w in (quota_map or {}).values())
+    has_bonus = _bonus_active(account.plan, now) or any(
+        _bonus_active(p, now) for p in (account.plans or [])
+    )
+    return has_daily, has_bonus
 
 
 async def fetch_quota(account: Account) -> dict:
@@ -280,12 +311,9 @@ async def fetch_quota(account: Account) -> dict:
         # 每个 messages 一律回 {"code":1005}。只看余额会让这类号长期占着轮询位。
         # 注意 balance 不含一次性赠送池：赠送池有效时不判耗尽。
         now = time.time()
-        usable = [w for w in quota_map.values() if window_usable(w, now)]
         all_expired = all(window_expired(w, now) for w in quota_map.values())
-        has_bonus = _bonus_active(account.plan, now) or any(
-            _bonus_active(p, now) for p in account.plans
-        )
-        has_daily = bool(usable)
+        # 与「到点本地激活」共用同一谓词，避免两处口径漂移（2026-11-04）
+        has_daily, has_bonus = quota_recoverable(account, quota_map, now)
         if not has_daily and not has_bonus and account.enabled:
             # enabled=False（手动停用）不改写状态：停用语义优先于额度语义，
             # 否则刷新会把「停用」洗成 exhausted，面板读不出来停用原因。
@@ -398,46 +426,188 @@ async def refresh_accounts(accounts: list[Account]) -> dict:
 
 
 class QuotaMonitor:
-    """后台周期性刷新可管理账号的额度，实现实时用量监控。"""
+    """后台周期性刷新额度 + **待生效套餐到点自动生效**（2026-11-04）。
+
+    两层：
+      ① 准点本地激活：`effective_at` 是已落库的上游承诺，到点零上游流量即可
+         把 EXHAUSTED 号翻回 ACTIVE，不必等 30min 轮询 / 不必先打 billing。
+      ② 准点后一次确认刷新：写回真实额度给看板；常规 1800s 节拍不变。
+    等待取 `min(常规节拍, 最早 pending_plan_start)`；过点后 pending_plan_start
+    自动返回 None → 天然一次性，不增加常态 billing 频率。
+    """
+
+    START_DELAY = 5            # 启动避让
+    DISABLED_POLL = 30         # interval<=0 时回看设置的间隔
+    CONFIRM_GRACE = 10         # 到点后给上游落地的宽限（秒）
+    CONFIRM_RETRIES = 3        # 确认刷新有界重试次数
+    CONFIRM_RETRY_WAIT = 30    # 重试间隔（秒）
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
+
+    # ── 外部提前唤醒：领包成功后立即重算 due（不额外打 billing）──
+    def request_refresh(self, reason: str = "") -> None:
+        if self._wake.is_set():
+            return
+        logs.info("quota", f"额度刷新提前唤醒: {reason}")
+        self._wake.set()
+
+    async def _wait_stop_or_wake(self, timeout: float) -> bool:
+        """等「停服 / 提前唤醒 / 到点」；返回是否因提前唤醒（停服/超时 False）。"""
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        wake_task = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({stop_task, wake_task}, timeout=timeout,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (stop_task, wake_task):
+                t.cancel()
+        if self._stop.is_set():
+            return False
+        return self._wake.is_set()
+
+    @staticmethod
+    def _wake_plan(now: float, next_regular_at: float, due: float | None):
+        """选下一个唤醒点：常规节拍 vs 最早待生效时刻（纯函数，可单测）。
+
+        due 为 None（无待生效包 / 已过时刻）或晚于常规节拍 → 走 regular。
+        """
+        if due is not None and due < next_regular_at:
+            return due, "due"
+        return next_regular_at, "regular"
+
+    def _activate_due(self, now: float) -> int:
+        """准点本地激活（零上游流量），返回激活账号数。
+
+        只认 entitlement `effective_at` 已跨过且未失效的 one_time 授权
+        （`quota_recoverable` 的 has_bonus）——这是权威时刻；`has_daily` 来自
+        可能过期的本地快照，零流量复活会引入「402→翻活→再402」抖动，那类
+        恢复交给常规 billing 刷新（fetch_quota 同一谓词）处理。
+        冷却 / 停用 / 凭证失效 / 非 JWT 一律不动，保住既有不变量。
+        """
+        changed = 0
+        for a in store.list_accounts("zai"):
+            if a.mode != "jwt" or not a.enabled or a.status != Status.EXHAUSTED:
+                continue
+            if a.is_cooling(now):
+                continue
+            _, has_bonus = quota_recoverable(a, a.quota, now)
+            if not has_bonus:
+                continue
+            a.status = Status.ACTIVE
+            a.last_error = None
+            a.cooling_until = None
+            if store.update_account(a):
+                changed += 1
+        return changed
+
+    async def _regular_refresh(self) -> None:
+        try:
+            accounts = [a for a in store.list_accounts("zai")
+                        if a.mode == "jwt" and a.allows_billing()]
+            if accounts:
+                await refresh_accounts(accounts)
+        except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
+            logs.err("quota", f"后台刷新出错: {err}")
+
+    async def _sleep_or_stop(self, secs: float) -> bool:
+        """等 secs 秒；返回 True 表示期间收到停服（调用方应立即退出）。"""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=max(0.0, secs))
+            return True
+        except TimeoutError:
+            return False
+
+    async def _confirm_refresh(self) -> None:
+        """准点确认刷新：写回真实额度；失败按 CONFIRM_RETRY_WAIT 有界重试。
+
+        上限固定（3 次）且只在到点发生 —— 常态节拍仍是 1800s，不会回退到
+        「把间隔调小」那类风控放大器（2026-10-24 实证 60s 轮询是 3012 主信号）。
+        """
+        for attempt in range(self.CONFIRM_RETRIES):
+            try:
+                accounts = [a for a in store.list_accounts("zai")
+                            if a.mode == "jwt" and a.allows_billing()]
+                if not accounts:
+                    return
+                res = await refresh_accounts(accounts)
+            except Exception as err:  # noqa: BLE001
+                logs.err("quota", f"到点确认刷新出错: {err}")
+                res = {"ok": 0, "fail": 1}
+            if not res.get("fail"):
+                return
+            if attempt + 1 < self.CONFIRM_RETRIES:
+                if await self._sleep_or_stop(self.CONFIRM_RETRY_WAIT):
+                    return
+        logs.warn("quota", "到点确认刷新多次失败，回落常规轮询")
 
     async def _loop(self) -> None:
         # 启动后先等几秒，避免与服务启动争抢
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=5)
+            await asyncio.wait_for(self._stop.wait(), timeout=self.START_DELAY)
             return
         except TimeoutError:
             pass
 
+        # 保留原语义：启动后立即常规刷新一次（历史 22:38:32 首轮）
+        if store.quota_refresh_interval() > 0:
+            await self._regular_refresh()
+
+        last_interval = store.quota_refresh_interval()
+        next_regular_at = time.time() + (
+            last_interval if last_interval > 0 else self.DISABLED_POLL)
+
         while not self._stop.is_set():
-            interval = store.quota_refresh_interval()  # 实时读取设置，改后即生效
-            if interval > 0:
-                try:
-                    accounts = [
-                        a for a in store.list_accounts("zai")
-                        if a.mode == "jwt" and a.allows_billing()
-                    ]
-                    if accounts:
-                        await refresh_accounts(accounts)
-                except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
-                    logs.err("quota", f"后台刷新出错: {err}")
-            # interval<=0 视为关闭：仍周期性回看设置，便于随时启用
-            wait = interval if interval > 0 else 30
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=wait)
-            except TimeoutError:
+            interval = store.quota_refresh_interval()  # 实时读取，改后即生效
+            now = time.time()
+            if interval != last_interval:
+                last_interval = interval
+                next_regular_at = now + (
+                    interval if interval > 0 else self.DISABLED_POLL)
+
+            due = pending_plan_start(store.list_accounts("zai"), now)
+            wake_at, reason = self._wake_plan(now, next_regular_at, due)
+            # 下限 1s：wake_at 已过期（如改设置后立即重算）时不能退化成忙轮询
+            wait = max(1.0, wake_at - now)
+
+            woken = await self._wait_stop_or_wake(wait)
+            if self._stop.is_set():
+                return
+            if woken:
+                # 领包/外部唤醒：领包方已自行 refresh，这里只重算 due，不额外打点
+                self._wake.clear()
                 continue
+
+            now = time.time()
+            if reason == "due" and now >= due:
+                changed = self._activate_due(now)
+                if changed:
+                    logs.ok("quota", f"待生效套餐到点，本地激活 {changed} 个账号（零上游请求）")
+                # 常规节拍不受 due 影响（next_regular_at 保持不变）；
+                # interval<=0 = 用户关了后台轮询 → 只做本地激活，不打 billing。
+                if interval > 0:
+                    if await self._sleep_or_stop(self.CONFIRM_GRACE):
+                        return
+                    await self._confirm_refresh()
+                continue
+
+            # 常规节拍刷新
+            if interval > 0:
+                await self._regular_refresh()
+            next_regular_at = time.time() + (
+                interval if interval > 0 else self.DISABLED_POLL)
 
     def start(self) -> None:
         if self._task is None:
             self._stop.clear()
+            self._wake.clear()
             self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
         self._stop.set()
+        self._wake.set()  # 立即打断等待
         if self._task:
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None

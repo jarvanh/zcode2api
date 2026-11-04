@@ -1029,7 +1029,9 @@ class ClaimRoundManager:
         self._round_visited = False
 
     async def _round(self) -> None:
-        from .quota import refresh_accounts
+        # 领到新套餐后让额度监控立即重算「最早生效时刻」，不必等下一次节拍；
+        # 唤醒本身不打 billing（领包方下面已自行 refresh 一次）。
+        from .quota import monitor, refresh_accounts
         from .store import store
 
         accounts = [
@@ -1107,6 +1109,7 @@ class ClaimRoundManager:
                 except Exception as err:  # noqa: BLE001
                     logs.warn("claim", f"轮次领取 账号 {acc.name} 额度刷新失败: {err}")
         if claimed:
+            monitor.request_refresh(f"自动领取轮新入账 {claimed} 个账号")
             logs.ok("claim", f"自动领取轮完成: {claimed} 个账号有新套餐入账")
 
     async def _wait_stop_or_wake(self, timeout: float) -> bool:
