@@ -461,3 +461,15 @@ select.input option{background:var(--panel);color:var(--ink)}
   .mon-grid-health > :nth-child(n+8){display:none}
   .vitals-row{gap:6px}
 }
+/* ── 额度节奏 / 告警历史（2026-11-04 第四批）── */
+.forecast-panel .stat-grid,.alerts-panel .stat-grid{margin-bottom:10px}
+.forecast-panel .stat-cell,.alerts-panel .stat-cell{min-height:92px;gap:8px}
+.fc-reasons{display:flex;flex-direction:column;gap:4px;padding:4px 2px;font-size:11.5px;color:var(--ink-mute)}
+.fc-reason{color:var(--amber)}
+.fc-refills{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.fc-refills .dist-chip{font-size:10.5px}
+.alerts-chart{height:96px;padding:10px 12px 4px}
+.alerts-chart .hist-bar{background:var(--amber)}
+.alerts-rules{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:9px;font-size:11px;color:var(--ink-dim)}
+.alerts-rules .dist-chip{font-size:10.5px}
+@media (max-width:960px){.alerts-chart{height:84px}}

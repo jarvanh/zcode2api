@@ -581,3 +581,65 @@ class TestHealthAndVitalsEndpoints:
                              headers=ADMIN_AUTH)).json()["totals"]
         for key in ("cache", "cache_rate", "clients_n", "sess_n"):
             assert key in t
+
+
+@pytest.mark.integration
+class TestForecastAndAlerts:
+    """额度节奏 / 告警台账端点契约（第四批）。"""
+
+    async def test_watch_carries_forecast_and_alerts(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/watch", headers=ADMIN_AUTH)).json()
+        assert "forecast" in data and "alerts" in data
+        f = data["forecast"]
+        for k in ("generated_at", "snapshots", "refills", "next_refill", "rates",
+                  "eta", "eta_reliable", "reasons"):
+            assert k in f
+        assert f["next_refill"] and f["next_refill"]["at"] > f["generated_at"]
+        a = data["alerts"]
+        for k in ("days", "total", "daily", "rules", "last_alert_at", "silent_seconds"):
+            assert k in a
+
+    async def test_forecast_endpoint_shape(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/forecast?days=2",
+                                 headers=ADMIN_AUTH)).json()
+        assert data["days"] == 2 and data["eta_reliable"] is False   # 新号池无快照
+        assert data["eta"] is None and data["reasons"]
+
+    async def test_forecast_day_clamped(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/forecast?days=999",
+                                 headers=ADMIN_AUTH)).json()
+        assert data["days"] == 30
+
+    async def test_alert_ledger_post_and_get(self, gateway_client, tmp_path, monkeypatch):
+        client, _ = gateway_client
+        from app import alertlog
+
+        monkeypatch.setattr(alertlog.settings, "DATA_DIR", tmp_path)
+        res = await client.post("/admin/api/monitoring/alerts",
+                                json={"rules": ["RISK", "POOL", "RISK"], "delivered": True},
+                                headers=ADMIN_AUTH)
+        assert res.status_code == 200 and res.json()["recorded"] is True
+        assert res.json()["rules"] == ["POOL", "RISK"]
+        data = (await client.get("/admin/api/monitoring/alerts?days=1",
+                                 headers=ADMIN_AUTH)).json()
+        assert data["total"] == 1 and data["daily"][-1]["alerts"] == 1
+
+    async def test_alert_ledger_dry_run_not_written(self, gateway_client, tmp_path, monkeypatch):
+        client, _ = gateway_client
+        from app import alertlog
+
+        monkeypatch.setattr(alertlog.settings, "DATA_DIR", tmp_path)
+        res = await client.post("/admin/api/monitoring/alerts",
+                                json={"rules": ["RISK"], "dry_run": True},
+                                headers=ADMIN_AUTH)
+        assert res.json()["recorded"] is False
+        assert not list(tmp_path.glob("alertlog-*.jsonl"))
+
+    async def test_alert_ledger_bad_rules_type_is_safe(self, gateway_client):
+        client, _ = gateway_client
+        res = await client.post("/admin/api/monitoring/alerts",
+                                json={"rules": "not-a-list"}, headers=ADMIN_AUTH)
+        assert res.status_code == 200 and res.json()["rules"] == []

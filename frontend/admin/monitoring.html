@@ -69,6 +69,30 @@
   </div>
 
   <div class="dist-bar" id="dist-bar"></div>
+  <div class="cap-panel forecast-panel">
+    <div class="cap-hd">
+      <div>
+        <div class="cap-title">额度节奏 · 几点回血 / 几点打光</div>
+        <div class="cap-sub" id="forecast-sub">回血时刻取运营事实（北京 23:00 日窗 / 已领待生效套餐）；耗尽 ETA 只在快照新鲜且账本一致时给出</div>
+      </div>
+      <div class="cap-meta" id="forecast-meta"></div>
+    </div>
+    <div class="stat-grid" id="forecast-grid"></div>
+    <div class="fc-reasons" id="forecast-reasons"></div>
+  </div>
+
+  <div class="cap-panel alerts-panel">
+    <div class="cap-hd">
+      <div>
+        <div class="cap-title">告警历史 · 近 7 天</div>
+        <div class="cap-sub">只记已发送告警的规则集合（不记正文/数值）· dry-run 不落盘 · 按北京日分文件</div>
+      </div>
+      <div class="cap-meta" id="alerts-meta"></div>
+    </div>
+    <div class="stat-grid" id="alerts-grid"></div>
+    <div class="hist-chart alerts-chart" id="alerts-chart"></div>
+    <div class="alerts-rules" id="alerts-rules"></div>
+  </div>
 
   <div class="cap-panel">
     <div class="cap-hd">
@@ -503,6 +527,8 @@ function render(){
     else if(tab==='health')renderHealth();else renderAgg(tab);
   }
   renderDist();
+  renderForecast();
+  renderAlerts();
   // 健康表在上面的视图分支里已渲染，且 1s 心跳（renderConc）也会重画 ——
   // 这里再调一次是重复渲染
   $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
@@ -557,6 +583,10 @@ async function load(){
     entries=res.entries||[];
     state.keep=res.keep||500;
     health=res.health||null;
+    // 额度节奏与告警历史按天聚合，5s 刷新足够；与 entries 同拍取，不另开定时器
+    const w=await api('GET','/monitoring/watch').catch(()=>({}));
+    ops=w.forecast||w.alerts?{forecast:w.forecast,alerts:w.alerts}:null;
+    if(w.accounts)state.accounts=w.accounts;
   }
   render();
 }
@@ -612,6 +642,72 @@ function renderConc(){
       <div class="hist-lbl">${m.t%60===0?hh+':00':''}</div>
     </div>`;
   }).join('');
+}
+
+// ── 额度节奏 / 告警历史（随 5s 主刷新从 /monitoring/watch 取）──────────
+let ops=null;
+
+function fmtBJ(ts){
+  if(ts==null)return '—';
+  const d=new Date(ts*1000);
+  return d.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function fmtLeft(sec){
+  if(sec==null)return '—';
+  const h=Math.floor(sec/3600), m=Math.floor((sec%3600)/60);
+  return h?`${h}h${m}m`:`${m}m`;
+}
+function opsCell(label,val,sub,color,tip){
+  return `<div class="stat-cell"${tip?` title="${esc(tip)}"`:''}>
+    <div class="stat-top"><div class="stat-label">${label}</div></div>
+    <div class="stat-num"${color?` style="color:${color}"`:''}>${val}</div>
+    <div class="stat-sub">${sub}</div>
+  </div>`;
+}
+
+function renderForecast(){
+  const f=ops&&ops.forecast;
+  if(!f){$('forecast-grid').innerHTML='';$('forecast-reasons').innerHTML='';return;}
+  const next=f.next_refill||{};
+  const rateRows=(f.rates&&f.rates.per_account||[]).filter(r=>r.rate!=null);
+  const hot=rateRows[0];
+  $('forecast-grid').innerHTML=[
+    opsCell('下次回血',fmtBJ(next.at),`${esc(next.label||'—')} · 还有 ${fmtLeft(next.in_seconds)}`,'var(--mint)','运营事实，不是预测：日窗 23:00 或待生效套餐更早者'),
+    opsCell('耗尽 ETA',f.eta!=null?fmtBJ(f.eta):'不可靠',
+      f.eta!=null?`${esc(f.eta_basis||'')} · 还有 ${fmtLeft(f.eta-f.generated_at)}`:'拒绝给假精度',
+      f.eta!=null?'var(--amber)':'var(--ink-mute)',
+      '需在快照新鲜(≤15min)且账本一致时才给；两套账矛盾时不外推'),
+    opsCell('消耗速率',hot?`${hot.rate}`:'—',hot?`${esc(hot.account)} · ${esc(hot.model)} · used/秒`:'需≥2 次 quota 刷新快照','var(--blue)','同账号同模型 quota_verified_at 快照差分'),
+    opsCell('快照数',f.snapshots,f.days+' 天窗口 · '+rateRows.length+' 个号有速率'),
+  ].join('');
+  $('forecast-meta').textContent=f.eta_reliable?'ETA 可信':'ETA 已抑制（见下方原因）';
+  const reasons=(f.reasons||[]).map(r=>`<div class="fc-reason">· ${esc(r)}</div>`).join('');
+  const refills=(f.refills||[]).map(r=>`<span class="dist-chip">${esc(r.label)} ${fmtBJ(r.at)}${r.committed?' <b>承诺</b>':''}</span>`).join('');
+  $('forecast-reasons').innerHTML=reasons+`<div class="fc-refills">${refills}</div>`;
+}
+
+function renderAlerts(){
+  const a=ops&&ops.alerts;
+  if(!a){$('alerts-grid').innerHTML='';$('alerts-chart').innerHTML='';$('alerts-rules').innerHTML='';return;}
+  const daily=a.daily||[];
+  $('alerts-grid').innerHTML=[
+    opsCell('告警总数',a.total,`近 ${a.days} 天`,a.total?'var(--amber)':'var(--mint)'),
+    opsCell('最近告警',a.last_alert_at?fmtBJ(a.last_alert_at):'从未','告警台账按天落盘'),
+    opsCell('已静默',a.silent_seconds!=null?fmtLeft(a.silent_seconds):'—','距最近一条已发送告警'),
+    opsCell('最吵规则',(a.rules[0]&&a.rules[0].id)||'—',(a.rules[0]?`${a.rules[0].count} 次`:'无')),
+  ].join('');
+  $('alerts-meta').textContent=a.total?'有告警记录':'近 7 天零告警 ✓';
+  const max=Math.max(...daily.map(d=>d.alerts),1);
+  $('alerts-chart').innerHTML=daily.map(d=>{
+    const h=Math.max(d.alerts?Math.round(d.alerts/max*76):2,2);
+    return `<div class="hist-col" title="${d.name} · ${d.alerts} 条${d.rules.length?' · '+d.rules.map(r=>r.id+'×'+r.count).join(' '):''}">
+      <div class="hist-bar-wrap"><i class="hist-bar" style="height:${h}px"></i></div>
+      <div class="hist-lbl">${d.name.slice(5)}</div>
+    </div>`;
+  }).join('');
+  $('alerts-rules').innerHTML=(a.rules||[]).length
+    ? '<span class="dist-note">规则分布：</span>'+a.rules.map(r=>`<span class="dist-chip">${esc(r.id)} <b>${r.count}</b></span>`).join('')
+    : '<span class="dist-note">无告警规则记录</span>';
 }
 
 // ── 进程体征行（随并发心跳一起取，省一个轮询器）────────────────────

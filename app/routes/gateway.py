@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import business_error, constants, dedup, diaglog, egress, freshness, logs, reqlog, riskmetrics, session_ctx, settings
+from .. import business_error, constants, dedup, diaglog, egress, freshness, logs, quota_windows, reqlog, riskmetrics, session_ctx, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -547,32 +547,18 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
 
 
 def _quota_reset_at(accounts: list, now: float) -> float:
-    """额度耗尽后的承诺恢复时刻：默认当天 23:00（北京），待生效套餐更早则用之。
+    """额度耗尽后的承诺恢复时刻（口径真源见 app/quota_windows.py）。
 
-    待生效 = plans[].entitlements[] 里 starts_at（或 effective_at）在未来的
-    条目（已领取/预约但尚未开始发放的套餐授权）。
+    旧实现在本文件里自带 _bj_today_at 与毫秒归一，「几点回血」类观测想复用
+    就得抄一份或循环 import 网关。现抽到共享纯函数模块，本处只做转发，
+    保持所有既有调用点（含单测 monkeypatch）签名不变。
     """
-    pending: list[float] = []
-    for a in accounts:
-        for plan in ([a.plan] if isinstance(a.plan, dict) and a.plan else []) \
-                + list(a.plans or []):
-            for ent in (plan or {}).get("entitlements") or []:
-                start = ent.get("starts_at") or ent.get("effective_at") or 0
-                # 上游秒/毫秒都可能下发（claim 载荷即做了 ms 归一），统一到秒
-                start = start / 1000 if start > 1e12 else start
-                if start > now:
-                    pending.append(float(start))
-    today_reset = _bj_today_at(23, 0, now)
-    return min(pending) if pending and min(pending) < today_reset else today_reset
+    return quota_windows.quota_reset_at(accounts, now)
 
 
 def _bj_today_at(hour: int, minute: int, now: float) -> float:
-    """北京时区当天 hour:minute 的 epoch。"""
-    from datetime import datetime, timedelta, timezone
-    bj = timezone(timedelta(hours=8))
-    local = datetime.fromtimestamp(now, bj)
-    target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return target.timestamp() if target.timestamp() > now else target.timestamp() + 86400
+    """兼容旧调用/测试：转发到共享实现。"""
+    return quota_windows.bj_today_at(hour, minute, now)
 
 
 def _rotate_allowed(account: Account) -> bool:

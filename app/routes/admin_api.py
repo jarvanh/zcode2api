@@ -9,9 +9,11 @@ import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .. import (
+    alertlog,
     captcha_ledger,
     dedup,
     diaglog,
+    forecast,
     freshness,
     logs,
     reqlog,
@@ -926,11 +928,45 @@ async def monitoring_watch():
     阈值判定与告警发送刻意放在仓库外（token 不入公开仓；告警降噪逻辑与
     gateway-admission-sentinel 同范式）。这里只出数，不出判断。
     """
+    accounts = store.list_accounts()
     return {"conc": reqlog.conc_snapshot(),
             "recent": reqlog.recent_counts(10.0),
             "vitals": vitals.snapshot(minutes=5),
             "health": reqlog.health(1.0),
+            "forecast": forecast.forecast(accounts),
+            "alerts": alertlog.history(7),
             "accounts": _account_watch_rows()}
+
+
+@router.get("/monitoring/forecast")
+async def monitoring_forecast(days: int = 3):
+    """额度节奏：几点回血（可信）+ 消耗速率 + 有条件的「几点打光」外推。
+
+    口径诚实：balance 的 remaining 与 grant 腿是两套账（2026-10-31 实证），
+    存在「exhausted 却 remaining>0」时明确拒给 ETA，不造假精度。
+    每次查询顺带登记当前 quota 快照（纯观测，不触发 billing 请求）。
+    """
+    return forecast.forecast(store.list_accounts(), days=days)
+
+
+@router.post("/monitoring/alerts")
+async def monitoring_alert_record(payload: dict = Body(...)):
+    """值守脚本发送成功后登记一条告警（只记规则集合，不记正文）。
+
+    dry_run=true 时不落盘，避免本地自检污染真实告警曲线。
+    """
+    rules = payload.get("rules") or []
+    if not isinstance(rules, list):
+        rules = []
+    return alertlog.record([str(r) for r in rules],
+                           dry_run=bool(payload.get("dry_run")),
+                           delivered=bool(payload.get("delivered", True)))
+
+
+@router.get("/monitoring/alerts")
+async def monitoring_alert_history(days: int = 7):
+    """告警历史曲线：逐日条数、规则分布 TOP、最近告警与静默时长。"""
+    return alertlog.history(days)
 
 
 @router.post("/monitoring/clear")

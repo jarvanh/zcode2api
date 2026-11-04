@@ -91,6 +91,9 @@
 | `GET /admin/api/monitoring/concurrency/history?days=N` | 磁盘并发曲线：逐日峰值 + 最近一天分钟级（峰值不因重启丢；单文件 ≤1440 行，随 HISTORY_DAYS 清理） |
 | `GET /admin/api/monitoring/health?hours=N` | 近端逐号健康窗口（上限 24h）：P50/P95 首字、429/5xx/风控/额度计数。与 history 分工：那边按天读磁盘看趋势，这边答「这个号现在还能不能用」（P95 要分钟级新鲜度） |
 | `GET /admin/api/monitoring/vitals` | 进程体征：RSS / solver 与 Chromium 后代进程数 / 僵尸数 / 令牌池水位 / 事件循环延迟（Linux /proc 口径，零新依赖，不抢子进程回收权） |
+| `GET /admin/api/monitoring/forecast?days=N` | 额度节奏：下次回血时刻（运营事实：北京 23:00 日窗 / 待生效套餐，与网关 `_quota_reset_at` 同源）+ 连续 quota 快照差分速率 + **有条件**的耗尽 ETA。存在「exhausted 却 remaining>0」两套账矛盾时明确拒绝 ETA（`eta_reliable=false` + reasons），不造假精度；查询顺带登记快照到 `quota-history-*.jsonl` |
+| `POST /admin/api/monitoring/alerts` | 值守脚本发送成功后登记告警规则集合（dry-run 不落盘）；落盘 `alertlog-*.jsonl`。台账失败不影响告警发送结果 |
+| `GET /admin/api/monitoring/alerts?days=N` | 告警历史：逐日条数 / 规则分布 TOP / 最近告警 / 静默时长（只记规则集合，不记正文与数值） |
 | `GET /admin/api/monitoring/watch` | **值守脚本单一数据源**：conc + recent(10min 风控/5xx/429) + vitals + health + accounts；只出数不做阈值判断（阈值与降噪在主机侧 cron，token 不入仓） |
 | `GET /admin/api/monitoring/history?days=N` | 磁盘历史聚合（1–30 天）：按天曲线 + accounts/models/channels/clients 分组 + 错误 TOP + 码直方图/stop_reason/去重数/断开率/净耗时/唯一客户端与会话数，并内嵌 `conc` 并发曲线（只回统计不回明细） |
 | `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比 + cache_read **三档**均值（首见 / 窗口内复见 / 窗口外复见）。判读看 `cache_read_repeat_in_avg` 对 `cache_read_first_avg`；窗口外那档只用来解释「整体复见为何不涨」。旧字段 `cache_read_repeat_avg` 保持混档原义（向后兼容） |
