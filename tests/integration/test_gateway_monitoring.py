@@ -18,9 +18,9 @@ ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
 def _clean_reqlog():
     from app import reqlog
 
-    reqlog.clear()
+    reqlog._reset_for_tests()
     yield
-    reqlog.clear()
+    reqlog._reset_for_tests()
 
 
 @pytest.mark.integration

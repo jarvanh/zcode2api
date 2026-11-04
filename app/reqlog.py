@@ -551,6 +551,28 @@ def finish_error(req_id: str, error: str, status: int | None = None,
     _persist(row)
 
 
+def _reset_for_tests() -> None:
+    """测试复位：内存条目 + 在途字典 + 并发仪表一起清零（与 dedup._reset_for_tests 同范式）。
+
+    clear() 故意保留 _inflight（「清空」不该把在途请求的收口一起抹掉），但用例隔离
+    必须连它一起清 —— 否则上一用例遗留的在途条目会污染本用例的并发绝对读数
+    （2026-11-04 实测：重放收口用例读到 client=3，全是跨用例泄漏）。
+    """
+    global _queue_now, _conc_day, _conc_flushed
+    with _lock:
+        _entries.clear()
+        _inflight.clear()
+        _queue_now = 0
+        _conc.clear()
+        _conc.update({"client": 0, "slot": 0, "queue": 0, "limit": 0, "per": {}})
+        _conc_peak.clear()
+        _conc_peak.update({"client": 0, "slot": 0, "queue": 0, "at": 0.0, "kind": ""})
+        _conc_min.clear()
+        _conc_day = ""
+        _conc_flushed = -1
+        _pending_flush.clear()
+
+
 def snapshot() -> list[dict]:
     """全部条目，最新在前（含在途）。"""
     with _lock:

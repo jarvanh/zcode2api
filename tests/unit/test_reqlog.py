@@ -19,9 +19,9 @@ def _clean(tmp_path, monkeypatch):
     （model="m"、耗时微秒级、账号为空），监控页统计被虚高近 5 倍。
     """
     monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
-    reqlog.clear()
+    reqlog._reset_for_tests()
     yield
-    reqlog.clear()
+    reqlog._reset_for_tests()
 
 
 class TestRingBuffer:
