@@ -54,6 +54,9 @@ class TestForecastHonesty:
         assert f["eta"] is None and f["eta_reliable"] is False
         assert f["reasons"] and "至少 2 次" in " ".join(f["reasons"])
         assert f["next_refill"]["kind"] == "day_reset"
+        # next_refill 必须和 refills 同批 dict：漏了 in_seconds 前端就显示「—」
+        assert isinstance(f["next_refill"]["in_seconds"], (int, float))
+        assert f["next_refill"]["in_seconds"] > 0
 
     def test_contradictory_ledger_refuses_eta(self, tmp_path):
         """exhausted 但 remaining>0 = 两套账矛盾，即便有速率也必须拒绝外推。"""

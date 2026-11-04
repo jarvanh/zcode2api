@@ -235,13 +235,19 @@ def forecast(accounts: list, days: int = 3) -> dict:
     if contradictory:
         reasons.append("账本不一致：存在 exhausted 账号仍显示 remaining>0（balance 与 grant 两套账），拒绝外推")
 
+    # 先给每个候选补 in_seconds，再从**同一批 dict**里取承诺项：
+    # 早先 refills 用 {**r} 造新 dict、next_refill 却从原 refills 取，导致
+    # next_refill 缺 in_seconds（前端显示「—」），线上 v2.9.16 实测抓到。
+    points = [{**r, "in_seconds": round(r["at"] - now)} for r in refills]
+    committed = next((r for r in points if r.get("committed")),
+                     points[0] if points else None)
     return {
         "generated_at": now,
         "days": days,
         "snapshots": len(rows),
-        "refills": [{**r, "in_seconds": round(r["at"] - now)} for r in refills],
+        "refills": points,
         # 承诺时刻由 quota_windows 判定（= earliest），不是简单取列表第一项
-        "next_refill": next((r for r in refills if r.get("committed")), refills[0] if refills else None),
+        "next_refill": committed,
         "rates": rate,
         "eta": eta,
         "eta_basis": eta_basis,
