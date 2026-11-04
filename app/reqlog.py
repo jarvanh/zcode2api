@@ -9,6 +9,18 @@
 - 粒度：一次客户端请求一条；多账号重试不分裂，账号字段记录最终归宿；
   up 标记是否真实发起过上游调用（调度失败·未达上游的行，账号名仅供参考）
 - ok 三态：None=在途/未知，True=成功，False=失败（含客户端断开 status=499）
+- 排障维度（2026-11-04 增补）：
+    · 来源：client_ip / ua / path / probe（X-Probe 探测标记）
+    · 路由：mode（凭证：jwt/key）、channel（业务通道：plan/apikey）、
+      egress（出口：direct/proxy/account）
+    · 尝试梯子：att 记录每次账号尝试（通道/状态/耗时/失败原因，最多 8 条）
+    · 耗时拆解：wait_q 排队、wait_rl 429 等待、wait_5xx 重试等待、
+      wait_cap 验证码等待；retry_* 为各原因重试计数
+    · 错误分类：err_kind（client/risk/quota/rate/upstream/network/...）
+      + err_code（上游业务码，如 3012/1005/1113）
+    · 上游追踪：upstream_id（响应头 cf-ray / x-request-id 等）
+- 隐私：client_ip/ua 只用于本机排障，随历史保留 HISTORY_DAYS 天，不对外回传
+  除管理端外的任何接口。
 - 纯观测：不触碰账号状态与调度逻辑；落盘失败只记日志，绝不影响请求
 """
 
@@ -26,12 +38,18 @@ from . import logs, settings
 KEEP = 500
 # 磁盘历史保留天数（与前端「30 天」视图上限对齐，超出按天文件整体删除）
 HISTORY_DAYS = 30
-# 聚合分组回传条数上限（账号/模型可能很多，超过按调用量截断）
+# 聚合分组回传条数上限（账号/模型/客户端可能很多，超过按调用量截断）
 TOP_GROUPS = 50
 TOP_ERRORS = 8
+# 单请求尝试梯子上限：MAX_ACCOUNT_ATTEMPTS=5，留一点余量给回退/补码重试
+MAX_ATTEMPTS = 8
 
 _BJ = timezone(timedelta(hours=8))
 _PREFIX = "reqlog-"
+
+# 耗时拆解/重试计数的合法键（拼错时静默忽略，观测代码不因笔误抛异常）
+_WAIT_KEYS = ("q", "rl", "5xx", "cap")
+_RETRY_KEYS = ("429", "5xx", "cap", "fb")
 
 _lock = threading.Lock()
 _entries: deque = deque(maxlen=KEEP)
@@ -41,21 +59,53 @@ _hist_lock = threading.Lock()
 _last_prune_day = ""
 
 
-def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "") -> None:
-    """请求进入网关（鉴权通过、body 解析成功后）。"""
+def _clip(value, limit: int) -> str:
+    """观测字段统一截断（None → 空串，绝不把非字符串塞进日志）。"""
+    return str(value or "")[:limit]
+
+
+def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "",
+          *, path: str = "", client_ip: str = "", ua: str = "", probe: bool = False,
+          msgs: int | None = None, max_tokens: int | None = None,
+          model_req: str = "") -> None:
+    """请求进入网关（鉴权通过、body 解析成功后）。
+
+    新增字段全部带默认值：旧调用点不传也能工作；网关三个入口（messages /
+    chat / responses）会补齐来源与请求形状。
+    """
     entry = {
         "req_id": req_id,
         "ts": time.time(),
         "endpoint": endpoint,
+        "path": _clip(path or endpoint, 80),
         "model": model,
+        "model_req": _clip(model_req, 80),
         "stream": bool(stream),
         "preview": (preview or "")[:80],
+        "client_ip": _clip(client_ip, 64),
+        "ua": _clip(ua, 96),
+        "probe": bool(probe),
+        "msgs": msgs if isinstance(msgs, int) else None,
+        "max_tokens": max_tokens if isinstance(max_tokens, int) else None,
         "account": "",
         "mode": "",
+        "channel": "",
+        "egress": "",
         "up": False,
+        "att": [],
+        "wait_q": 0.0,
+        "wait_rl": 0.0,
+        "wait_5xx": 0.0,
+        "wait_cap": 0.0,
+        "retry_429": 0,
+        "retry_5xx": 0,
+        "retry_cap": 0,
+        "retry_fb": 0,
         "ok": None,
         "status": None,
         "error": "",
+        "err_code": None,
+        "err_kind": "",
         "t_first": None,
         "t_total": None,
         "input_tokens": None,
@@ -63,6 +113,8 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "cache_read": None,
         "sess": None,
         "sess_repeat": None,
+        "upstream_id": "",
+        "stop_reason": None,
     }
     with _lock:
         _entries.append(entry)
@@ -87,6 +139,22 @@ def mark_account(req_id: str, account_name: str, mode: str) -> None:
             entry["mode"] = mode
 
 
+def mark_channel(req_id: str, channel: str) -> None:
+    """记录最终命中的业务通道：plan（Coding Plan）或 apikey（回退）。"""
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["channel"] = _clip(channel, 20)
+
+
+def mark_egress(req_id: str, egress: str) -> None:
+    """记录最后一次尝试的出口：direct / proxy / account（账号级代理）。"""
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["egress"] = _clip(egress, 20)
+
+
 def mark_upstream(req_id: str) -> None:
     """标记本请求已真实发往上游（首次置位后不复位）。
 
@@ -101,9 +169,70 @@ def mark_upstream(req_id: str) -> None:
             entry["up"] = True
 
 
+def mark_upstream_meta(req_id: str, upstream_id: str = "") -> None:
+    """记录上游响应头里的追踪标识（cf-ray / x-request-id），便于跨系统对账。"""
+    if not upstream_id:
+        return
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["upstream_id"] = _clip(upstream_id, 120)
+
+
+def mark_attempt(req_id: str, account_name: str, mode: str = "", channel: str = "",
+                 status: int | None = None, ms: float | None = None,
+                 error: str = "", code: int | None = None) -> None:
+    """追加一次账号尝试（失败换号 / 回退 / 最终成败都算）。
+
+    只留观测必需的元数据：账号名、凭证类型、通道、上游状态码、耗时、失败原因。
+    错误原因压成单行 80 字，避免把整段上游 body 复制进环形日志。
+    """
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is None:
+            return
+        att = entry["att"]
+        if len(att) >= MAX_ATTEMPTS:
+            return
+        item = {
+            "acc": _clip(account_name, 40),
+            "mode": _clip(mode, 10),
+            "ch": _clip(channel, 12),
+            "st": status,
+            "ms": round(ms, 3) if isinstance(ms, (int, float)) else None,
+        }
+        if code is not None:
+            item["code"] = code
+        err = " ".join((error or "").split())[:80]
+        if err:
+            item["err"] = err
+        att.append(item)
+
+
+def note_wait(req_id: str, kind: str, seconds: float | None) -> None:
+    """累计一类等待耗时（q=排队 / rl=429 / 5xx / cap=验证码）。"""
+    if kind not in _WAIT_KEYS or not isinstance(seconds, (int, float)) or seconds <= 0:
+        return
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry[f"wait_{kind}"] += float(seconds)
+
+
+def note_retry(req_id: str, kind: str) -> None:
+    """计数一类重试（429 / 5xx / cap=补码 / fb=通道回退）。"""
+    if kind not in _RETRY_KEYS:
+        return
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry[f"retry_{kind}"] += 1
+
+
 def finish_ok(req_id: str, t_first: float | None = None,
               input_tokens: int | None = None, output_tokens: int | None = None,
-              status: int | None = None, cache_read: int | None = None) -> None:
+              status: int | None = None, cache_read: int | None = None,
+              stop_reason: str | None = None) -> None:
     with _lock:
         entry = _inflight.pop(req_id, None)
         if entry is None:
@@ -115,12 +244,15 @@ def finish_ok(req_id: str, t_first: float | None = None,
         entry["input_tokens"] = input_tokens
         entry["output_tokens"] = output_tokens
         entry["cache_read"] = cache_read
+        if stop_reason:
+            entry["stop_reason"] = _clip(stop_reason, 20)
         row = dict(entry)
     _persist(row)
 
 
 def finish_error(req_id: str, error: str, status: int | None = None,
-                 t_first: float | None = None) -> None:
+                 t_first: float | None = None, *, code: int | None = None,
+                 kind: str = "") -> None:
     with _lock:
         entry = _inflight.pop(req_id, None)
         if entry is None:
@@ -130,6 +262,10 @@ def finish_error(req_id: str, error: str, status: int | None = None,
         entry["error"] = (error or "")[:200]
         entry["t_first"] = t_first
         entry["t_total"] = time.time() - entry["ts"]
+        if code is not None:
+            entry["err_code"] = code
+        if kind:
+            entry["err_kind"] = _clip(kind, 20)
         row = dict(entry)
     _persist(row)
 
@@ -141,10 +277,13 @@ def snapshot() -> list[dict]:
 
 
 def clear() -> None:
-    """清空内存实时层（磁盘历史不受影响）。"""
+    """清空内存实时层（磁盘历史不受影响）。
+
+    故意不清 _inflight：在途条目已从 _entries 摘除但对象仍在 _inflight 里，
+    收口时照旧落盘历史 —— 否则「清空」会把正在跑的请求的结局一起抹掉。
+    """
     with _lock:
         _entries.clear()
-        _inflight.clear()
 
 
 # ── 磁盘历史 ─────────────────────────────────────────────────────────────────
@@ -175,6 +314,10 @@ def _maybe_prune(data_dir: Path) -> None:
                 logs.warn("reqlog", f"历史文件清理失败（忽略）: {path.name} {err}")
 
 
+def _retry_total(entry: dict) -> int:
+    return sum(int(entry.get(f"retry_{k}") or 0) for k in _RETRY_KEYS)
+
+
 def _persist(entry: dict) -> None:
     """终态条目落盘（best-effort）。"""
     try:
@@ -184,11 +327,19 @@ def _persist(entry: dict) -> None:
             "ts": round(entry.get("ts") or 0, 3),
             "ok": entry.get("ok"),
             "status": entry.get("status"),
+            "kind": entry.get("err_kind") or "",
+            "code": entry.get("err_code"),
             "account": entry.get("account") or "",
             "mode": entry.get("mode") or "",
+            "ch": entry.get("channel") or "",
+            "eg": entry.get("egress") or "",
             "up": bool(entry.get("up") or False),
             "model": entry.get("model") or "",
             "endpoint": entry.get("endpoint") or "",
+            "path": entry.get("path") or "",
+            "ip": entry.get("client_ip") or "",
+            "ua": entry.get("ua") or "",
+            "probe": bool(entry.get("probe")),
             "stream": bool(entry.get("stream")),
             "t_first": entry.get("t_first"),
             "t_total": entry.get("t_total"),
@@ -198,6 +349,15 @@ def _persist(entry: dict) -> None:
             # 会话亲和观测（app/session_ctx.py）：sess 是内容哈希非正文
             "sess": entry.get("sess"),
             "sess_repeat": entry.get("sess_repeat"),
+            # 尝试梯子只落条数与各原因重试计数，明细留在实时页
+            "att": len(entry.get("att") or []),
+            "rt": _retry_total(entry),
+            "q": round(float(entry.get("wait_q") or 0), 2),
+            "rl": round(float(entry.get("wait_rl") or 0), 2),
+            "5xx": round(float(entry.get("wait_5xx") or 0), 2),
+            "cap": round(float(entry.get("wait_cap") or 0), 2),
+            "trace": entry.get("upstream_id") or "",
+            "stop": entry.get("stop_reason") or "",
             # 历史只留错误摘要（明细 preview 含用户内容，不进磁盘）
             "err": (entry.get("error") or "")[:160],
         }
@@ -216,7 +376,9 @@ def _persist(entry: dict) -> None:
 
 def _new_bucket(key: str = "") -> dict:
     return {"name": key, "calls": 0, "ok": 0, "fail": 0, "in": 0, "out": 0,
-            "ttfb_sum": 0.0, "ttfb_n": 0, "last": 0.0}
+            "probe": 0, "wait": 0.0, "retry": 0,
+            "ttfb_sum": 0.0, "ttfb_n": 0, "total_sum": 0.0, "total_n": 0,
+            "last": 0.0}
 
 
 def _acc(bucket: dict, row: dict) -> None:
@@ -228,10 +390,18 @@ def _acc(bucket: dict, row: dict) -> None:
         bucket["fail"] += 1
     bucket["in"] += int(row.get("in") or 0)
     bucket["out"] += int(row.get("out") or 0)
+    if row.get("probe"):
+        bucket["probe"] += 1
+    bucket["wait"] += float(row.get("q") or 0)
+    bucket["retry"] += int(row.get("rt") or 0)
     tf = row.get("t_first")
     if isinstance(tf, (int, float)):
         bucket["ttfb_sum"] += float(tf)
         bucket["ttfb_n"] += 1
+    tt = row.get("t_total")
+    if isinstance(tt, (int, float)):
+        bucket["total_sum"] += float(tt)
+        bucket["total_n"] += 1
     ts = row.get("ts") or 0
     if ts > bucket["last"]:
         bucket["last"] = ts
@@ -247,8 +417,12 @@ def _finalize(bucket: dict) -> dict:
         "rate": round(bucket["ok"] / done * 100, 1) if done else None,
         "in": bucket["in"],
         "out": bucket["out"],
+        "probe": bucket["probe"],
+        "wait": round(bucket["wait"], 1),
+        "retry": bucket["retry"],
         "ttfb": round(bucket["ttfb_sum"] / bucket["ttfb_n"], 3) if bucket["ttfb_n"] else None,
         "ttfb_n": bucket["ttfb_n"],
+        "total": round(bucket["total_sum"] / bucket["total_n"], 3) if bucket["total_n"] else None,
         "last": bucket["last"] or None,
     }
 
@@ -272,6 +446,8 @@ def history(days: int = 7) -> dict:
     daily: dict[str, dict] = {d: _new_bucket(d) for d in day_list}
     accounts: dict[str, dict] = {}
     models: dict[str, dict] = {}
+    channels: dict[str, dict] = {}
+    clients: dict[str, dict] = {}
     errors: dict[str, int] = {}
     total = _new_bucket()
 
@@ -293,10 +469,16 @@ def history(days: int = 7) -> dict:
             _acc(daily[day], row)
             acc_key = row.get("account") or "—"
             mdl_key = row.get("model") or "—"
+            ch_key = row.get("ch") or "—"
+            cli_key = row.get("ip") or "—"
             accounts.setdefault(acc_key, _new_bucket(acc_key))
             models.setdefault(mdl_key, _new_bucket(mdl_key))
+            channels.setdefault(ch_key, _new_bucket(ch_key))
+            clients.setdefault(cli_key, _new_bucket(cli_key))
             _acc(accounts[acc_key], row)
             _acc(models[mdl_key], row)
+            _acc(channels[ch_key], row)
+            _acc(clients[cli_key], row)
             if row.get("ok") is False:
                 err = (row.get("err") or f"HTTP {row.get('status') or '未知'}")[:80] or "失败"
                 errors[err] = errors.get(err, 0) + 1
@@ -310,6 +492,8 @@ def history(days: int = 7) -> dict:
         "daily": [_finalize(daily[d]) for d in day_list],
         "accounts": _top(accounts),
         "models": _top(models),
+        "channels": _top(channels),
+        "clients": _top(clients),
         "errors": [{"error": e, "count": c} for e, c in
                    sorted(errors.items(), key=lambda kv: -kv[1])[:TOP_ERRORS]],
     }

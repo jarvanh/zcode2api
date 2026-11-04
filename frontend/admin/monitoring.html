@@ -15,7 +15,7 @@
   <div class="page-hd">
     <div>
       <div class="page-title">请求监控</div>
-      <div class="page-sub">网关请求观测 · 实时为内存环形日志（最近 500 条，重启清零）· 7 / 30 天取自磁盘历史（按天聚合，保留 30 天）</div>
+      <div class="page-sub">网关请求观测 · 实时为内存环形日志（最近 500 条，重启清零）· 7 / 30 天取自磁盘历史（按天聚合，保留 30 天）<br>行点开看详情：来源 IP / UA、通道与出口、账号尝试梯子、排队与重试拆解、业务错误码、上游追踪 ID</div>
     </div>
     <div class="page-actions">
       <span class="live-dot" id="live-dot">实时监控中</span>
@@ -49,6 +49,8 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">输入</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-in">—</div><div class="stat-sub" id="s-in-sub"></div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">输出</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-out">—</div><div class="stat-sub" id="s-out-sub"></div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均首字</div><span class="stat-icon" style="color:var(--blue)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/></svg></span></div><div class="stat-num" id="s-ttfb" style="color:var(--blue)">—</div><div class="stat-sub" id="s-ttfb-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均总耗时</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span></div><div class="stat-num" id="s-total">—</div><div class="stat-sub" id="s-total-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">重试 / 排队</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></span></div><div class="stat-num" id="s-retry" style="color:var(--amber)">—</div><div class="stat-sub" id="s-retry-sub"></div></div>
   </div>
 
   <div class="cap-panel">
@@ -66,7 +68,9 @@
     <div class="mon-tabs" id="mon-tabs">
       <button class="mon-tab" data-tab="account" onclick="setTab('account')">账号</button>
       <button class="mon-tab" data-tab="model" onclick="setTab('model')">模型</button>
-      <button class="mon-tab" data-tab="daily" onclick="setTab('daily')">每日</button>
+      <button class="mon-tab" data-tab="channel" onclick="setTab('channel')">渠道</button>
+      <button class="mon-tab" data-tab="client" onclick="setTab('client')">客户端</button>
+      <button class="mon-tab" data-tab="daily" id="tab-daily" onclick="setTab('daily')">每日</button>
       <button class="mon-tab active" data-tab="live" onclick="setTab('live')" id="tab-live">实时 <span class="mon-tab-count" id="live-count">0</span></button>
     </div>
     <div class="section-meta" id="last-updated"></div>
@@ -90,6 +94,19 @@ const HIST_DAYS = { '7d': 7, '30d': 30 };
 const isHist = () => state.range in HIST_DAYS;
 
 const $ = id => document.getElementById(id);
+const openDetails = new Set();
+
+function pct(vals, p){
+  if(!vals.length)return null;
+  const a=[...vals].sort((x,y)=>x-y);
+  return a[Math.min(a.length-1, Math.floor((a.length-1)*p))];
+}
+function retryTotal(e){
+  return (e.retry_429||0)+(e.retry_5xx||0)+(e.retry_cap||0)+(e.retry_fb||0);
+}
+function waitTotal(e){
+  return (e.wait_q||0)+(e.wait_rl||0)+(e.wait_5xx||0)+(e.wait_cap||0);
+}
 
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function pad(n){return String(n).padStart(2,'0');}
@@ -128,7 +145,7 @@ function filtered(){
     if(state.status==='fail'&&e.ok!==false)return false;
     if(state.status==='inflight'&&e.ok!==null)return false;
     if(q){
-      const hay=`${e.account} ${e.model} ${e.preview} ${e.error} ${e.endpoint}`.toLowerCase();
+      const hay=`${e.account} ${e.model} ${e.model_req} ${e.preview} ${e.error} ${e.endpoint} ${e.path} ${e.client_ip} ${e.ua} ${e.req_id} ${e.channel} ${e.egress} ${e.err_code||''} ${(e.att||[]).map(a=>a.acc+' '+a.err).join(' ')}`.toLowerCase();
       if(!hay.includes(q))return false;
     }
     return true;
@@ -140,25 +157,48 @@ function renderStats(list){
   const ok=list.filter(e=>e.ok===true).length;
   const fail=list.filter(e=>e.ok===false).length;
   const inflight=list.filter(e=>e.ok===null).length;
+  const probes=list.filter(e=>e.probe).length;
   const tin=list.reduce((a,e)=>a+(e.input_tokens||0),0);
   const tout=list.reduce((a,e)=>a+(e.output_tokens||0),0);
   const ttfbs=list.filter(e=>e.t_first!=null).map(e=>e.t_first);
   const ttfb=ttfbs.length?ttfbs.reduce((a,b)=>a+b,0)/ttfbs.length:null;
+  const totals=list.filter(e=>e.t_total!=null).map(e=>e.t_total);
+  const avgTotal=totals.length?totals.reduce((a,b)=>a+b,0)/totals.length:null;
+  const retries=list.reduce((a,e)=>a+retryTotal(e),0);
+  const queued=list.filter(e=>(e.wait_q||0)>0);
+  const queuedSecs=list.reduce((a,e)=>a+(e.wait_q||0),0);
+  // 输出速率：只算有输出 token 且知道首字后耗时的成功请求
+  let genSecs=0;
+  for(const e of list){
+    if(e.output_tokens&&e.t_total!=null&&e.t_first!=null&&e.t_total>e.t_first)genSecs+=e.t_total-e.t_first;
+  }
+  const tps=genSecs>0?tout/genSecs:null;
+  const errCounts={};
+  for(const e of list){
+    if(e.ok!==false)continue;
+    const k=e.err_code?`业务码 ${e.err_code}`:(e.status?`HTTP ${e.status}`:(e.err_kind||'失败'));
+    errCounts[k]=(errCounts[k]||0)+1;
+  }
+  const topErr=Object.entries(errCounts).sort((a,b)=>b[1]-a[1])[0];
 
   $('s-calls').textContent=total;
-  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${state.keep} 条`;
+  $('s-calls-sub').textContent=`进行中 ${inflight} · 探测 ${probes} · 内存保留 ${state.keep} 条`;
   $('s-rate').textContent=total?(ok/(ok+fail||1)*100).toFixed(1)+'%':'—';
-  $('s-rate-sub').textContent=`成功 ${ok}`;
+  $('s-rate-sub').textContent=`成功 ${ok} · 失败 ${fail}`;
   $('s-fail').textContent=fail;
-  $('s-fail-sub').textContent=fail?'点击「失败」筛选查看':'';
+  $('s-fail-sub').textContent=topErr?`最多：${topErr[0]} × ${topErr[1]}`:(fail?'点击「失败」筛选查看':'');
   $('s-tok').textContent=(tin||tout)?fmtTok(tin+tout):'—';
-  $('s-tok-sub').textContent='仅非流式与 OpenAI 流可统计';
+  $('s-tok-sub').textContent=tps!=null?`输出速率 ${tps.toFixed(1)} tok/s`:'仅非流式与 OpenAI 流可统计';
   $('s-in').textContent=fmtTok(tin);
   $('s-in-sub').textContent=`占比 ${tin+tout?Math.round(tin/(tin+tout)*100):0}%`;
   $('s-out').textContent=fmtTok(tout);
   $('s-out-sub').textContent=`占比 ${tin+tout?Math.round(tout/(tin+tout)*100):0}%`;
   $('s-ttfb').textContent=ttfb!=null?fmtSec(ttfb):'—';
-  $('s-ttfb-sub').textContent=ttfbs.length?`样本 ${ttfbs.length}`:'';
+  $('s-ttfb-sub').textContent=ttfbs.length?`P95 ${fmtSec(pct(ttfbs,0.95))} · 样本 ${ttfbs.length}`:'';
+  $('s-total').textContent=avgTotal!=null?fmtSec(avgTotal):'—';
+  $('s-total-sub').textContent=totals.length?`P95 ${fmtSec(pct(totals,0.95))} · 样本 ${totals.length}`:'';
+  $('s-retry').textContent=retries;
+  $('s-retry-sub').textContent=`排队 ${queued.length} 次 · 累计 ${fmtSec(queuedSecs)}`;
 
   // 近 30 分钟每分钟调用量走势
   const now=Math.floor(Date.now()/1000/60);
@@ -173,14 +213,73 @@ function renderStats(list){
 }
 
 function statusCell(e){
-  if(e.ok===true)return `<span class="badge badge-active">成功</span>`;
-  if(e.ok===null)return `<span class="badge badge-cooling">进行中</span>`;
-  if(e.status===499)return `<span class="badge badge-invalid" title="${esc(e.error||'')}">${e.up===false?'客户端断开·未达上游':'客户端断开'}</span>`;
-  // up=false = 请求未发起过上游调用（排队放弃/无号可选）：账号名仅供参考，
-  // 不代表该号被服务或被打挂；up=true/undefined（旧数据）= 账号归属真实
-  const kind=e.up===false?'调度失败':'失败';
-  const label=`${kind}${e.status?` · HTTP ${e.status}`:''}`;
-  return `<span class="badge badge-invalid" title="${esc(e.error||'')}">${label}</span>`;
+  let html;
+  if(e.ok===true)html=`<span class="badge badge-active">成功</span>`;
+  else if(e.ok===null)html=`<span class="badge badge-cooling">进行中</span>`;
+  else if(e.status===499)html=`<span class="badge badge-invalid" title="${esc(e.error||'')}">${e.up===false?'客户端断开·未达上游':'客户端断开'}</span>`;
+  else{
+    // up=false = 请求未发起过上游调用（排队放弃/无号可选）：账号名仅供参考，
+    // 不代表该号被服务或被打挂；up=true/undefined（旧数据）= 账号归属真实
+    const kind=e.up===false?'调度失败':'失败';
+    const label=`${kind}${e.status?` · HTTP ${e.status}`:''}`;
+    html=`<span class="badge badge-invalid" title="${esc(e.error||'')}">${label}</span>`;
+  }
+  const tries=(e.att||[]).length;
+  if(tries>1)html+=`<span class="mon-retry" title="账号尝试 ${tries} 次">×${tries}</span>`;
+  if((e.wait_q||0)>0)html+=`<span class="mon-queue" title="排队等待 ${fmtSec(e.wait_q)}">⏳${fmtSec(e.wait_q)}</span>`;
+  return html;
+}
+
+function detailHtml(e){
+  const kv=(k,v,wide)=>{
+    if(v==null||v==='')return '';
+    return `<div class="mon-kv${wide?' wide':''}"><span class="mon-k">${k}</span><span class="mon-v">${esc(v)}</span></div>`;
+  };
+  const tps=(e.output_tokens&&e.t_total!=null&&e.t_first!=null&&e.t_total>e.t_first)
+    ?(e.output_tokens/(e.t_total-e.t_first)).toFixed(1)+' tok/s':'';
+  const waits=[];
+  if(e.wait_q>0)waits.push(`排队 ${fmtSec(e.wait_q)}`);
+  if(e.wait_rl>0)waits.push(`429 ${fmtSec(e.wait_rl)}`);
+  if(e.wait_5xx>0)waits.push(`5xx ${fmtSec(e.wait_5xx)}`);
+  if(e.wait_cap>0)waits.push(`验证码 ${fmtSec(e.wait_cap)}`);
+  const retries=[];
+  if(e.retry_429)retries.push(`429×${e.retry_429}`);
+  if(e.retry_5xx)retries.push(`5xx×${e.retry_5xx}`);
+  if(e.retry_cap)retries.push(`补码×${e.retry_cap}`);
+  if(e.retry_fb)retries.push(`回退×${e.retry_fb}`);
+  const att=(e.att||[]).map((a,i)=>`<div class="mon-att">
+      <span class="mon-att-n">#${i+1}</span><span>${esc(a.acc||'—')}</span>
+      <span class="mon-ch-b">${esc(a.ch||a.mode||'')}</span>
+      <span>${a.st?('HTTP '+a.st):'未达上游'}</span>
+      <span>${a.ms!=null?fmtSec(a.ms/1000):'—'}</span>
+      ${a.err?`<span class="mon-att-err">${esc(a.err)}</span>`:''}
+    </div>`).join('');
+  return `<div class="mon-detail">
+    <div class="mon-kv"><span class="mon-k">请求 ID</span><span class="mon-v">${esc(e.req_id)}</span></div>
+    ${kv('路径', e.path||e.endpoint)}
+    ${kv('客户端 IP', e.client_ip)}
+    ${kv('UA', e.ua)}
+    ${kv('模型', e.model_req&&e.model_req!==e.model?`${e.model_req} → ${e.model}`:e.model)}
+    ${kv('账号 / 凭证', `${e.account||'—'}${e.mode?' · '+e.mode:''}`)}
+    ${kv('通道 / 出口', `${e.channel||'—'}${e.egress?' · '+e.egress:''}`)}
+    ${kv('请求形状', e.msgs!=null?`${e.msgs} 条消息${e.max_tokens?` · max_tokens ${e.max_tokens}`:''}`:'')}
+    ${kv('耗时', [e.t_first!=null?`首字 ${fmtSec(e.t_first)}`:'',e.t_total!=null?`总 ${fmtSec(e.t_total)}`:'',tps].filter(Boolean).join(' · '))}
+    ${kv('Token', `输入 ${fmtTok(e.input_tokens)} · 输出 ${fmtTok(e.output_tokens)}${e.cache_read?` · 缓存 ${fmtTok(e.cache_read)}`:''}`)}
+    ${kv('等待', waits.join(' · ')||'无')}
+    ${kv('重试', retries.join(' · ')||'无')}
+    ${kv('错误', `${e.err_kind||''}${e.err_code?` / 业务码 ${e.err_code}`:''}${e.error?` · ${e.error}`:''}`.trim(), true)}
+    ${kv('上游追踪', e.upstream_id)}
+    ${kv('会话', e.sess?`${e.sess}${e.sess_repeat?' · 复见':''}`:'')}
+    ${kv('探测', e.probe?'是（X-Probe）':'')}
+    ${att?`<div class="mon-att-list wide"><div class="mon-k">尝试梯子</div>${att}</div>`:''}
+  </div>`;
+}
+
+function toggleDetail(id){
+  const el=document.getElementById('mon-d-'+id);
+  if(!el)return;
+  if(openDetails.has(id)){openDetails.delete(id);el.hidden=true;}
+  else{openDetails.add(id);el.hidden=false;}
 }
 
 function tickbarHtml(items){
@@ -188,10 +287,15 @@ function tickbarHtml(items){
   return `<span class="tickbar">${items.map(e=>`<i class="${e.ok===true?'ok':e.ok===false?'bad':''}" title="${esc(fmtTs(e.ts))} ${e.ok===true?'成功':e.ok===false?esc(e.error||'失败'):'进行中'}"></i>`).join('')}</span>`;
 }
 
+const AGG_FIELD={account:'account',model:'model',channel:'channel',client:'client_ip'};
+const AGG_LABEL={account:'账号',model:'模型',channel:'渠道',client:'客户端'};
+const HIST_FIELD={account:'accounts',model:'models',channel:'channels',client:'clients'};
+
 function renderAgg(key){
+  const field=AGG_FIELD[key]||'account';
   const map=new Map();
   for(const e of filtered()){
-    const k=e[key]||'—';
+    const k=e[field]||'—';
     if(!map.has(k))map.set(k,{name:k,items:[],ok:0,fail:0,inflight:0,tin:0,tout:0,ttfbs:[],last:null});
     const g=map.get(k);
     g.items.push(e);
@@ -201,7 +305,7 @@ function renderAgg(key){
     if(!g.last||e.ts>g.last)g.last=e.ts;
   }
   const rows=[...map.values()].sort((a,b)=>(b.ok+b.fail+b.inflight)-(a.ok+a.fail+a.inflight));
-  const head=`<div class="mon-head mon-grid-agg"><span>${key==='account'?'账号':'模型'}</span><span>最近状态</span><span>成功率</span><span>调用</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
+  const head=`<div class="mon-head mon-grid-agg"><span>${AGG_LABEL[key]||key}</span><span>最近状态</span><span>成功率</span><span>调用</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
   const body=rows.map(g=>{
     const done=g.ok+g.fail;
     const rate=done?Math.round(g.ok/done*100)+'%':'—';
@@ -222,52 +326,62 @@ function renderAgg(key){
 
 function renderLive(){
   const head=`<div class="mon-head mon-grid-live"><span>时间</span><span>账号</span><span>模型</span><span>状态</span><span>首字</span><span>总耗时</span><span>输入</span><span>输出</span><span>内容 / 错误</span></div>`;
-  const body=filtered().slice(0,200).map(e=>`
-    <div class="mon-row mon-grid-live">
-      <span class="mon-time">${fmtTs(e.ts)}</span>
-      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
-      <span class="mon-model" title="${esc(e.model||'')}">${esc(e.model||'—')}</span>
-      <span>${statusCell(e)}</span>
-      <span class="mon-num">${fmtSec(e.t_first)}</span>
-      <span class="mon-num">${fmtSec(e.t_total)}</span>
-      <span class="mon-num">${fmtTok(e.input_tokens)}</span>
-      <span class="mon-num">${fmtTok(e.output_tokens)}</span>
-      <span class="mon-preview" title="${esc(e.error||e.preview||'')}">${e.ok===false&&e.error?`<span class="err-line">${esc(e.error)}</span>`:esc(e.preview||'—')}${e.stream?' <span class="mon-stream">流</span>':''}</span>
-    </div>`).join('');
-  $('list').innerHTML=filtered().length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">所选时间范围内没有请求</div>`;
+  const list=filtered();
+  const body=list.slice(0,200).map(e=>{
+    const open=openDetails.has(e.req_id);
+    return `<div class="mon-item">
+      <div class="mon-row mon-grid-live" onclick="toggleDetail('${e.req_id}')" title="点击展开详情">
+        <span class="mon-time">${fmtTs(e.ts)}</span>
+        <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
+        <span class="mon-model" title="${esc(e.model||'')}">${esc(e.model||'—')}${e.channel?` <span class="mon-ch ${e.channel==='plan'?'plan':'key'}">${e.channel==='plan'?'PLAN':'KEY'}</span>`:''}</span>
+        <span class="mon-status">${statusCell(e)}</span>
+        <span class="mon-num">${fmtSec(e.t_first)}</span>
+        <span class="mon-num">${fmtSec(e.t_total)}</span>
+        <span class="mon-num">${fmtTok(e.input_tokens)}</span>
+        <span class="mon-num">${fmtTok(e.output_tokens)}</span>
+        <span class="mon-preview" title="${esc(e.error||e.preview||'')}">${e.ok===false&&e.error?`<span class="err-line">${esc(e.error)}</span>`:esc(e.preview||'—')}${e.stream?' <span class="mon-stream">流</span>':''}${e.probe?' <span class="mon-probe">探测</span>':''}</span>
+      </div>
+      <div class="mon-detail-wrap" id="mon-d-${e.req_id}" ${open?'':'hidden'}>${detailHtml(e)}</div>
+    </div>`;
+  }).join('');
+  $('list').innerHTML=list.length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">所选时间范围内没有请求</div>`;
 }
 
 // ── 磁盘历史（7 / 30 天）视图 ────────────────────────────────────────────────
 function histRows(key){
   if(!hist)return [];
   const q=state.q.trim().toLowerCase();
-  return (hist[key]||[]).filter(r=>!q||String(r.name).toLowerCase().includes(q));
+  return (hist[HIST_FIELD[key]||'accounts']||[]).filter(r=>!q||String(r.name).toLowerCase().includes(q));
 }
 
 function renderHistStats(){
   const t=hist.totals;
   $('s-calls').textContent=t.calls;
-  $('s-calls-sub').textContent=`${hist.from} ~ ${hist.to} · 磁盘历史`;
+  $('s-calls-sub').textContent=`${hist.from} ~ ${hist.to} · 磁盘历史 · 探测 ${t.probe||0}`;
   $('s-rate').textContent=t.rate!=null?t.rate.toFixed(1)+'%':'—';
-  $('s-rate-sub').textContent=`成功 ${t.ok}`;
+  $('s-rate-sub').textContent=`成功 ${t.ok} · 失败 ${t.fail}`;
   $('s-fail').textContent=t.fail;
-  $('s-fail-sub').textContent='';
+  $('s-fail-sub').textContent=(hist.errors&&hist.errors[0])?`最多：${hist.errors[0].error.slice(0,24)} × ${hist.errors[0].count}`:'';
   $('s-tok').textContent=(t.in||t.out)?fmtTok(t.in+t.out):'—';
-  $('s-tok-sub').textContent='仅非流式与 OpenAI 流可统计';
+  $('s-tok-sub').textContent='历史聚合无逐请求耗时';
   $('s-in').textContent=fmtTok(t.in);
   $('s-in-sub').textContent=`占比 ${t.in+t.out?Math.round(t.in/(t.in+t.out)*100):0}%`;
   $('s-out').textContent=fmtTok(t.out);
   $('s-out-sub').textContent=`占比 ${t.in+t.out?Math.round(t.out/(t.in+t.out)*100):0}%`;
   $('s-ttfb').textContent=t.ttfb!=null?fmtSec(t.ttfb):'—';
   $('s-ttfb-sub').textContent=t.ttfb_n?`样本 ${t.ttfb_n}`:'';
+  $('s-total').textContent=t.total!=null?fmtSec(t.total):'—';
+  $('s-total-sub').textContent='已收口请求均值';
+  $('s-retry').textContent=t.retry||0;
+  $('s-retry-sub').textContent=`排队累计 ${fmtSec(t.wait||0)}`;
   // 走势改为按天调用量（历史视图没有分钟级数据）
   $('s-calls-spark').innerHTML=spark(hist.daily.map(d=>d.calls),'var(--amber)');
   $('live-count').textContent='';
 }
 
 function renderHistAgg(key){
-  const rows=histRows(key==='account'?'accounts':'models');
-  const head=`<div class="mon-head mon-grid-hist"><span>${key==='account'?'账号':'模型'}</span><span>调用</span><span>成功</span><span>失败</span><span>成功率</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
+  const rows=histRows(key);
+  const head=`<div class="mon-head mon-grid-hist"><span>${AGG_LABEL[key]||key}</span><span>调用</span><span>成功</span><span>失败</span><span>成功率</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
   const body=rows.map(g=>`
     <div class="mon-row mon-grid-hist">
       <span class="mon-name" title="${esc(g.name)}">${esc(g.name)}</span>
@@ -280,7 +394,7 @@ function renderHistAgg(key){
       <span class="mon-num">${g.ttfb!=null?fmtSec(g.ttfb):'—'}</span>
       <span class="mon-time">${fmtTs(g.last)}</span>
     </div>`).join('');
-  $('list').innerHTML=rows.length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">${state.q?'没有匹配的账号 / 模型':'近 ' + hist.days + ' 天没有请求'}</div>`;
+  $('list').innerHTML=rows.length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">${state.q?`没有匹配的${AGG_LABEL[key]||''}`:'近 ' + hist.days + ' 天没有请求'}</div>`;
 }
 
 function errBlock(errors){
@@ -294,10 +408,12 @@ function errBlock(errors){
 function renderHistDaily(){
   const daily=hist.daily||[];
   const max=Math.max(...daily.map(d=>d.calls),1);
+  // 堆叠柱：底部红段=失败，顶部绿段=成功（只看调用量看不出成功率曲线）
   const chart=`<div class="hist-chart">${daily.map(d=>{
     const h=Math.max(d.calls?Math.round(d.calls/max*76):2,2);
-    return `<div class="hist-col" title="${d.name} · 调用 ${d.calls} · 成功 ${d.ok} · 失败 ${d.fail}">
-      <div class="hist-bar-wrap"><i class="hist-bar" style="height:${h}px"></i></div>
+    const fh=d.fail&&d.calls?Math.round(h*d.fail/d.calls):0;
+    return `<div class="hist-col" title="${d.name} · 调用 ${d.calls} · 成功 ${d.ok} · 失败 ${d.fail} · 探测 ${d.probe||0} · 排队 ${Math.round(d.wait||0)}s">
+      <div class="hist-bar-wrap"><i class="hist-bar" style="height:${h}px"><b class="hist-bar-fail" style="height:${fh}px"></b></i></div>
       <div class="hist-lbl">${d.name.slice(5)}</div>
     </div>`;
   }).join('')}</div>`;
@@ -305,7 +421,7 @@ function renderHistDaily(){
   const body=daily.map(d=>`
     <div class="mon-row mon-grid-hist">
       <span class="mon-name">${d.name}</span>
-      <span class="mon-num">${d.calls}</span>
+      <span class="mon-num" title="探测 ${d.probe||0} · 重试 ${d.retry||0} · 排队 ${Math.round(d.wait||0)}s">${d.calls}</span>
       <span class="mon-num">${d.ok}</span>
       <span class="mon-num"${d.fail?' style="color:var(--red)"':''}>${d.fail}</span>
       <span class="mon-num">${d.rate!=null?d.rate.toFixed(1)+'%':'—'}</span>
@@ -327,20 +443,24 @@ function render(){
   else{
     const list=filtered();
     renderStats(list);
-    if(tab==='live')renderLive();else renderAgg(tab);
+    if(tab==='live')renderLive();else if(tab==='daily')renderAgg('account');else renderAgg(tab);
   }
   $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
 }
 
-// 历史视图没有在途概念：实时页签与状态筛选在该模式下不适用，直接隐藏/禁用
+// 历史视图没有在途概念：实时页签与状态筛选在该模式下不适用，直接隐藏/禁用；
+// 实时视图没有按天聚合（数据只有 500 条内存），每日页签反向置灰。
 function syncMode(){
   const h=isHist();
   $('tab-live').classList.toggle('is-disabled',h);
   $('tab-live').title=h?'磁盘历史只存已收口请求（无在途），实时页签仅用于 1 小时 / 今天':'';
+  $('tab-daily').classList.toggle('is-disabled',!h);
+  $('tab-daily').title=h?'':'每日聚合需要磁盘历史，请切到 7 / 30 天';
   $('status-sel').style.display=h?'none':'';
   $('btn-clear').style.display=h?'none':'';
   $('live-dot').textContent=h?'历史聚合':'实时监控中';
   if(h&&tab==='live')tab='account';
+  if(!h&&tab==='daily')tab='account';
 }
 
 function renderChips(){
@@ -359,6 +479,7 @@ function setRange(v){
 function syncTabs(){document.querySelectorAll('.mon-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));}
 function setTab(t){
   if(isHist()&&t==='live')return;
+  if(!isHist()&&t==='daily')return;
   tab=t;syncTabs();render();
 }
 function onSearch(v){state.q=v;render();}

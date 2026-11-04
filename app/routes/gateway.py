@@ -56,6 +56,53 @@ def is_probe_request(headers) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes"}
 
 
+def _client_meta(request) -> dict:
+    """请求来源元数据（监控用）：真实客户端 IP / UA / 路径。
+
+    CF 隧道下 nginx 无访问日志，真实 IP 以 CF-Connecting-IP 为准；直连本机时
+    回退 X-Forwarded-For（多跳取第一段）/ local。UA 截断防日志/环形区膨胀。
+    """
+    h = request.headers
+    ip = (h.get("cf-connecting-ip") or "").strip()
+    if not ip:
+        ip = (h.get("x-forwarded-for") or "").split(",")[0].strip()
+    return {"path": request.url.path, "client_ip": (ip or "local")[:64],
+            "ua": (h.get("user-agent") or "")[:96]}
+
+
+def _body_meta(body: dict) -> dict:
+    """请求形状（监控展示）：消息条数与 max_tokens（都不是则 None）。"""
+    msgs = body.get("messages")
+    mt = body.get("max_tokens")
+    return {"msgs": len(msgs) if isinstance(msgs, list) else None,
+            "max_tokens": mt if isinstance(mt, int) else None}
+
+
+def _lane_for(force_fallback: bool, plan_channel: bool, url: str) -> str:
+    """本次尝试实际走的业务通道（监控用）。
+
+    与成功路径的判定保持同一口径：url 里出现 /zcode-plan/ 才是 Plan 通道。
+    单靠 force_fallback 参数推断会在内部 lane 重路由时误标（该标志仍为 False）。
+    """
+    if url and "/zcode-plan/" in url:
+        return "plan"
+    if force_fallback:
+        return "apikey"
+    return "plan" if plan_channel else ""
+
+
+def _upstream_trace(resp) -> str:
+    """上游响应头追踪标识：优先 cf-ray（CF 边缘），其次上游 request id。"""
+    for key in ("cf-ray", "x-request-id", "x-zcode-request-id", "x-trace-id"):
+        try:
+            val = resp.headers.get(key)
+        except Exception:  # noqa: BLE001 - 观测字段绝不放大请求失败
+            return ""
+        if val:
+            return f"{key}={val}"[:120]
+    return ""
+
+
 # 用量明细保留天数：与 reqlog 的 HISTORY_DAYS 同语义，按天文件整体删除。
 # 不清理时高流量实例 data/ 目录以 ~每天一个文件无限增长（2026-10-07 审查发现）。
 USAGE_HISTORY_DAYS = 30
@@ -682,18 +729,20 @@ async def messages(request: Request):
     # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
     _probe_flag.set(is_probe_request(request.headers))
 
+    meta = _client_meta(request)
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
-                 bool(body.get("stream")), _last_user_text(body))
+                 bool(body.get("stream")), _last_user_text(body),
+                 path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
+                 probe=_probe_flag.get(), model_req=requested_model,
+                 **_body_meta(body))
     session_ctx.tag(req_id, body)
     # 客户端指纹（上游 2.7.17，2026-11-04 排障加装）：周期短探测打线上时无法
     # 定位来源——CF 隧道绕过 nginx 无访问日志、hub 也不记录调用方。真实客户端
     # IP 以 CF-Connecting-IP 为准（经 cloudflared），直连本机时回退
     # X-Forwarded-For / 本地环回。UA 截断防日志爆炸。
-    _client_ip = (incoming_headers.get("cf-connecting-ip")
-                  or incoming_headers.get("x-forwarded-for") or "local")
-    logs.info(req_id, f"client={_client_ip} ua={incoming_headers.get('user-agent', '?')[:72]}")
+    logs.info(req_id, f"client={meta['client_ip']} ua={meta['ua'] or '?'}")
 
     if body.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
         # Early flush：宽限期内保持真实状态码语义；超期先发 200+SSE 头
@@ -983,7 +1032,7 @@ def _no_quota_response(req_id: str, model: str, message: str, wait: float | None
     )
 
 
-async def _bigmodel_openai_chat(payload: dict, requested_model: str):
+async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Request):
     """bigmodel 资源包模型的 OpenAI 直通路径。
 
     这些模型在 Anthropic 兼容端点会被 Coding Plan 门禁拦（1309），
@@ -1001,7 +1050,11 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
                 preview = m["content"][:80]
                 break
     logs.req(req_id, model_name, stream, preview)
-    reqlog.begin(req_id, "chat", model_name, stream, preview)
+    meta = _client_meta(request)
+    reqlog.begin(req_id, "chat", model_name, stream, preview,
+                 path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
+                 probe=is_probe_request(request.headers), model_req=requested_model,
+                 **_body_meta(payload))
     session_ctx.tag(req_id, payload)
     tried: set[str] = set()
     last_error = ""
@@ -1019,6 +1072,10 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
         # 账号级出口代理：proxy_kwargs() 未配置时返回 {}，行为与直连一致
         client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
                                    **account.proxy_kwargs())
+        reqlog.mark_account(req_id, account.name, account.mode)
+        reqlog.mark_channel(req_id, "apikey")
+        reqlog.mark_egress(req_id, "account" if account.proxy_kwargs()
+                           else egress.egress_for(url))
         # 打标：本请求已发起上游调用（监控区分调度/上游失败，同 zai 主链路）
         reqlog.mark_upstream(req_id)
         try:
@@ -1031,6 +1088,10 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
                     account.record_result(True, f"HTTP 200 · {model_name} · openai-stream")
                     account.clear_model_cooling(model_name)
                     store.update_account(account)
+                    t_first = time.time() - t0
+                    reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
+                    reqlog.finish_ok(req_id, t_first=t_first, status=200)
+                    record_usage(model_name)
 
                     async def gen():
                         try:
@@ -1066,10 +1127,16 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
         except httpx.HTTPError as err:
             await client.aclose()
             last_error = f"连接失败: {err}"
+            reqlog.mark_attempt(req_id, account.name, account.mode, channel="apikey",
+                                ms=(time.time() - t0) * 1000, error=last_error)
             account.record_result(False, last_error)
             store.update_account(account)
             continue
         last_error = text[:300]
+        if resp.status_code != 200:
+            reqlog.mark_attempt(req_id, account.name, account.mode, channel="apikey",
+                                status=resp.status_code, ms=(time.time() - t0) * 1000,
+                                error=f"HTTP {resp.status_code}: {text[:80]}")
         if resp.status_code == 429 and ("1113" in text or "1309" in text or "insufficient balance" in text.lower()):
             until = account.cool_model(model_name, settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
                                        settings.MODEL_NO_QUOTA_COOLDOWN_MAX)
@@ -1078,12 +1145,13 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str):
             store.update_account(account)
             logs.warn(req_id, f"账号 {account.name} {model_name} 无资源包，冷却后换号")
             continue
-        reqlog.finish_error(req_id, last_error, status=resp.status_code)
+        reqlog.finish_error(req_id, last_error, status=resp.status_code, kind="upstream")
         return JSONResponse({"error": {"message": last_error, "type": "upstream_error"}},
                             status_code=resp.status_code)
     wait = store.next_model_uncooldown_at("bigmodel", model_name)
     reqlog.finish_error(req_id, last_error or "所有 bigmodel 账号均不可用",
-                        status=429 if wait else 503)
+                        status=429 if wait else 503,
+                        kind="quota" if wait else "no_account")
     return _no_quota_response(req_id, model_name, last_error or "所有 bigmodel 账号均不可用", wait)
 
 
@@ -1114,7 +1182,7 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
     if requested_model.startswith("bigmodel/"):
         model_name = requested_model.split("/", 1)[1].strip().lower()
         if model_name in constants.BIGMODEL_OPENAI_MODELS:
-            return await _bigmodel_openai_chat(payload, requested_model)
+            return await _bigmodel_openai_chat(payload, requested_model, request)
 
     body, err = translate(payload)
     if err or body is None:
@@ -1139,10 +1207,14 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
     # X-Probe 打标：本次请求若为探测（模型测试/健康检查）则标记，供用量分流
     _probe_flag.set(is_probe_request(request.headers))
 
+    meta = _client_meta(request)
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, kind, str(body.get("model") or "-"),
-                 bool(payload.get("stream")), _last_user_text(body))
+                 bool(payload.get("stream")), _last_user_text(body),
+                 path=meta["path"], client_ip=meta["client_ip"], ua=meta["ua"],
+                 probe=_probe_flag.get(), model_req=requested_model,
+                 **_body_meta(body))
     session_ctx.tag(req_id, body)
 
     if payload.get("stream") and settings.EARLY_FLUSH_GRACE > 0:
@@ -1465,7 +1537,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     while attempts < MAX_ACCOUNT_ATTEMPTS:
         if deadline and time.time() - t0 > deadline:
             logs.warn(req_id, f"请求级死线 {deadline}s 已到，停止重试（已试 {len(tried)} 账号）")
-            reqlog.finish_error(req_id, f"请求级死线 {deadline}s 已到（已试 {len(tried)} 账号）", status=503)
+            reqlog.finish_error(req_id, f"请求级死线 {deadline}s 已到（已试 {len(tried)} 账号）", status=503,
+                                kind="deadline")
             return JSONResponse(
                 {"error": {"message": f"所有账号重试均未成功（请求级死线 {deadline}s）",
                            "type": "no_available_account", "tried": sorted(tried)}},
@@ -1478,7 +1551,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             until = _risk_wave_until_for(provider) or time.time()
             remaining = int(until - time.time()) + 1
             logs.warn(req_id, f"风控波次暂停中（剩 ~{remaining}s），快速失败不试探账号（防 strike 放大）")
-            reqlog.finish_error(req_id, "风控波次暂停中", status=503)
+            reqlog.finish_error(req_id, "风控波次暂停中", status=503, kind="risk_wave")
             return JSONResponse(
                 {"error": {
                     "message": (f"上游风控波次暂停中（频道级封锁窗口），"
@@ -1498,6 +1571,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             if waited is None:
                 break
             queued += waited
+            reqlog.note_wait(req_id, "q", waited)
             tried.clear()  # 期间账号状态可能已刷新，重新给每个账号机会
             continue
         tried.add(account.id)
@@ -1547,11 +1621,13 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
 
     if queued:
         logs.req_err(req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队等待 {queued:.0f}s）")
+        # 排队耗时已在 _wait_for_account 返回时逐段 note_wait 累加，此处不再重复计入
         kind, wait = _recovery(provider, model_key)
         reqlog.finish_error(
             req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）",
             status=429 if (kind == "model" and wait) else (
                 402 if kind == "quota" else 503),
+            kind="quota" if kind == "quota" else ("rate" if kind == "model" and wait else "no_account"),
         )
         if wait and wait > time.time():
             retry_after = max(1, int(wait - time.time() + 0.999))
@@ -1605,7 +1681,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     kind, wait = _recovery(provider, model_key)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
                         status=429 if (kind == "model" and wait) else (
-                            402 if kind == "quota" else 503))
+                            402 if kind == "quota" else 503),
+                        kind="quota" if kind == "quota" else ("rate" if kind == "model" and wait else "no_account"))
     if wait and wait > time.time():
         retry_after = max(1, int(wait - time.time() + 0.999))
         if kind == "model":
@@ -2069,6 +2146,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         verify_param = verify_region = None
         if needs_captcha:
             _park_slot(slot_box)
+            cap_t0 = time.time()
             try:
                 # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                 # 换出口使用会被上游判 unusual activity（3012）。
@@ -2077,11 +2155,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 )
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
-                reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
+                reqlog.note_wait(req_id, "cap", time.time() - cap_t0)
+                reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500, kind="captcha")
                 return JSONResponse(
                     {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
                     status_code=500,
                 )
+            reqlog.note_wait(req_id, "cap", time.time() - cap_t0)
             if not _reacquire_slot(account, slot_box):
                 logs.warn(req_id, f"账号 {account.name} 验证码等待后并发已满，切换下一个")
                 return _NEXT_ACCOUNT
@@ -2091,6 +2171,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                                   incoming_headers, verify_region,
                                                   force_fallback=force_fallback)
         except RuntimeError as err:
+            # build_request 本身抛错：url 尚未赋值（或为上一趟残留），不得用假 url 推通道
+            reqlog.mark_attempt(req_id, account.name, account.mode,
+                                channel=_lane_for(force_fallback, plan_channel, ""),
+                                error=f"凭证无效: {err}")
             account.record_result(False, f"凭证无效: {err}")
             _mark(account, Status.INVALID, str(err))
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
@@ -2104,6 +2188,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
             trust_env=not settings.MESSAGES_FORCE_DIRECT,
             **account.proxy_kwargs())
+        # 出口观测：账号自带代理 / env 系统代理 / 直连（egress_for 与 httpx 判定逐字一致）
+        if account.proxy_kwargs():
+            egress_seen = "account"
+        else:
+            egress_seen = egress.egress_for(url)
+        reqlog.mark_egress(req_id, egress_seen)
         # 打标：本请求已发起上游调用（含连接失败/4xx/5xx）；调度层放弃的行
         # 无此标记，监控端据此区分「调度失败·未达上游」与「上游失败」
         reqlog.mark_upstream(req_id)
@@ -2111,6 +2201,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         try:
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
+            reqlog.mark_attempt(req_id, account.name, account.mode,
+                                channel=_lane_for(force_fallback, plan_channel, url),
+                                error=f"连接失败: {err}")
             await client.aclose()
             account.record_result(False, f"连接失败: {err}")
             riskmetrics.record("net", account.name, err=str(err))
@@ -2165,6 +2258,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             diaglog.record_failure(req_id, account_name=account.name, mode=account.mode,
                                    model=str(body.get("model") or ""), url=url,
                                    status=status_code, text=text, request_body=body)
+            reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
 
         if status_code >= 400:
             if text is None:
@@ -2178,7 +2272,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             if challenge:
                 captcha_manager.invalidate(_messages_egress())
                 captcha_retries += 1
+                reqlog.note_retry(req_id, "cap")
+                reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
+                    reqlog.mark_attempt(req_id, account.name, account.mode, channel="plan",
+                                        status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                        error=f"验证码挑战连续失败（{challenge}）")
                     account.record_result(False, "验证码挑战连续失败")
                     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
                     return _NEXT_ACCOUNT
@@ -2204,6 +2303,11 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 signal = (f"业务码 {biz_code}" if biz_code is not None
                           else f"3012/unusual activity HTTP {status_code}")
                 snippet = " ".join(text.split())[:200]
+                reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                    error=f"风控 {signal}")
                 account.record_result(False, f"风控 {signal}（HTTP {status_code}）")
                 penalty_note = _apply_risk_strike(
                     account, signal, req_id,
@@ -2239,6 +2343,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 return _NEXT_ACCOUNT
 
             if _is_exhausted(status_code, text):
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                    error="额度用完")
                 account.record_result(False, f"额度用完 HTTP {status_code}")
                 if account.status in (Status.INVALID, Status.DISABLED):
                     store.update_account(account)
@@ -2249,6 +2357,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=401, ms=(time.time() - attempt_t0) * 1000, error="鉴权失败")
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
                 if plan_channel and not force_fallback and account.has_apikey_fallback():
@@ -2261,6 +2372,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
 
             if status_code == 403:
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=403, ms=(time.time() - attempt_t0) * 1000, error="鉴权拒绝")
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
                 if plan_channel and not force_fallback and account.has_apikey_fallback():
@@ -2282,6 +2396,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
                         settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
                     )
+                    reqlog.mark_attempt(req_id, account.name, account.mode,
+                                        channel=_lane_for(force_fallback, plan_channel, url),
+                                        status=429, ms=(time.time() - attempt_t0) * 1000,
+                                        error=f"429 1113 无余额，{model_key} 冷却", code=1113)
                     account.record_result(
                         False,
                         f"429 1113 无余额（{model_key or '-'} 冷却至 "
@@ -2293,6 +2411,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         f"账号 {account.name} 429 为 1113 无余额，{model_key} 冷却，跳过等待重试",
                     )
                     if plan_channel and not force_fallback and account.has_apikey_fallback():
+                        reqlog.note_retry(req_id, "fb")
                         needs_captcha = False
                         force_fallback = True
                         retries_429 = 0
@@ -2305,6 +2424,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
                         settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
                     )
+                    reqlog.mark_attempt(req_id, account.name, account.mode, channel="plan",
+                                        status=429, ms=(time.time() - attempt_t0) * 1000,
+                                        error=f"429 1309 Plan 到期，{model_key} 冷却", code=1309)
                     account.record_result(
                         False,
                         f"429 1309 Coding Plan 到期（{model_key or '-'} 冷却至 "
@@ -2328,12 +2450,17 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(
                     account, str(body.get("model") or "")
                 ):
+                    reqlog.note_retry(req_id, "429")
+                    reqlog.mark_attempt(req_id, account.name, account.mode,
+                                        channel=_lane_for(force_fallback, plan_channel, url),
+                                        status=429, ms=(time.time() - attempt_t0) * 1000, error="429 频控，换号优先")
                     account.record_result(False, "429 频控，换号优先（不原地静默等待）")
                     riskmetrics.record("rate", account.name, model=str(body.get("model") or ""))
                     logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号")
                     return _NEXT_ACCOUNT
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
+                    reqlog.note_retry(req_id, "429")
                     # 3009「model concurrency limit exceeded」= 并发争用，不是频控：
                     # 上游不给 Retry-After，槽位通常几秒内释放。等默认 60s 会把
                     # 客户端白白吊死。短退避 + 抖动打散重试。
@@ -2357,12 +2484,17 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             f"（{retries_429}/{settings.RETRY_429_TIMES}）",
                         )
                     _park_slot(slot_box)
+                    reqlog.note_wait(req_id, "rl", wait)
                     await _sleep(wait)
                     if not _reacquire_slot(account, slot_box):
                         logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
                         return _NEXT_ACCOUNT
                     continue
                 if plan_channel and not force_fallback and account.has_apikey_fallback():
+                    reqlog.note_retry(req_id, "fb")
+                    reqlog.mark_attempt(req_id, account.name, account.mode, channel="plan",
+                                        status=429, ms=(time.time() - attempt_t0) * 1000,
+                                        error=f"Plan 通道 429 耗尽（重试 {retries_429} 次），切回退")
                     account.record_result(False, "Plan 通道 429 耗尽，切 API Key 回退")
                     logs.warn(req_id, f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退")
                     needs_captcha = False
@@ -2370,6 +2502,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     retries_429 = 0
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=429, ms=(time.time() - attempt_t0) * 1000,
+                                    error=f"429 重试 {retries_429} 次耗尽")
                 cool = _rate_break(account)
                 store.update_account(account)
                 if cool:
@@ -2390,6 +2526,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 一般性上游错误：重试，耗尽才冷却账号并换号
                 if retries_5xx < settings.RETRY_5XX_TIMES:
                     retries_5xx += 1
+                    reqlog.note_retry(req_id, "5xx")
+                    reqlog.note_wait(req_id, "5xx", settings.RETRY_5XX_WAIT)
+                    reqlog.mark_attempt(req_id, account.name, account.mode,
+                                        channel=_lane_for(force_fallback, plan_channel, url),
+                                        status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                        error=f"上游 {status_code}，{settings.RETRY_5XX_WAIT}s 后重试")
                     logs.warn(
                         req_id,
                         f"账号 {account.name} 上游 HTTP {status_code}，"
@@ -2402,6 +2544,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         return _NEXT_ACCOUNT
                     continue
                 account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
+                reqlog.mark_attempt(req_id, account.name, account.mode,
+                                    channel=_lane_for(force_fallback, plan_channel, url),
+                                    status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                    error=f"5xx 重试 {retries_5xx} 次耗尽，冷却换号")
                 if (account.status in (Status.INVALID, Status.DISABLED)
                         or account.is_cooling() or account.has_lane_cooling()):
                     # Key 回退 5xx 不得覆盖废 JWT / 风控禁用，否则冷却结束会重开 Plan；
@@ -2426,8 +2572,16 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
             body_log = text if len(text) <= 4000 else text[:4000] + f"...(共 {len(text)} 字节，疑似 WAF 页)"
             logs.warn(req_id, f"上游 {status_code} 完整响应体: {body_log}")
+            reqlog.mark_attempt(req_id, account.name, account.mode,
+                                channel=_lane_for(force_fallback, plan_channel, url),
+                                status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                error=f"HTTP {status_code}: {text[:80]}")
+            # 上游把业务码装进 4xx body（3006/1002/1309 等）时一并落 code：
+            # 「HTTP 400」不够排障，业务码才是区分套餐外/额度/验证码的真因
+            biz_code = _upstream_biz_code(text)
             reqlog.finish_error(req_id, f"HTTP {status_code}: {text[:120]}".replace("\n", " "),
-                                status=status_code, t_first=time.time() - attempt_t0)
+                                status=status_code, t_first=time.time() - attempt_t0,
+                                code=biz_code, kind="biz" if biz_code is not None else "upstream")
             return JSONResponse(
                 _safe_json(text) or {"error": {"message": text[:500], "type": "upstream_error"}},
                 status_code=status_code,
@@ -2449,9 +2603,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     diaglog.record_failure(req_id, account_name=account.name, mode=account.mode,
                                            model=str(body.get("model") or ""), url=url,
                                            status=200, text=text, request_body=body)
+                    reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
                     await cm.__aexit__(None, None, None)
                     await client.aclose()
                     if code_hit in _RISK_BIZ_CODES:
+                        reqlog.mark_attempt(req_id, account.name, account.mode,
+                                            channel="plan", status=_status,
+                                            ms=(time.time() - attempt_t0) * 1000,
+                                            error=f"风控封禁（业务码 {code_hit}）", code=code_hit)
                         account.record_result(False, f"风控封禁（业务码 {code_hit}）")
                         penalty_note = _apply_risk_strike(
                             account, f"业务码 {code_hit}", req_id,
@@ -2474,6 +2633,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             logs.warn(req_id, f"账号 {account.name} 命中风控业务码 {code_hit}，{penalty_note}，切换下一个")
                         return _NEXT_ACCOUNT
                     if code_hit in _QUOTA_BIZ_CODES:
+                        reqlog.mark_attempt(req_id, account.name, account.mode,
+                                            channel="apikey" if force_fallback else "plan",
+                                            status=_status, ms=(time.time() - attempt_t0) * 1000,
+                                            error=f"额度用完（业务码 {code_hit}）", code=code_hit)
                         account.record_result(False, f"额度用完（业务码 {code_hit}）")
                         if account.status in (Status.INVALID, Status.DISABLED):
                             store.update_account(account)
@@ -2486,7 +2649,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     account.record_result(False, f"上游业务错误 {code_hit}")
                     store.update_account(account)
                     logs.req_err(req_id, f"账号 {account.name} 上游业务错误 {code_hit}")
-                    reqlog.finish_error(req_id, f"上游业务错误 {code_hit}", status=_status)
+                    reqlog.finish_error(req_id, f"上游业务错误 {code_hit}", status=_status,
+                                        code=code_hit, kind="biz")
                     return JSONResponse(
                         {"error": {"message": f"上游业务错误 {code_hit}", "type": etype,
                                    "upstream": text[:400]}},
@@ -2510,6 +2674,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # force_fallback 仍为 False，不能用请求参数猜通道）
                 channel_used = "plan" if "/zcode-plan/" in url else "apikey"
                 account.clear_channel_cooling(channel_used)
+                reqlog.mark_channel(req_id, channel_used)
                 # 计数清洗要求整号无任何在场风控退避：lane 冷却中成功（如走回退腿）
                 # 保留 last_error 与 strikes 审计；lane 清空后的 plan 成功才全量清洗
                 if (account.status not in (Status.INVALID, Status.DISABLED)
@@ -2530,10 +2695,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 无界增长，监控页也把已完成请求永远显示为进行中
                 sync_data = _safe_json(text)
                 sync_usage = (sync_data.get("usage") or {}) if isinstance(sync_data, dict) else {}
+                sync_stop = sync_data.get("stop_reason") if isinstance(sync_data, dict) else None
+                reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
                 reqlog.finish_ok(req_id, t_first=time.time() - attempt_t0, status=status_code,
                                  input_tokens=sync_usage.get("input_tokens"),
                                  output_tokens=sync_usage.get("output_tokens"),
-                                 cache_read=_cache_read(sync_usage))
+                                 cache_read=_cache_read(sync_usage),
+                                 stop_reason=str(sync_stop) if sync_stop else None)
                 record_usage(model_name, sync_usage.get("input_tokens"),
                              sync_usage.get("output_tokens"))
                 # 2026-10-25 防放大器：Plan 通道真实成功 = 上游风控窗口已开，
@@ -2555,6 +2723,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         # 真实成功按实际通道聚合解封（url 判通道，见同步直通出口注释）
         channel_used = "plan" if "/zcode-plan/" in url else "apikey"
         account.clear_channel_cooling(channel_used)
+        reqlog.mark_channel(req_id, channel_used)
         if (account.status not in (Status.INVALID, Status.DISABLED)
                 and not account.is_cooling() and not account.has_lane_cooling()):
             account.risk_strikes = 0
@@ -2574,6 +2743,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         if channel_used == "plan":
             _risk_wave_clear(account.provider)
 
+        reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
                          account_name=account.name, mode=account.mode, model=model_name)
 

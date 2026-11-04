@@ -378,7 +378,9 @@ select.input option{background:var(--panel);color:var(--ink)}
 .hist-chart{display:flex;align-items:flex-end;gap:3px;padding:14px 16px 8px;border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel);overflow-x:auto}
 .hist-col{flex:1 1 0;min-width:14px;display:flex;flex-direction:column;align-items:center;gap:6px}
 .hist-bar-wrap{height:76px;width:100%;display:flex;align-items:flex-end;justify-content:center}
-.hist-bar{display:block;width:100%;max-width:26px;border-radius:3px 3px 0 0;background:var(--amber);opacity:.85}
+.hist-bar{display:flex;flex-direction:column;justify-content:flex-end;width:100%;max-width:26px;border-radius:3px 3px 0 0;background:var(--amber);opacity:.85}
+/* 失败占比段：堆叠在柱底，颜色区分成功/失败，曲线不再只反映调用量 */
+.hist-bar-fail{display:block;width:100%;border-radius:0 0 2px 2px;background:var(--red);opacity:.9}
 .hist-lbl{font-family:var(--mono);font-size:10px;color:var(--ink-mute);white-space:nowrap}
 .hist-err{border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel);padding:12px 16px}
 .hist-err-hd{font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.04em;margin-bottom:8px}
@@ -396,6 +398,32 @@ select.input option{background:var(--panel);color:var(--ink)}
 .mon-preview{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink-mute)}
 .mon-preview .err-line{color:var(--red)}
 .mon-stream{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--blue-a14);color:var(--blue);font-weight:600}
+/* 探测请求标记：与「流」同族小药丸，避免把健康检查误读成真实用量 */
+.mon-probe{display:inline-block;margin-left:4px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--amber-a14,rgba(255,170,0,.14));color:var(--amber);font-weight:600}
+/* 状态列徽标：尝试次数（>1）与排队时长，一眼看出「这次慢是等出来的」 */
+.mon-retry{display:inline-block;margin-left:5px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--chip-count-bg);color:var(--ink-dim);font-weight:600;font-family:var(--mono)}
+.mon-queue{display:inline-block;margin-left:5px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--amber-a14,rgba(255,170,0,.14));color:var(--amber);font-weight:600;font-family:var(--mono)}
+/* 渠道徽标：Plan / Key 回退混排时唯一可靠的区分方式 */
+.mon-ch{display:inline-block;margin-left:5px;padding:0 5px;border-radius:4px;font-size:10px;font-weight:600;font-family:var(--mono)}
+.mon-ch.plan{background:var(--mint-a14,rgba(40,200,120,.14));color:var(--mint)}
+.mon-ch.key{background:var(--blue-a14);color:var(--blue)}
+.mon-status{white-space:nowrap;overflow:hidden}
+/* 实时行点开详情：整行包一层容器，详情横跨全部网格列 */
+.mon-item{border-bottom:1px solid var(--hairline-soft)}
+.mon-item .mon-row{border-bottom:none;cursor:pointer}
+.mon-item:last-child{border-bottom:none}
+.mon-detail-wrap{background:var(--panel-2,var(--panel))}
+.mon-detail-wrap[hidden]{display:none}
+.mon-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:6px 18px;padding:4px 16px 12px;font-size:11.5px}
+.mon-kv{display:flex;gap:8px;min-width:0}
+.mon-kv.wide{grid-column:1/-1}
+.mon-k{color:var(--ink-mute);white-space:nowrap;min-width:64px}
+.mon-v{color:var(--ink-dim);font-family:var(--mono);overflow-wrap:anywhere}
+.mon-att-list{grid-column:1/-1;display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.mon-att{display:flex;gap:10px;align-items:center;font-size:11px;font-family:var(--mono);color:var(--ink-dim)}
+.mon-att-n{color:var(--ink-mute)}
+.mon-att-err{color:var(--red);overflow-wrap:anywhere}
+.mon-ch-b{min-width:42px;color:var(--ink-mute)}
 @media (max-width:960px){
   .mon-grid-live{grid-template-columns:110px 120px 110px 120px 1fr;grid-auto-rows:auto}
   .mon-grid-live > :nth-child(n+6){display:none}

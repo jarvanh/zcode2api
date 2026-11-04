@@ -86,7 +86,8 @@
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零） |
+| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零）。行字段含来源（client_ip/ua/path/probe）、通道与出口（channel/egress）、尝试梯子明细（att）、等待拆解（wait_q/rl/5xx/cap）与错误分类（err_kind/err_code） |
+| `GET /admin/api/monitoring/history?days=N` | 磁盘历史聚合（1–30 天）：按天曲线 + accounts/models/channels/clients 分组 + 错误 TOP（只回统计不回明细） |
 | `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比/首见 vs 复见的 cache_read 均值对比 |
 | `POST /admin/api/monitoring/clear` | 清空监控 |
 | `GET /admin/api/settings` | 不回明文密钥。返回 `admin_key_set` / `admin_key_masked` / `admin_key_is_default`、`gateway_key_set` / `gateway_key_masked`、`quota_refresh_interval`、`account_concurrency` |
