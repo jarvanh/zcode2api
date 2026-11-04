@@ -431,3 +431,19 @@ select.input option{background:var(--panel);color:var(--ink)}
   .mon-grid-agg > :nth-child(n+6){display:none}
   .mon-search{width:100%}
 }
+/* ── 实时并发面板 + 分布条（2026-11-04 第二批）── */
+.conc-panel .stat-grid{margin-bottom:10px}
+.conc-panel .stat-cell{min-height:92px;gap:8px}
+.conc-chart{height:96px;padding:10px 12px 4px}
+.conc-chart .hist-col{min-width:7px;flex:0 0 auto}
+.conc-chart .hist-bar-wrap{width:10px;height:72px}
+.conc-chart .hist-bar{max-width:10px}
+/* 占槽段：叠在在途柱内的薄荷底段（两者口径不同，必须能同屏对比） */
+.hist-bar-slot{display:block;width:100%;border-radius:0 0 2px 2px;background:var(--mint);opacity:.85}
+.dist-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px;padding:9px 14px;border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel);font-size:11.5px;color:var(--ink-dim)}
+.dist-bar:empty{display:none}
+.dist-chip{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;background:var(--panel-2);border:1px solid var(--hairline-soft);font-family:var(--mono);white-space:nowrap}
+.dist-chip b{color:var(--ink);font-weight:600}
+.dist-note{margin-left:auto;color:var(--ink-mute);font-size:10.5px;letter-spacing:.04em}
+@media (max-width:960px){.dist-note{display:none}.conc-chart{height:84px}}
+.mon-dedup{display:inline-block;margin-left:5px;padding:0 5px;border-radius:4px;font-size:10px;background:var(--blue-a14);color:var(--blue);font-weight:600}

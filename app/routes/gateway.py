@@ -1432,6 +1432,11 @@ async def _dispatch_guarded(req_id, body, incoming_headers, port, provider):
     if hit is not None and _dedup_replay_worthy(provider, str(body.get("model") or "")):
         status, payload = hit
         logs.info(req_id, f"风暴去重: {settings.DEDUP_TTL}s 内同内容失败，直接重放（不进调度）")
+        # 收口修复（2026-11-04）：重放不经过 _dispatch，监控条目原先永远滞留
+        # 「进行中」——既刷脏实时并发（client 口径虚高），也让 _inflight 无界增长。
+        reqlog.mark_dedup(req_id, "replayed")
+        reqlog.finish_error(req_id, f"风暴去重重放（{settings.DEDUP_TTL}s 内同内容失败）",
+                            status=status, kind="dedup")
         return Response(content=payload, status_code=status, media_type="application/json")
     stream = bool(body.get("stream"))
     # 流式跳过登记（真实结局在生成器里）；非流式登记，True=leader / False=follower
@@ -1441,6 +1446,9 @@ async def _dispatch_guarded(req_id, body, incoming_headers, port, provider):
         if outcome == "failed":
             status, payload = dedup.failure_of(fp)
             logs.info(req_id, "风暴去重: leader 同内容调度失败，重放其失败响应")
+            reqlog.mark_dedup(req_id, "merged")
+            reqlog.finish_error(req_id, "风暴去重: 并入 leader 失败结局",
+                                status=status, kind="dedup")
             return Response(content=payload, status_code=status, media_type="application/json")
         # leader 成功/超时 → follower 正常走自己的调度（上游已被证明健康）
     result = await _dispatch(req_id, body, incoming_headers, port, provider)
@@ -1947,18 +1955,23 @@ async def _wait_for_account(req_id, provider: str, t0: float,
     poll = max(1, settings.QUEUE_POLL)
     logs.warn(req_id, f"暂无可用账号，排队等待（剩余预算 {remaining:.0f}s，每 {poll}s 重试选号）")
     _trigger_quota_probe(req_id, provider)
-
+    reqlog.note_queue(1)
     waited = 0.0
-    while waited < remaining:
-        step = min(float(poll), remaining - waited)
-        await _sleep(step)
-        waited += step
-        if store.select(provider) is not None:
-            logs.warn(req_id, f"排队 {waited:.0f}s 后账号恢复可用，继续调度")
-            return waited
-        if deadline and time.time() - t0 >= deadline:
-            return waited  # 死线到：交给主循环的死线分支出 503
-    return None  # 排队预算耗尽
+    try:
+        while waited < remaining:
+            step = min(float(poll), remaining - waited)
+            await _sleep(step)
+            waited += step
+            if store.select(provider) is not None:
+                logs.warn(req_id, f"排队 {waited:.0f}s 后账号恢复可用，继续调度")
+                return waited
+            if deadline and time.time() - t0 >= deadline:
+                return waited  # 死线到：交给主循环的死线分支出 503
+        return None  # 排队预算耗尽
+    finally:
+        # 无论正常结束/提前返回/客户端取消，都必须退出排队计数，
+        # 否则 queue 口径只进不出，实时并发面板会被刷成永久高位
+        reqlog.note_queue(-1)
 
 
 _NEXT_ACCOUNT = object()
@@ -1978,6 +1991,25 @@ def _spawn_bg(coro) -> None:
 # 账号并发限制：account_id → 在飞请求数。asyncio 单线程事件循环下
 # check+inc 原子；释放走 _Upstream.close / 失败路径，泄漏面在测试钉住。
 _inflight: dict[str, int] = {}
+
+
+def _slot_view() -> dict:
+    """上游占槽快照（reqlog 并发仪表数据源）。
+
+    per 键用账号名而非 id（面板直接渲染）；已删除的账号跳过。limit=0 表示
+    后台未设并发上限，前端据此不画 n/limit 而画裸数。
+    """
+    per: dict[str, int] = {}
+    for acc_id, n in list(_inflight.items()):
+        if n <= 0:
+            continue
+        acc = store.find_any(acc_id)
+        per[acc.name if acc else acc_id[:8]] = n
+    return {"total": sum(n for n in _inflight.values() if n > 0),
+            "per": per, "limit": _limit()}
+
+
+reqlog.register_slot_source(_slot_view)
 
 
 def _limit() -> int:

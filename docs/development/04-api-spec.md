@@ -86,7 +86,9 @@
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零）。行字段含来源（client_ip/ua/path/probe）、通道与出口（channel/egress）、尝试梯子明细（att）、等待拆解（wait_q/rl/5xx/cap）与错误分类（err_kind/err_code） |
+| `GET /admin/api/monitoring` | 内存环形请求日志（最新在前，KEEP=500，重启清零）+ 并发快照。行字段含来源（client_ip/ua/path/probe）、通道与出口（channel/egress）、尝试梯子明细（att）、等待拆解（wait_q/rl/5xx/cap）、错误分类（err_kind/err_code）、净上游耗时（t_up）与去重标记（dedup） |
+| `GET /admin/api/monitoring/concurrency` | 实时并发四口径（client 在途 / slot 上游占槽 / queue 排队 / per 每账号 n÷limit）+ 启动以来峰值 + 当日分钟曲线（事件驱动精确采样，1s 心跳） |
+| `GET /admin/api/monitoring/concurrency/history?days=N` | 磁盘并发曲线：逐日峰值 + 最近一天分钟级（峰值不因重启丢；单文件 ≤1440 行，随 HISTORY_DAYS 清理） |
 | `GET /admin/api/monitoring/history?days=N` | 磁盘历史聚合（1–30 天）：按天曲线 + accounts/models/channels/clients 分组 + 错误 TOP（只回统计不回明细） |
 | `GET /admin/api/session-affinity?days=N` | 会话亲和观测汇总（近 N 天）：请求数/会话数/复见占比/首见 vs 复见的 cache_read 均值对比 |
 | `POST /admin/api/monitoring/clear` | 清空监控 |

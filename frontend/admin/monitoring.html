@@ -38,6 +38,8 @@
       <option value="ok">成功</option>
       <option value="fail">失败</option>
       <option value="inflight">进行中</option>
+      <option value="queue">有等待</option>
+      <option value="dedup">去重挡下</option>
     </select>
   </div>
 
@@ -52,6 +54,20 @@
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均总耗时</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span></div><div class="stat-num" id="s-total">—</div><div class="stat-sub" id="s-total-sub"></div></div>
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">重试 / 排队</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></span></div><div class="stat-num" id="s-retry" style="color:var(--amber)">—</div><div class="stat-sub" id="s-retry-sub"></div></div>
   </div>
+
+  <div class="cap-panel conc-panel">
+    <div class="cap-hd">
+      <div>
+        <div class="cap-title">实时并发</div>
+        <div class="cap-sub" id="conc-sub">四口径各自独立：在途含排队/等待，占槽只算真正压在账号上的；峰值事件驱动精确采样 · 1s 心跳</div>
+      </div>
+      <div class="cap-meta" id="conc-meta"></div>
+    </div>
+    <div class="stat-grid" id="conc-grid"></div>
+    <div class="hist-chart conc-chart" id="conc-chart"></div>
+  </div>
+
+  <div class="dist-bar" id="dist-bar"></div>
 
   <div class="cap-panel">
     <div class="cap-hd">
@@ -144,8 +160,10 @@ function filtered(){
     if(state.status==='ok'&&e.ok!==true)return false;
     if(state.status==='fail'&&e.ok!==false)return false;
     if(state.status==='inflight'&&e.ok!==null)return false;
+  if(state.status==='dedup'&&!e.dedup)return false;
+  if(state.status==='queue'&&waitTotal(e)<=0)return false;
     if(q){
-      const hay=`${e.account} ${e.model} ${e.model_req} ${e.preview} ${e.error} ${e.endpoint} ${e.path} ${e.client_ip} ${e.ua} ${e.req_id} ${e.channel} ${e.egress} ${e.err_code||''} ${(e.att||[]).map(a=>a.acc+' '+a.err).join(' ')}`.toLowerCase();
+      const hay=`${e.account} ${e.model} ${e.model_req} ${e.preview} ${e.error} ${e.endpoint} ${e.path} ${e.client_ip} ${e.ua} ${e.req_id} ${e.channel} ${e.egress} ${e.err_code||''} ${e.dedup||''} ${(e.att||[]).map(a=>a.acc+' '+a.err).join(' ')}`.toLowerCase();
       if(!hay.includes(q))return false;
     }
     return true;
@@ -226,7 +244,9 @@ function statusCell(e){
   }
   const tries=(e.att||[]).length;
   if(tries>1)html+=`<span class="mon-retry" title="账号尝试 ${tries} 次">×${tries}</span>`;
-  if((e.wait_q||0)>0)html+=`<span class="mon-queue" title="排队等待 ${fmtSec(e.wait_q)}">⏳${fmtSec(e.wait_q)}</span>`;
+  const waited=waitTotal(e);
+  if(waited>0)html+=`<span class="mon-queue" title="网关侧等待累计 ${fmtSec(waited)}（排队/429/5xx/验证码）">⏳${fmtSec(waited)}</span>`;
+  if(e.dedup)html+=`<span class="mon-dedup" title="风暴去重：${e.dedup==='replayed'?'TTL 内同内容失败重放':'并入 leader 失败结局'}，未进调度、零号压力">去重</span>`;
   return html;
 }
 
@@ -238,6 +258,7 @@ function detailHtml(e){
   const tps=(e.output_tokens&&e.t_total!=null&&e.t_first!=null&&e.t_total>e.t_first)
     ?(e.output_tokens/(e.t_total-e.t_first)).toFixed(1)+' tok/s':'';
   const waits=[];
+  if(e.dedup)waits.push(e.dedup==='replayed'?'风暴去重：TTL 内同内容失败重放（未进调度）':'风暴去重：并入 leader 失败结局（未进调度）');
   if(e.wait_q>0)waits.push(`排队 ${fmtSec(e.wait_q)}`);
   if(e.wait_rl>0)waits.push(`429 ${fmtSec(e.wait_rl)}`);
   if(e.wait_5xx>0)waits.push(`5xx ${fmtSec(e.wait_5xx)}`);
@@ -263,7 +284,7 @@ function detailHtml(e){
     ${kv('账号 / 凭证', `${e.account||'—'}${e.mode?' · '+e.mode:''}`)}
     ${kv('通道 / 出口', `${e.channel||'—'}${e.egress?' · '+e.egress:''}`)}
     ${kv('请求形状', e.msgs!=null?`${e.msgs} 条消息${e.max_tokens?` · max_tokens ${e.max_tokens}`:''}`:'')}
-    ${kv('耗时', [e.t_first!=null?`首字 ${fmtSec(e.t_first)}`:'',e.t_total!=null?`总 ${fmtSec(e.t_total)}`:'',tps].filter(Boolean).join(' · '))}
+    ${kv('耗时', [e.t_first!=null?`首字 ${fmtSec(e.t_first)}`:'',e.t_total!=null?`总 ${fmtSec(e.t_total)}`:'',e.t_up!=null?`净上游 ${fmtSec(e.t_up)}`:'',tps].filter(Boolean).join(' · '), true)}
     ${kv('Token', `输入 ${fmtTok(e.input_tokens)} · 输出 ${fmtTok(e.output_tokens)}${e.cache_read?` · 缓存 ${fmtTok(e.cache_read)}`:''}`)}
     ${kv('等待', waits.join(' · ')||'无')}
     ${kv('重试', retries.join(' · ')||'无')}
@@ -445,6 +466,7 @@ function render(){
     renderStats(list);
     if(tab==='live')renderLive();else if(tab==='daily')renderAgg('account');else renderAgg(tab);
   }
+  renderDist();
   $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
 }
 
@@ -497,6 +519,93 @@ async function load(){
 }
 
 // ── 验证码路线卡片 ────────────────────────────────────────────────────────────
+// ── 实时并发面板（1s 心跳，独立于主刷新）───────────────────────────────────
+let conc=null;
+let concTimer=null;
+
+async function loadConc(){
+  conc=await api('GET','/monitoring/concurrency');
+  renderConc();
+}
+
+function concCell(label,val,sub,color,tip){
+  return `<div class="stat-cell"${tip?` title="${esc(tip)}"`:''}>
+    <div class="stat-top"><div class="stat-label">${label}</div></div>
+    <div class="stat-num" style="color:${color||'var(--ink)'}">${val}</div>
+    <div class="stat-sub">${sub}</div>
+  </div>`;
+}
+
+function renderConc(){
+  if(!conc)return;
+  const now=conc.now||{}, peak=conc.peak||{}, minutes=conc.minutes||[];
+  const per=now.per||{};
+  const perList=Object.entries(per).sort((a,b)=>b[1]-a[1]);
+  const perTxt=perList.length?perList.map(([n,v])=>`${n} ${v}${now.limit?'/'+now.limit:''}`).join(' · '):'全部空闲';
+  const hot=perList.length?perList[0][1]:0;
+  $('conc-grid').innerHTML=[
+    concCell('网关在途',now.client??0,`峰值 ${peak.client??0}`,'var(--blue)','客户端连接还开着的请求（含排队/等 429/铸码）'),
+    concCell('上游占槽',now.slot??0,`峰值 ${peak.slot??0}${now.limit?` · 上限 ${now.limit}/号`:' · 未设上限'}`,'var(--mint)','真正压在账号上的并发；等待前会释放槽，所以可以小于在途'),
+    concCell('排队深度',now.queue??0,`峰值 ${peak.queue??0}`,now.queue?'var(--amber)':'var(--ink-mute)','选不到号在限流排队的请求数 —— 加号/调并发上限的依据'),
+    concCell('最热账号',perList.length?esc(perList[0][0]):'—',perTxt,'var(--ink-dim)','每账号 占用/上限'),
+  ].join('');
+  const pk=peak.kind;
+  $('conc-meta').textContent=pk?`启动峰值 ${peak[pk]} · ${pk==='client'?'在途':pk==='slot'?'占槽':'排队'} @ ${fmtTs(peak.at)}`:'开机后尚无流量';
+  const dot=$('live-dot');
+  if(dot&&!isHist())dot.textContent=`实时监控中 · 在途 ${now.client??0}`;
+  if(!minutes.length){$('conc-chart').innerHTML='<div class="mon-time" style="padding:4px 8px">分钟曲线随流量累积（每北京分钟一个点）</div>';return;}
+  const max=Math.max(...minutes.map(m=>Math.max(m.c,m.s,m.q)),1);
+  $('conc-chart').innerHTML=minutes.map(m=>{
+    const h=Math.max(Math.round(m.c/max*76),2);
+    const sh=m.s?Math.max(Math.round(m.s/max*76),2):0;
+    const hh=String(Math.floor(m.t/60)).padStart(2,'0'), mm=String(m.t%60).padStart(2,'0');
+    return `<div class="hist-col" title="${hh}:${mm} 在途峰值 ${m.c} · 占槽 ${m.s} · 排队 ${m.q}">
+      <div class="hist-bar-wrap"><i class="hist-bar" style="height:${h}px">${sh?`<b class="hist-bar-slot" style="height:${sh}px"></b>`:''}</i></div>
+      <div class="hist-lbl">${m.t%60===0?hh+':00':''}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── 分布条：上游码直方图 / stop_reason / 去重挡下 / 断开率 ─────────────────
+function chip(label,val,tip,color){
+  return `<span class="dist-chip"${color?` style="color:${color}"`:''}${tip?` title="${esc(tip)}"`:''}>${label} <b>${val}</b></span>`;
+}
+
+function renderDist(){
+  const chips=[];
+  const codes={}, stops={};
+  if(isHist()&&hist&&hist.totals){
+    const t=hist.totals;
+    (t.codes||[]).forEach(c=>codes[c.code]=c.count);
+    (t.stops||[]).forEach(c=>stops[c.reason]=c.count);
+    if(t.dedup)chips.push(chip('去重挡下',t.dedup,'不进调度的重放/合并请求数：零号压力，今天少烧的号就在这'));
+    if(t.disc)chips.push(chip('客户端断开',`${t.disc} · ${t.disc_rate}%`,'499 占比高=客户端超时短于网关 TTFB','var(--red)'));
+    if(t.net!=null)chips.push(chip('净上游均耗时',fmtSec(t.net),'总耗时 − 排队/重试等待：524 归因看这个'));
+  }else{
+    let dd=0, disc=0, done=0, netSum=0, netN=0;
+    for(const e of filtered()){
+      if(e.status!=null){const k=e.err_code?`${e.status}/${e.err_code}`:String(e.status);codes[k]=(codes[k]||0)+1;}
+      if(e.stop_reason)stops[e.stop_reason]=(stops[e.stop_reason]||0)+1;
+      if(e.dedup)dd++;
+      if(e.status===499)disc++;
+      if(e.ok!==null)done++;
+      if(e.t_up!=null){netSum+=e.t_up;netN++;}
+    }
+    if(dd)chips.push(chip('去重挡下',dd,'不进调度的重放/合并请求数：零号压力'));
+    if(disc&&done)chips.push(chip('客户端断开',`${disc} · ${(disc/done*100).toFixed(1)}%`,'499 占比高=客户端超时短于网关 TTFB','var(--red)'));
+    if(netN)chips.push(chip('净上游均耗时',fmtSec(netSum/netN),'总耗时 − 等待：524 归因看这个'));
+  }
+  const codeRows=Object.entries(codes).sort((a,b)=>b[1]-a[1]).slice(0,6)
+    .map(([c,n])=>chip(`码 ${c}`,n,'上游状态码'+(c.includes('/')?'（含业务码）':'')+' 分布：按码设阈值比看文案准'));
+  const stopRows=Object.entries(stops).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([s,n])=>{
+    const cut=s==='max_tokens'||s==='length';
+    return chip(cut?`截断 ${s}`:s,n,
+      cut?'撞 max_tokens 预算的占比高=客户端预算给小了或改写有问题':(s==='refusal'?'上游内容策略拒绝':'stop_reason 分布'),'');
+  });
+  const all=[...chips,...codeRows,...stopRows];
+  $('dist-bar').innerHTML=all.length?all.join('')+'<span class="dist-note">码分布 / 截断率 / 去重收益</span>':'';
+}
+
 let capLedger=null;
 let capTimer=null;
 const CAP_DAYS=7;
@@ -559,6 +668,9 @@ function startPoll(){
   // 铸码台账同样读磁盘按天文件，独立 60 秒一轮
   clearInterval(capTimer);
   capTimer=setInterval(()=>{if(!document.hidden)loadCaptcha().catch(()=>{});},60000);
+  // 并发面板要秒级手感：独立 1s 心跳（只读内存快照，不读磁盘，代价恒定）
+  clearInterval(concTimer);
+  concTimer=setInterval(()=>{if(!document.hidden)loadConc().catch(()=>{});},1000);
 }
 
 (async()=>{
@@ -570,6 +682,7 @@ function startPoll(){
   await renderAdminHeader();
   await load();
   await loadCaptcha();
+  await loadConc().catch(()=>{});
   startPoll();
 })();
 </script>

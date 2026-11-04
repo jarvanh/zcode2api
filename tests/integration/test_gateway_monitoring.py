@@ -374,3 +374,118 @@ class TestMonitoringEnrichedFields:
             assert key in data
         assert data["totals"]["calls"] >= 1
         assert any(c["name"] == "plan" for c in data["channels"])
+
+
+@pytest.mark.integration
+class TestConcurrencyPanel:
+    """实时并发四口径：API 形状 + 事件驱动峰值 + 收口修复不污染在途读数。"""
+
+    @pytest.fixture(autouse=True)
+    def _reset_slot_source(self):
+        """槽位源是模块级注入点：用例间必须复位，否则假数据源泄漏到其他用例。"""
+        from app import reqlog
+
+        reqlog.register_slot_source(None)
+        yield
+        reqlog.register_slot_source(None)
+
+    @pytest.fixture(autouse=True)
+    def _clean_mock(self, gateway_client):
+        """Mock 是 session 级：前一用例留下的场景队列会把本用例的上游响应钉死，
+        并发用例虽然不断言状态码，但序列泄漏会让耗时/槽位形态失真。"""
+        _client, mock = gateway_client
+        mock.state.calls.clear()
+        mock.state.counters.clear()
+        mock.state.sequences.clear()
+        return mock
+
+    async def test_conc_api_shape(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/concurrency", headers=ADMIN_AUTH)).json()
+        assert {"now", "peak", "tick", "minutes"} <= set(data)
+        assert {"client", "slot", "queue", "limit", "per"} <= set(data["now"])
+        assert {"client", "slot", "queue", "at", "kind"} <= set(data["peak"])
+
+    async def test_conc_history_api_shape(self, gateway_client):
+        client, _ = gateway_client
+        data = (await client.get("/admin/api/monitoring/concurrency/history?days=1", headers=ADMIN_AUTH)).json()
+        assert {"days", "daily", "peak", "minutes"} <= set(data)
+
+    async def test_client_gauge_returns_to_zero_after_traffic(self, gateway_client, fresh_app):
+        """请求收口后在途读数必须归零（begin +1 / finish −1 成对）。
+
+        这一条同时是 dedup 重放不收口 bug 的哨兵：那类条目永不收口，
+        client 口径会一路虚高。
+        """
+        from app import reqlog
+
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E1_JWT, name="mon-conc")
+        reqlog.register_slot_source(lambda: {"total": 1, "per": {"mon-conc": 1}, "limit": 2})
+        reqlog.sample()
+        # 基线：同进程其他用例可能留下真正未收口的条目，只断言「回到基线」
+        # 而非「等于 0」——绝对断言在生产语义下没意义，但漏收口一定会抬高读数。
+        base = reqlog.conc_snapshot()["now"]["client"]
+        for _ in range(3):
+            await client.post("/v1/messages", json={
+                "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
+            })
+        reqlog.sample()
+        snap = reqlog.conc_snapshot()
+        assert snap["now"]["client"] == base, "在途读数未回到基线：有请求漏收口"
+        assert snap["peak"]["client"] > base   # 峰值保留（事件驱动精确采样）
+        assert snap["now"]["slot"] == 1 and snap["now"]["per"] == {"mon-conc": 1}
+        assert snap["minutes"], "分钟曲线未累积"
+
+    async def test_broken_slot_source_does_not_break_gauge(self, gateway_client):
+        """坏数据源（抛异常）只让 slot 口径归零，心跳与其余三个口径照旧。"""
+        from app import reqlog
+
+        def _boom():
+            raise RuntimeError("store 炸了")
+        reqlog.register_slot_source(_boom)
+        try:
+            reqlog.sample()  # 不得抛出
+            snap = reqlog.conc_snapshot()
+            assert snap["now"]["slot"] == 0
+            assert {"client", "queue"} <= set(snap["now"])
+        finally:
+            reqlog.register_slot_source(None)
+
+
+@pytest.mark.integration
+class TestDedupReplayClosesEntry:
+    """风暴去重重放必须收口监控条目（2026-11-04 修复的 bug）。
+
+    旧行为：_dispatch_guarded 的两个重放分支直接 return Response，不经过
+    _dispatch，也就从不调 finish_* —— 条目永久滞留「进行中」，既让 _inflight
+    无界增长，又把实时并发的 client 口径刷成虚高。
+    """
+
+    async def test_failure_replay_closed_with_flag(self, gateway_client, fresh_app, monkeypatch):
+        import time
+
+        client, mock = gateway_client
+        mock.state.sequences.clear()
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _E3_JWT, name="mon-dd")
+        mock.state.sequences[_E3_JWT[:16]] = ["server_error"]
+        body = {"model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "dedup-x"}]}
+
+        first = await client.post("/v1/messages", json=body)
+        assert first.status_code >= 400
+        # 重放只对「波次暂停仍在」生效：注入暂停窗口，模拟同内容风暴
+        monkeypatch.setitem(gw._risk_wave_until, "zai", time.time() + 60)
+        second = await client.post("/v1/messages", json=body)
+        assert second.status_code >= 400
+
+        e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
+        assert e["ok"] is False, "重放条目未收口，会永久滞留进行中"
+        assert e["dedup"] == "replayed" and e["err_kind"] == "dedup"
+        # 实时并发读数不得被滞留条目污染
+        conc = (await client.get("/admin/api/monitoring/concurrency", headers=ADMIN_AUTH)).json()
+        assert conc["now"]["client"] == 0

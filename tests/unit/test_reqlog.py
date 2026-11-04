@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import time
 
 import pytest
@@ -304,3 +305,164 @@ class TestEnrichedHistory:
         agg = reqlog.history(days=1)
         assert agg["totals"]["wait"] == 30.0
         assert agg["totals"]["retry"] == 1
+
+
+class TestConcurrencyMeter:
+    """实时并发四口径 + 事件驱动峰值 + 分钟曲线（2026-11-04 第二批）。"""
+
+    def _reset(self, monkeypatch):
+        # client 口径读 len(_inflight)：必须连在途字典一起清空，
+        # 否则前面用例遗留的未收口条目会让读数虚高
+        monkeypatch.setattr(reqlog, "_inflight", {})
+        monkeypatch.setattr(reqlog, "_queue_now", 0)
+        monkeypatch.setattr(reqlog, "_conc", {"client": 0, "slot": 0, "queue": 0,
+                                              "limit": 0, "per": {}})
+        monkeypatch.setattr(reqlog, "_conc_peak",
+                            {"client": 0, "slot": 0, "queue": 0, "at": 0.0, "kind": ""})
+        monkeypatch.setattr(reqlog, "_conc_min", {})
+        monkeypatch.setattr(reqlog, "_conc_day", "")
+        reqlog.register_slot_source(None)
+
+    def test_client_peak_tracks_inflight(self, monkeypatch):
+        self._reset(monkeypatch)
+        reqlog.begin("c1", "messages", "m", False, "")
+        reqlog.begin("c2", "messages", "m", False, "")
+        snap = reqlog.conc_snapshot()
+        assert snap["now"]["client"] == 2
+        assert snap["peak"]["client"] == 2 and snap["peak"]["kind"] == "client"
+        reqlog.finish_ok("c1")
+        snap = reqlog.conc_snapshot()
+        assert snap["now"]["client"] == 1
+        # 峰值不因回落而变小（事件驱动精确采样，不靠轮询撞）
+        assert snap["peak"]["client"] == 2
+
+    def test_queue_delta_never_negative(self, monkeypatch):
+        self._reset(monkeypatch)
+        reqlog.note_queue(1)
+        reqlog.note_queue(1)
+        assert reqlog.conc_snapshot()["now"]["queue"] == 2
+        reqlog.note_queue(-5)
+        snap = reqlog.conc_snapshot()
+        assert snap["now"]["queue"] == 0
+        assert snap["peak"]["queue"] == 2  # 峰值保留
+
+    def test_slot_source_injected(self, monkeypatch):
+        self._reset(monkeypatch)
+        reqlog.register_slot_source(lambda: {"total": 3, "per": {"zai-131": 2, "zai-176": 1},
+                                             "limit": 2})
+        reqlog.sample()
+        snap = reqlog.conc_snapshot()
+        assert snap["now"]["slot"] == 3 and snap["now"]["limit"] == 2
+        assert snap["now"]["per"] == {"zai-131": 2, "zai-176": 1}
+        assert snap["peak"]["slot"] == 3
+
+    def test_broken_slot_source_is_ignored(self, monkeypatch):
+        """仪表读失败绝不影响请求与心跳（观测不反压）。"""
+        self._reset(monkeypatch)
+
+        def _boom():
+            raise RuntimeError("store 炸了")
+        reqlog.register_slot_source(_boom)
+        reqlog.sample()  # 不得抛出
+        assert reqlog.conc_snapshot()["now"]["slot"] == 0
+
+    def test_minute_buckets_and_persist(self, monkeypatch):
+        self._reset(monkeypatch)
+        reqlog.begin("m1", "messages", "m", False, "")
+        reqlog.sample()
+        reqlog.sample()
+        conc = reqlog.conc_snapshot()
+        assert conc["minutes"], "分钟桶未生成"
+        last = conc["minutes"][-1]
+        assert last["c"] == 1 and last["n"] >= 2  # begin + 2 次 sample
+
+        # 跨天刷盘：把 day 改成旧值，下一次采样触发上一天落盘
+        from pathlib import Path
+
+        reqlog._conc_day = "1999-01-01"
+        reqlog.sample()
+        files = list(Path(settings.DATA_DIR).glob("conc-*.jsonl"))
+        assert files, "并发曲线未落盘"
+        row = _json.loads(files[0].read_text().strip().splitlines()[0])
+        assert {"t", "c", "s", "q", "n"} <= set(row)
+
+    def test_conc_history_reads_disk(self, tmp_path, monkeypatch):
+        self._reset(monkeypatch)
+        reqlog.begin("h1", "messages", "m", False, "")
+        reqlog.sample()
+        reqlog.flush_conc()
+        agg = reqlog.conc_history(days=1)
+        assert agg["peak"]["client"] >= 1
+        assert agg["daily"][-1]["name"] == agg["to"] if "to" in agg else True
+        assert any(d["samples"] >= 1 for d in agg["daily"])
+
+    def test_start_sampler_without_loop(self):
+        """无 running loop 时返回 None 而不是抛（create_app 单测路径）。"""
+        assert reqlog.start_sampler() is None
+
+    def test_minute_rollover_keeps_curve_and_writes_once(self, monkeypatch, tmp_path):
+        """跨分钟：面板曲线要保留已结束的分钟（不能只留当前一分钟），
+        但磁盘每分钟只写一次（水位线去重，否则 jsonl 会被心跳刷爆）。"""
+        from pathlib import Path
+
+        self._reset(monkeypatch)
+        clock = {"m": 600}
+        monkeypatch.setattr(reqlog, "_bj_minute",
+                            lambda ts=None: ("2026-11-04", clock["m"]))
+
+        reqlog.begin("w1", "messages", "m", False, "")
+        reqlog.sample()                 # 分钟 600 采样
+        clock["m"] = 601
+        reqlog.sample()                 # 600 结束 → 落盘一次；曲线应含 600+601
+        clock["m"] = 602
+        reqlog.sample()                 # 再次心跳：600 不得重复写
+
+        minutes = [b["t"] for b in reqlog.conc_snapshot()["minutes"]]
+        assert minutes == [600, 601, 602], f"面板曲线丢失已结束分钟: {minutes}"
+        rows = [line for line in
+                next(Path(tmp_path).glob("conc-*.jsonl")).read_text().splitlines() if line]
+        ts = [_json.loads(r)["t"] for r in rows]
+        assert ts.count(600) == 1, f"分钟重复落盘: {ts}"
+
+
+class TestDedupAndLatencySplit:
+    """去重标记 + 净上游耗时：把「网关自己等出来的」与「上游慢」分开。"""
+
+    def test_dedup_flag_persisted(self, tmp_path):
+        from pathlib import Path
+
+        reqlog.begin("d1", "messages", "m", False, "")
+        reqlog.mark_dedup("d1", "replayed")
+        reqlog.finish_error("d1", "风暴去重重放", status=429, kind="dedup")
+        row = _json.loads(next(Path(tmp_path).glob("reqlog-*.jsonl")).read_text().strip().splitlines()[-1])
+        assert row["dd"] == "replayed" and row["kind"] == "dedup"
+
+    def test_net_up_excludes_waits(self):
+        reqlog.begin("d2", "messages", "m", False, "")
+        reqlog.note_wait("d2", "rl", 30.0)
+        reqlog.finish_ok("d2")
+        e = reqlog.snapshot()[0]
+        assert e["t_up"] is not None
+        # 总耗时是微秒级（测试内），等 30s 后净耗时应被夹到 0 而不是负数
+        assert e["t_up"] == 0.0
+
+    def test_hist_aggregates_codes_stops_and_dedup(self, tmp_path):
+        reqlog.begin("g1", "messages", "m", False, "")
+        reqlog.mark_dedup("g1", "merged")
+        reqlog.finish_error("g1", "429", status=429, code=3009, kind="rate")
+        reqlog.begin("g2", "messages", "m", False, "")
+        reqlog.finish_ok("g2", status=200, stop_reason="max_tokens")
+        reqlog.begin("g3", "chat", "m", False, "")
+        reqlog.finish_error("g3", "客户端断开", status=499)
+
+        agg = reqlog.history(days=1)
+        t = agg["totals"]
+        codes = {c["code"]: c["count"] for c in t["codes"]}
+        assert codes.get("429/3009") == 1      # 业务码并进直方图键
+        assert codes.get("499") == 1
+        stops = {s["reason"]: s["count"] for s in t["stops"]}
+        assert stops.get("max_tokens") == 1
+        assert t["dedup"] == 1 and t["disc"] == 1
+        assert t["disc_rate"] == round(1 / 3 * 100, 1)
+        assert "conc" in agg                     # 历史响应带并发曲线
+

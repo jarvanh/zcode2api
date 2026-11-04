@@ -841,7 +841,19 @@ async def usage_summary():
 @router.get("/monitoring")
 async def monitoring():
     """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
-    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP, "conc": reqlog.conc_snapshot()}
+
+
+@router.get("/monitoring/concurrency")
+async def monitoring_concurrency():
+    """实时并发四口径快照 + 启动以来峰值 + 当日分钟曲线（面板 1s 轮询）。"""
+    return reqlog.conc_snapshot()
+
+
+@router.get("/monitoring/concurrency/history")
+async def monitoring_concurrency_history(days: int = 7):
+    """磁盘并发曲线（逐日峰值 + 最近一天分钟级），峰值不因重启清零而丢。"""
+    return reqlog.conc_history(days)
 
 
 @router.get("/monitoring/history")

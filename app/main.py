@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import constants, endpoint_routing, freshness, hostinfo, logs, settings
+from . import constants, endpoint_routing, freshness, hostinfo, logs, reqlog, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import model_probe, monitor, risk_lane_probe
@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI):
     endpoint_routing.start()  # 端点映射跟随轮（agent/configs mapping，fail-open；fork 增强）
     version_tracker.init_from_store()
     version_tracker.start()   # 官方版本自动探测与同步（上游 2.7.16）
+    conc_task = reqlog.start_sampler()   # 并发仪表心跳（1s：槽位快照 + 分钟曲线）
     _run_install_sequence_on_start()
     _warn_version_drift()
     base = f"http://{_display_host()}:{settings.PORT}"
@@ -153,6 +154,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if conc_task is not None:
+            conc_task.cancel()
+        reqlog.flush_conc()   # 关机前把当日未满分钟落盘，曲线不断尾
         await monitor.stop()
         await freshness.stop()
         await model_probe.stop()

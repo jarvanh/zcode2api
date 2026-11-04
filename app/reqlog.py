@@ -51,6 +51,11 @@ _PREFIX = "reqlog-"
 _WAIT_KEYS = ("q", "rl", "5xx", "cap")
 _RETRY_KEYS = ("429", "5xx", "cap", "fb")
 
+def _clip(value, limit: int) -> str:
+    """观测字段统一截断（None → 空串，绝不把非字符串塞进日志）。"""
+    return str(value or "")[:limit]
+
+
 _lock = threading.Lock()
 _entries: deque = deque(maxlen=KEEP)
 _inflight: dict[str, dict] = {}
@@ -58,10 +63,252 @@ _inflight: dict[str, dict] = {}
 _hist_lock = threading.Lock()
 _last_prune_day = ""
 
+# ── 并发仪表（实时四口径 + 分钟峰值曲线）───────────────────────────────
+# 口径为什么要四个（互不相等且必须同时看）：
+#   client  网关在途：客户端连接还开着的请求（含排队/等 429/铸码）
+#   slot    上游占槽：真正压在账号上的并发（gateway._inflight 汇总）——
+#           _park_slot 会在等待前释放槽，所以「client 8 / slot 0」正是波次期典型形态
+#   queue   排队深度：选不到号在限流排队的请求数，加号/调并发上限的唯一依据
+#   per     每账号 n/limit：答「卡在并发满还是额度满」（以前只存在于选号日志）
+# 精度分层（观测不得反压请求）：client/queue 在 begin/finish/入队时刻用零 IO
+# 增量抬峰值（真·事件驱动）；slot/per/limit 由 1s tick 读快照（要碰 store，
+# 只在后台心跳里做），tick 同时校准 client/queue 防计数漂移。
+_CONC_PREFIX = "conc-"
+_CONC_TICK = 1.0
 
-def _clip(value, limit: int) -> str:
-    """观测字段统一截断（None → 空串，绝不把非字符串塞进日志）。"""
-    return str(value or "")[:limit]
+_slot_source = None               # gateway 注入：读真实槽位快照（避开循环 import）
+_queue_now = 0
+_conc = {"client": 0, "slot": 0, "queue": 0, "limit": 0, "per": {}}
+_conc_peak = {"client": 0, "slot": 0, "queue": 0, "at": 0.0, "kind": ""}
+_conc_min: dict[int, dict] = {}   # 北京分钟序号 → 该分钟峰值（跨分钟时刷盘）
+_conc_day = ""
+_conc_flushed = -1              # 当日已落盘的最大分钟序号（水位线，防重复写）
+_pending_flush: list[tuple[str, dict]] = []   # 已结束天的待落盘曲线
+
+
+def register_slot_source(fn) -> None:
+    """网关注入槽位快照函数：返回 {"total": int, "per": {账号: n}, "limit": int}。
+
+    观测层不反向 import 网关（循环依赖）；没注册时 slot/per 口径恒为 0，
+    其余口径照旧工作（测试环境即如此）。
+    """
+    global _slot_source
+    _slot_source = fn
+
+
+def _peak_locked(kind: str, value: int, now: float) -> None:
+    """抬峰值（调用方持 _lock）。"""
+    if value > _conc_peak[kind]:
+        _conc_peak[kind] = value
+        _conc_peak["at"] = now
+        _conc_peak["kind"] = kind
+
+
+def note_queue(delta: int) -> None:
+    """排队深度增减（进/出 _wait_for_account 各一次）。零 IO。"""
+    global _queue_now
+    now = time.time()
+    _queue_now = max(0, _queue_now + int(delta))
+    with _lock:
+        _conc["queue"] = _queue_now
+        _peak_locked("queue", _queue_now, now)
+        _bump_minute_locked()
+
+
+def _bj_minute(ts: float | None = None) -> tuple[str, int]:
+    """(北京日期, 当日分钟序号)：曲线按北京日分文件，与 reqlog 历史对齐。"""
+    dt = datetime.now(_BJ) if ts is None else datetime.fromtimestamp(ts, _BJ)
+    return dt.strftime("%Y-%m-%d"), dt.hour * 60 + dt.minute
+
+
+def _bump_minute_locked() -> None:
+    """把当前值归入所属分钟的 max（调用方持 _lock）。
+
+    只做内存操作：跨天时把昨天整段移交 _pending_flush，真正的磁盘写由
+    _drain_flush（后台心跳/收口落盘处，锁外）执行 —— 热路径（begin/finish
+    持 _lock）绝不为观测做 IO，否则跨天那一发请求会把全部并发请求排在后面。
+    """
+    global _conc_day, _conc_min, _conc_flushed
+    day, minute = _bj_minute()
+    if _conc_day != day:
+        if _conc_day and _conc_min:
+            _pending_flush.append((_conc_day, _conc_min))
+        _conc_min = {}
+        _conc_day = day
+        _conc_flushed = -1
+    bucket = _conc_min.get(minute)
+    if bucket is None:
+        _conc_min[minute] = {"c": _conc["client"], "s": _conc["slot"],
+                             "q": _conc["queue"], "n": 1}
+        return
+    bucket["c"] = max(bucket["c"], _conc["client"])
+    bucket["s"] = max(bucket["s"], _conc["slot"])
+    bucket["q"] = max(bucket["q"], _conc["queue"])
+    bucket["n"] += 1
+
+
+def _write_minutes(day: str, buckets: dict) -> None:
+    """把一个天的分钟峰值写进 data/conc-<北京日期>.jsonl（best-effort，锁外调）。"""
+    if not buckets:
+        return
+    try:
+        data_dir = _hist_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({"t": m, **b}, ensure_ascii=False, separators=(",", ":"))
+                 for m, b in sorted(buckets.items())]
+        with _hist_lock:
+            _conc_prune(data_dir)
+            with open(data_dir / f"{_CONC_PREFIX}{day}.jsonl", "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    except Exception as err:  # noqa: BLE001 - 曲线落盘失败不影响请求
+        logs.warn("reqlog", f"并发曲线落盘失败（忽略）: {err}")
+
+
+def _drain_flush() -> None:
+    """落盘所有积压曲线（由心跳/收口/关机调用；不得在持 _lock 时调）。
+
+    内部自吞异常：调用方之一是 _persist（请求落盘），排水失败绝不能把
+    请求行落盘连带打断；多线程同时 pop 的竞争也用异常吞掉兼容。
+    """
+    while _pending_flush:
+        try:
+            day, buckets = _pending_flush.pop(0)
+        except IndexError:
+            return
+        _write_minutes(day, buckets)
+
+
+def _conc_prune(data_dir: Path) -> None:
+    """并发曲线按天清理（与 reqlog 历史同保留期）。"""
+    cutoff = (datetime.now(_BJ) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+    for path in data_dir.glob(f"{_CONC_PREFIX}*.jsonl"):
+        d = path.name[len(_CONC_PREFIX):-len(".jsonl")]
+        if d < cutoff:
+            try:
+                path.unlink()
+            except OSError as err:
+                logs.warn("reqlog", f"并发曲线清理失败（忽略）: {path.name} {err}")
+
+
+def sample() -> None:
+    """1s 心跳：读槽位快照 + 校准 client/queue + 推分钟曲线（只许在后台调）。"""
+    slot_total, per, limit = 0, {}, 0
+    src = _slot_source
+    if src is not None:
+        try:
+            view = src() or {}
+            slot_total = int(view.get("total") or 0)
+            per = dict(view.get("per") or {})
+            limit = int(view.get("limit") or 0)
+        except Exception as err:  # noqa: BLE001 - 仪表读失败不得拖垮心跳
+            logs.warn("reqlog", f"槽位快照失败（忽略）: {err}")
+    now = time.time()
+    with _lock:
+        _conc["slot"], _conc["per"], _conc["limit"] = slot_total, per, limit
+        _conc["client"] = len(_inflight)   # 以真值校准，防极端路径漏减
+        _conc["queue"] = _queue_now
+        _peak_locked("slot", slot_total, now)
+        _peak_locked("client", _conc["client"], now)
+        _peak_locked("queue", _queue_now, now)
+        _bump_minute_locked()
+        due = _due_minutes_locked()
+    _drain_flush()
+    for day, minute, bucket in due:
+        _write_minutes(day, {minute: bucket})
+
+
+def _due_minutes_locked() -> list[tuple[str, int, dict]]:
+    """取「已结束但尚未落盘」的分钟（当前分钟不落，防半截值当最终值）。
+
+    两个约束都要满足：
+      - 不能只在跨天时写盘：否则进程被杀会丢整天曲线，面板也看不到今天已发生的部分；
+      - 不能把已写分钟从 _conc_min 抹掉：面板的分钟曲线要靠它（内存只留当日，
+        上限 1440 个，代价忽略），因此用 _conc_flushed 水位线去重。
+    """
+    global _conc_flushed
+    day, minute = _bj_minute()
+    if _conc_day != day:
+        _conc_flushed = -1
+    due = [(day, m, dict(b)) for m, b in sorted(_conc_min.items())
+           if m < minute and m > _conc_flushed]
+    if due:
+        _conc_flushed = due[-1][1]
+    return due
+
+
+def conc_snapshot() -> dict:
+    """实时并发快照（管理端轮询）：当前值 + 启动以来峰值 + 当日分钟曲线尾巴。"""
+    with _lock:
+        now = dict(_conc)
+        peak = dict(_conc_peak)
+        minutes = [{"t": m, **b} for m, b in sorted(_conc_min.items())][-120:]
+    return {"now": now, "peak": peak, "tick": _CONC_TICK, "minutes": minutes}
+
+
+def conc_history(days: int = 7) -> dict:
+    """磁盘并发曲线：逐日峰值 + 最近一天分钟曲线（历史视图用）。"""
+    days = max(1, min(int(days or 1), HISTORY_DAYS))
+    day_list = _recent_days(days)
+    data_dir = _hist_dir()
+    out: dict[str, dict] = {d: {"client": 0, "slot": 0, "queue": 0, "samples": 0}
+                            for d in day_list}
+    latest_minutes: list[dict] = []
+    for day in day_list:
+        path = data_dir / f"{_CONC_PREFIX}{day}.jsonl"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            b = out[day]
+            b["client"] = max(b["client"], int(row.get("c") or 0))
+            b["slot"] = max(b["slot"], int(row.get("s") or 0))
+            b["queue"] = max(b["queue"], int(row.get("q") or 0))
+            b["samples"] += int(row.get("n") or 0)
+            if day == day_list[-1]:
+                latest_minutes.append(row)
+    daily = [{"name": d, **out[d]} for d in day_list]
+    return {
+        "days": days,
+        "daily": daily,
+        "peak": {k: max([d[k] for d in daily] or [0]) for k in ("client", "slot", "queue")},
+        "minutes": latest_minutes[-1440:],
+    }
+
+
+def start_sampler():
+    """启动 1s 采样心跳（lifespan 调）；无 running loop 时返回 None（单测直接调 sample）。"""
+    import asyncio
+
+    async def _loop():
+        while True:
+            try:
+                sample()
+            except Exception as err:  # noqa: BLE001 - 心跳异常不许掉线
+                logs.warn("reqlog", f"并发采样异常（继续）: {err}")
+            await asyncio.sleep(_CONC_TICK)
+
+    try:
+        return asyncio.create_task(_loop())
+    except RuntimeError:
+        return None
+
+
+def flush_conc() -> None:
+    """关机刷盘：把当日未满的分钟也落下去（lifespan shutdown 调）。"""
+    with _lock:
+        day = _conc_day
+        buckets = dict(_conc_min)
+        _conc_min.clear()
+    _drain_flush()
+    _write_minutes(day, buckets)
 
 
 def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "",
@@ -115,10 +362,15 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "sess_repeat": None,
         "upstream_id": "",
         "stop_reason": None,
+        "t_up": None,
+        "dedup": "",
     }
     with _lock:
         _entries.append(entry)
         _inflight[req_id] = entry
+        _conc["client"] = len(_inflight)
+        _peak_locked("client", _conc["client"], entry["ts"])
+        _bump_minute_locked()
 
 
 def tag_session(req_id: str, sess_key: str, repeat: bool) -> None:
@@ -229,6 +481,31 @@ def note_retry(req_id: str, kind: str) -> None:
             entry[f"retry_{kind}"] += 1
 
 
+def _net_up(entry: dict) -> float | None:
+    """上游处理净耗时 = 总耗时 − 网关侧等待（排队/429/5xx/验证码）。
+
+    524 红线归因用：净 up 大 = 上游慢；wait 大而 up 小 = 我们自己等出来的。
+    """
+    total = entry.get("t_total")
+    if not isinstance(total, (int, float)):
+        return None
+    wait = sum(float(entry.get(f"wait_{k}") or 0) for k in _WAIT_KEYS)
+    return round(max(0.0, total - wait), 3)
+
+
+def mark_dedup(req_id: str, state: str) -> None:
+    """风暴去重标记：replayed=TTL 内同内容失败重放；merged=follower 等 leader 失败后重放。
+
+    这两类请求不进调度（零号压力），以前在监控里完全隐形 —— 面板要靠它们回答
+    「今天去重少烧了多少号」。leader 成功/超时后 follower 正常自走的场景不打标
+    （那是真实调度，不是去重收益）。
+    """
+    with _lock:
+        entry = _inflight.get(req_id)
+        if entry is not None:
+            entry["dedup"] = _clip(state, 12)
+
+
 def finish_ok(req_id: str, t_first: float | None = None,
               input_tokens: int | None = None, output_tokens: int | None = None,
               status: int | None = None, cache_read: int | None = None,
@@ -237,6 +514,7 @@ def finish_ok(req_id: str, t_first: float | None = None,
         entry = _inflight.pop(req_id, None)
         if entry is None:
             return
+        _conc["client"] = len(_inflight)
         entry["ok"] = True
         entry["status"] = status or 200
         entry["t_first"] = t_first
@@ -246,6 +524,7 @@ def finish_ok(req_id: str, t_first: float | None = None,
         entry["cache_read"] = cache_read
         if stop_reason:
             entry["stop_reason"] = _clip(stop_reason, 20)
+        entry["t_up"] = _net_up(entry)
         row = dict(entry)
     _persist(row)
 
@@ -266,6 +545,8 @@ def finish_error(req_id: str, error: str, status: int | None = None,
             entry["err_code"] = code
         if kind:
             entry["err_kind"] = _clip(kind, 20)
+        entry["t_up"] = _net_up(entry)
+        _conc["client"] = len(_inflight)
         row = dict(entry)
     _persist(row)
 
@@ -358,6 +639,8 @@ def _persist(entry: dict) -> None:
             "cap": round(float(entry.get("wait_cap") or 0), 2),
             "trace": entry.get("upstream_id") or "",
             "stop": entry.get("stop_reason") or "",
+            "up_t": entry.get("t_up"),
+            "dd": entry.get("dedup") or "",
             # 历史只留错误摘要（明细 preview 含用户内容，不进磁盘）
             "err": (entry.get("error") or "")[:160],
         }
@@ -376,7 +659,8 @@ def _persist(entry: dict) -> None:
 
 def _new_bucket(key: str = "") -> dict:
     return {"name": key, "calls": 0, "ok": 0, "fail": 0, "in": 0, "out": 0,
-            "probe": 0, "wait": 0.0, "retry": 0,
+            "probe": 0, "wait": 0.0, "retry": 0, "net_sum": 0.0, "net_n": 0,
+            "codes": {}, "stops": {}, "dedup": 0, "disc": 0,
             "ttfb_sum": 0.0, "ttfb_n": 0, "total_sum": 0.0, "total_n": 0,
             "last": 0.0}
 
@@ -402,6 +686,21 @@ def _acc(bucket: dict, row: dict) -> None:
     if isinstance(tt, (int, float)):
         bucket["total_sum"] += float(tt)
         bucket["total_n"] += 1
+    ut = row.get("up_t")
+    if isinstance(ut, (int, float)):
+        bucket["net_sum"] += float(ut)
+        bucket["net_n"] += 1
+    if row.get("dd"):
+        bucket["dedup"] += 1
+    st = row.get("status")
+    if st:
+        key = f"{st}/{row['code']}" if row.get("code") else str(st)
+        bucket["codes"][key] = bucket["codes"].get(key, 0) + 1
+        if int(st) == 499:
+            bucket["disc"] += 1
+    stop = row.get("stop")
+    if stop:
+        bucket["stops"][stop] = bucket["stops"].get(stop, 0) + 1
     ts = row.get("ts") or 0
     if ts > bucket["last"]:
         bucket["last"] = ts
@@ -409,6 +708,8 @@ def _acc(bucket: dict, row: dict) -> None:
 
 def _finalize(bucket: dict) -> dict:
     done = bucket["ok"] + bucket["fail"]
+    codes = bucket["codes"]
+    stops = bucket["stops"]
     return {
         "name": bucket["name"],
         "calls": bucket["calls"],
@@ -420,6 +721,15 @@ def _finalize(bucket: dict) -> dict:
         "probe": bucket["probe"],
         "wait": round(bucket["wait"], 1),
         "retry": bucket["retry"],
+        "net": round(bucket["net_sum"] / bucket["net_n"], 3) if bucket["net_n"] else None,
+        "dedup": bucket["dedup"],
+        "disc": bucket["disc"],
+        "disc_rate": round(bucket["disc"] / bucket["calls"] * 100, 1) if bucket["calls"] else None,
+        # 直方图按频次降序取前 8（429/5xx 与业务码混排，设阈值看的是码不是文案）
+        "codes": [{"code": c, "count": n} for c, n in
+                  sorted(codes.items(), key=lambda kv: -kv[1])[:8]],
+        "stops": [{"reason": c, "count": n} for c, n in
+                  sorted(stops.items(), key=lambda kv: -kv[1])[:6]],
         "ttfb": round(bucket["ttfb_sum"] / bucket["ttfb_n"], 3) if bucket["ttfb_n"] else None,
         "ttfb_n": bucket["ttfb_n"],
         "total": round(bucket["total_sum"] / bucket["total_n"], 3) if bucket["total_n"] else None,
@@ -489,6 +799,7 @@ def history(days: int = 7) -> dict:
         "from": day_list[0],
         "to": day_list[-1],
         "totals": totals,
+        "conc": conc_history(days),
         "daily": [_finalize(daily[d]) for d in day_list],
         "accounts": _top(accounts),
         "models": _top(models),
