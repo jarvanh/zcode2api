@@ -132,6 +132,13 @@ class Store:
             # 这批号是被旧语义错定为终态的通道级封锁（#716：billing 全程正常、
             # 只有 grant 腿被拦），旧状态既等不到人工、又连带停掉自动领包轮与
             # 额度刷新。迁移后封锁记在 plan 通道上，到点自动回轮询。
+            changed: dict[str, Account] = {}
+            # 冷却到期归一：DB 里的 COOLING 是历史态，到期不应继续作为持久状态
+            # 留给外部消费者（额度看板直接读 DB，会一直显示「冷却中」）。
+            for accounts in self._accounts.values():
+                for account in accounts:
+                    if account.normalize_expired_cooling():
+                        changed[account.id] = account
             if settings.RISK_LANE_SCOPED:
                 migrated = []
                 for accounts in self._accounts.values():
@@ -142,22 +149,26 @@ class Store:
                             settings.RISK_STRIKE_DECAY_SECONDS,
                         ):
                             migrated.append(account)
-                for account in migrated:
-                    conn.execute(
-                        f"""INSERT OR REPLACE INTO {_TBL}
-                            (id, provider, name, mode, status, enabled, created_at, data)
-                            VALUES (?,?,?,?,?,?,?,?)""",
-                        (
-                            account.id, account.provider, account.name, account.mode,
-                            account.status, 1 if account.enabled else 0,
-                            account.created_at,
-                            json.dumps(account.to_dict(), ensure_ascii=False),
-                        ),
-                    )
+                            changed[account.id] = account
                 if migrated:
-                    conn.commit()
                     print(f"[risk-lane] 存量风控禁用已转通道级冷却 ×{len(migrated)}: "
                           f"{', '.join(a.name for a in migrated)}")
+            for account in changed.values():
+                conn.execute(
+                    f"""INSERT OR REPLACE INTO {_TBL}
+                        (id, provider, name, mode, status, enabled, created_at, data)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        account.id, account.provider, account.name, account.mode,
+                        account.status, 1 if account.enabled else 0,
+                        account.created_at,
+                        json.dumps(account.to_dict(), ensure_ascii=False),
+                    ),
+                )
+            if changed:
+                conn.commit()
+                print(f"[cooling] 已到期的冷却状态洗回 active ×{len(changed)}: "
+                      f"{', '.join(a.name for a in changed.values())}")
 
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:

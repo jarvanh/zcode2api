@@ -159,6 +159,22 @@ class TestAccountStateMachine:
         acc.cooling_until = time.time() - 1
         assert acc.effective_status() == Status.ACTIVE
 
+    def test_normalize_expired_cooling(self):
+        """到期冷却要把持久化状态洗回 ACTIVE，不能留给外部只读消费者。"""
+        acc = self._acc()
+        acc.status = Status.COOLING
+        acc.cooling_until = time.time() - 1
+        assert acc.normalize_expired_cooling() is True
+        assert acc.status == Status.ACTIVE
+        assert acc.cooling_until is None
+
+    def test_normalize_keeps_active_cooling(self):
+        acc = self._acc()
+        acc.status = Status.COOLING
+        acc.cooling_until = time.time() + 300
+        assert acc.normalize_expired_cooling() is False
+        assert acc.status == Status.COOLING
+
     def test_public_view_masks_token(self):
         acc = Account.create("zai", "t", "x" * 100)
         view = acc.public_view()

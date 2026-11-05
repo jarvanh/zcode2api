@@ -793,6 +793,24 @@ class Account:
         """考虑冷却到期后的实时状态。"""
         if self.status == Status.COOLING:
             now = now or time.time()
-            if self.cooling_until and now >= self.cooling_until:
+            if not self.cooling_until or now >= self.cooling_until:
                 return Status.ACTIVE
         return self.status
+
+    def normalize_expired_cooling(self, now: float | None = None) -> bool:
+        """把已到期的持久化 COOLING 状态洗回 ACTIVE（返回是否有改动）。
+
+        冷却只是临时门禁，不是终态；`is_cooling()` / `effective_status()` 早已
+        按到期判定，但 DB 里的 status 一直不清。外部只读消费者（额度看板等）
+        直接读 DB 时就会把「09:43 已恢复」的号永远显示成「冷却中」（2026-11-05
+        主人截图实证）。cooling_until 为空的老记录也按到期处理——否则
+        `is_selectable()` 的 COOLING 分支会永久返回 False，把号卡死。
+        """
+        if self.status != Status.COOLING:
+            return False
+        now = now or time.time()
+        if self.cooling_until and self.cooling_until > now:
+            return False
+        self.status = Status.ACTIVE
+        self.cooling_until = None
+        return True
