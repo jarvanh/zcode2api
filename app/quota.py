@@ -314,9 +314,13 @@ async def fetch_quota(account: Account) -> dict:
         all_expired = all(window_expired(w, now) for w in quota_map.values())
         # 与「到点本地激活」共用同一谓词，避免两处口径漂移（2026-11-04）
         has_daily, has_bonus = quota_recoverable(account, quota_map, now)
-        if not has_daily and not has_bonus and account.enabled:
-            # enabled=False（手动停用）不改写状态：停用语义优先于额度语义，
-            # 否则刷新会把「停用」洗成 exhausted，面板读不出来停用原因。
+        # 风控禁用 / 废 JWT：billing 数据照写，但**绝不**用额度数字改状态；
+        # 否则 DISABLED→EXHAUSTED→（额度恢复）→ACTIVE 会绕过人工/风控封禁。
+        if account.status in (Status.INVALID, Status.DISABLED):
+            pass
+        elif not account.enabled:
+            pass  # 手动停用语义优先于额度语义，面板才能读出停用原因
+        elif not has_daily and not has_bonus:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已过期" if all_expired else "额度已用完"
         elif account.status in (Status.EXHAUSTED, Status.COOLING) and (

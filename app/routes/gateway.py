@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from .. import business_error, constants, dedup, diaglog, egress, freshness, logs, quota_windows, reqlog, riskmetrics, session_ctx, settings
+from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -1503,14 +1504,20 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
 
 
 async def _dispatch(req_id, body, incoming_headers, port, provider):
-    """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
+    """多账号负载均衡调度：_Upstream（成功）或 JSONResponse（错误）。
 
-    单账号并发限制：选号后若该账号在飞请求已达上限（store.account_concurrency，
-    0 = 不限），跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会
-    放大延迟甚至吊死客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正
-    进入 _try_account 的次数）。全满/无号 → 503。
+    调度准则：
+    1. 同一上下文亲和性：多轮请求绑定同一账号，提高 Cache 命中与局部性；
+    2. 新请求多账号负载均衡：分配到在飞负载最低的账号（同负载轮询平局）；
+    3. 单账号并发限制：写死 2，满载或故障时无缝溢出至其他可用账号；
+    4. 满载跳过不计入 MAX_ACCOUNT_ATTEMPTS；全满/无号 → 503。
     """
     t0 = time.time()
+    ctx_info = extract_context_key(body, incoming_headers, provider=provider)
+    pinned_id = affinity_manager.get(ctx_info.key) if ctx_info.is_continuation else None
+    if pinned_id:
+        logs.info(req_id, f"会话亲和命中: key={ctx_info.key} -> account={pinned_id}")
+
     tried: set[str] = set()
     model_key = str(body.get("model") or "")
     limit = _limit()
@@ -1557,7 +1564,14 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 status_code=503,
                 headers={"Retry-After": str(max(remaining, 1))},
             )
-        account = store.select(provider, skip_ids=tried, model=model_key)
+        account = store.select(
+            provider,
+            skip_ids=tried,
+            model=model_key,
+            inflight=_inflight if limit > 0 else None,
+            pinned_id=pinned_id,
+            max_inflight=limit if limit > 0 else 2,
+        )
         if account is None:
             # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
             # 返回 None 表示不排队（关闭 / 预算耗尽 / 空池）→ 走下方 503。
@@ -1569,9 +1583,17 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             tried.clear()  # 期间账号状态可能已刷新，重新给每个账号机会
             continue
         tried.add(account.id)
-        if limit > 0 and _inflight.get(account.id, 0) >= limit:
-            logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
-            continue
+        pinned_id = None
+
+        slot_box: list[str | None] = [None]
+        if limit > 0:
+            if _inflight.get(account.id, 0) >= limit:
+                logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+                continue
+            # 在任何异步挂起点（await）前同步占槽，消除 Check-then-Act 竞态击穿上限
+            _inflight[account.id] = _inflight.get(account.id, 0) + 1
+            slot_box[0] = account.id
+
         attempts += 1
         # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
         # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须
@@ -1579,15 +1601,10 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         # _try_account 会补码重试。lane 可用性（风控冷却且有 Key 回退时路由到 Key
         # 通道）仍须满足：验证码流程必须与实际通道一致，strike 才会记对 lane。
         plan_channel = provider == "zai" and account.uses_plan_channel()
-        needs_captcha = (plan_channel and account.plan_lane_available(model_key)
-                         and await captcha_manager.model_requests_need_captcha(
-                             _messages_egress()))
-
-        slot_box: list[str | None] = [None]
-        if limit > 0:
-            _inflight[account.id] = _inflight.get(account.id, 0) + 1
-            slot_box[0] = account.id
         try:
+            needs_captcha = (plan_channel and account.plan_lane_available(model_key)
+                             and await captcha_manager.model_requests_need_captcha(
+                                 _messages_egress()))
             result = await _try_account(
                 req_id, account, body, incoming_headers, plan_channel, needs_captcha,
                 slot_box,
@@ -1603,14 +1620,21 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 slot_box[0] = None
             continue
         if isinstance(result, _Upstream):
+            if ctx_info.key:
+                affinity_manager.bind(ctx_info.key, account.id)
             held = slot_box[0]
             slot_box[0] = None
             if held is not None:
                 result.on_close = _make_slot_releaser(held)
             return result
+        # 非流式成功由 _try_account 直接聚合成 Response 返回（fork 既有路径），
+        # 这里同样只在上游成功（2xx）时记录亲和；4xx/5xx 不建立绑定。
+        if ctx_info.key and 200 <= int(getattr(result, "status_code", 0) or 0) < 300:
+            affinity_manager.bind(ctx_info.key, account.id)
         if slot_box[0] is not None:
             _release_slot(slot_box[0])
             slot_box[0] = None
+        # 仅在上游流成功建立（_Upstream）时才记录会话亲和；4xx 等错误不建立绑定
         return result
 
     if queued:
@@ -1999,7 +2023,7 @@ reqlog.register_slot_source(_slot_view)
 
 
 def _limit() -> int:
-    """当前并发上限（0 = 不限），实时读取设置（后台改后即生效）。"""
+    """当前并发上限。写死 2（2026-11-04 线上实测），env/meta 一律无效。"""
     return store.account_concurrency()
 
 
