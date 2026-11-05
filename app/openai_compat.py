@@ -344,7 +344,12 @@ class StreamConverter:
             self.cache["creation"] = cache["creation"]
 
     def _sync_usage_total(self) -> None:
-        """按 OpenAI 口径重算 prompt/total：prompt_tokens 含缓存读写量。"""
+        """按 OpenAI 口径重算 prompt/total：prompt_tokens 含缓存读写量。
+
+        同时把缓存别名回写进 self.usage：网关自身 reqlog 用
+        `_cache_read(conv.usage)` 读命中量，不能只让对外副本带上字段，
+        否则账上（OmniRoute）有数、自家流水仍是 None。
+        """
         cached = self.cache["cached"] + self.cache["creation"]
         completion = self.usage["completion_tokens"]
         if self._input_raw is not None:
@@ -353,6 +358,7 @@ class StreamConverter:
             self.usage["prompt_tokens"] = cached
         prompt = self.usage["prompt_tokens"]
         self.usage["total_tokens"] = (prompt or 0) + (completion or 0) if prompt is not None or completion is not None else None
+        self.usage.update(_cache_usage_fields(self.cache))
 
     def usage_out(self) -> dict:
         """对外 usage：基础三字段 + 缓存全别名（下游 ?? 链需要）。"""

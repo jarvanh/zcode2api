@@ -340,8 +340,11 @@ class TestCacheUsageAccounting:
         assert usage["completion_tokens"] == 20
         assert usage["cached_tokens"] == 47552
         assert usage["prompt_tokens_details"]["cached_tokens"] == 47552
-        # 网关自身 reqlog 读 conv.usage，口径必须与对外一致
+        # 网关自身 reqlog 读 conv.usage，口径必须与对外一致（含缓存别名）；
+        # 否则账上（OmniRoute）有数、自家流水仍记 cache_read=None。
         assert conv.usage["prompt_tokens"] == 47595
+        assert conv.usage["cache_read_input_tokens"] == 47552
+        assert conv.usage["prompt_tokens_details"]["cached_tokens"] == 47552
 
     def test_stream_prompt_tokens_from_message_delta(self):
         """回归：GLM 流式在 message_start 不给 input_tokens，实测 8346 条流水 in 全为 0。"""
