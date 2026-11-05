@@ -259,3 +259,11 @@ RISK_CONTROL_MARKERS = (
     '"code":3012', '"code": 3012',
     "unusual activity",
 )
+
+# ── IP 级拦截页（阿里云 ESA/WAF，2026-11-05 对齐 magpie plugins#649）──────────
+# 与上面的 3012 是**两种东西**，只是共用 HTTP 405 状态码：
+#   拦截页 = 出口 IP 被网络防火墙拦（换账号无用，继续敲会延长封锁）
+#   3012  = Z.ai 应用层风控（算账号的，走 lane 冷却）
+# 判别只看响应体：正常响应都是 JSON/SSE，拦截页则是 HTML 错误页。
+EDGE_PAGE_MARKERS = ("errors.aliyun.com",)
+EDGE_PAGE_HTML_HINTS = ("<!doctype", "<html")

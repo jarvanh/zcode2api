@@ -263,6 +263,16 @@ RISK_WAVE_PAUSE_MAX = _int("ZCODE_RISK_WAVE_PAUSE_MAX", 600)  # 暂停指数延�
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
+# ── IP 级封锁静默（2026-11-05，对齐 magpie zcode 0.1.43 / plugins#649）──────
+# 405 + HTML 拦截页（errors.aliyun.com / <html>）= 本机出口 IP 被阿里云
+# ESA/WAF 拦，不是账号风控。命中后整个 plan 通道静默这么久：不发上游、
+# 不记 strike、不改账号状态；静默期内本地回同款 405，让下游切 provider。
+# 3 分钟与 magpie 一致（短到换网络/代理的用户等得起，长到防火墙计数降下来）。
+EDGE_HOLD_SECONDS = _int("ZCODE_EDGE_HOLD_SECONDS", 180)
+# 同时投入的账号数上限（0 = 不限）。magpie 实测：同一出口 3 个号并发会被
+# 405 拒，2 个不会（plugins#649 引用 01huadalang 的 Discord 反馈）。
+# 控制台可改（meta 表即时生效）；超出的号留作备用，在用的号冷却/耗尽时顶上。
+MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
 # 单账号并发上限。2026-11-04 线上实测写死为 2（每个账号同一时刻最多 2 个在飞
 # 请求，超限自动切下一账号）：不再读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台
 # meta 覆盖，历史 meta 值一律作废
@@ -318,7 +328,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.22"
+APP_VERSION = "2.9.23"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

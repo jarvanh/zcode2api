@@ -175,6 +175,12 @@ def build_app() -> FastAPI:
             else:
                 conc_in[bind_gauge] = left
         if status != 200:
+            if scenario == "edge_block_page" and isinstance(resp_body, str):
+                # 拦截页是 HTML，不能 JSON 序列化（否则网关看到的是带引号的字符串）
+                return Response(
+                    resp_body, status_code=status, media_type="text/html",
+                    headers={"x-mock-call-index": str(n), **extra_headers},
+                )
             return Response(
                 json.dumps(resp_body), status_code=status,
                 media_type="application/json",
@@ -232,6 +238,14 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "edge_block_page":
+            # 阿里云 ESA/WAF 拦截页（plugins#649）：405 + HTML，封的是**出口 IP**，
+            # 不是账号。网关必须把它与上面的 3012 分开处置（不记 strike）。
+            return 405, (
+                '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8">'
+                '<title>405</title><div>Sorry, your request has been blocked '
+                'due to unusual activity. errors.aliyun.com</div></html>'
+            ), {}
         if scenario in ("risk_biz_3012", "risk_control_3012_200"):
             # HTTP 200 内嵌业务码 3012 的风控形态（与 405 形态同因不同载体）。
             # 原实现在此路径误调不存在的 Account.ban_for_risk → AttributeError 500

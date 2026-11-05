@@ -731,6 +731,7 @@ async def get_settings():
         "bigmodel_channel_enabled": store.bigmodel_channel_enabled(),
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
+        "max_active_accounts": store.max_active_accounts(),
         "claim_round_interval": store.claim_round_interval(),
         "claim_round_stagger": store.claim_round_stagger(),
         "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
@@ -772,6 +773,13 @@ async def update_settings(payload: dict = Body(...)):
         store.set_setting("quota_refresh_interval", str(interval))
     # account_concurrency 已写死为 2（2026-11-04 线上实测），不再接受后台修改；
     # PUT 中携带该键直接忽略（不报错，兼容旧前端 payload）
+    if "max_active_accounts" in payload:
+        # 同时投入的账号数（0 = 不限），对齐 magpie 的 maxAccounts
+        try:
+            cap = max(0, int(payload["max_active_accounts"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "同时使用账号数必须是非负整数（0 = 不限）") from None
+        store.set_setting("max_active_accounts", str(cap))
     if "claim_round_interval" in payload:
         try:
             interval = max(0, int(payload["claim_round_interval"]))

@@ -170,6 +170,9 @@ class TestAccountConcurrency:
         mock.state.slow_all = False
         # 写死后 meta 不再生效；本用例需要 limit=1 制造「5 号全满」场景
         monkeypatch.setattr(settings, "ACCOUNT_CONCURRENCY", 1)
+        # 本用例测的是 MAX_ACCOUNT_ATTEMPTS 的会计（满号不计入尝试），
+        # 与「同时使用账号数」无关：解除上限以免 5 个满号把新号挡在备用池。
+        fresh_app.set_setting("max_active_accounts", "0")
         accounts = [
             _seed(fresh_app, f"h{i}.eyJzdWIiOiJjIn0.sig", f"a-skip-{i}")
             for i in range(6)

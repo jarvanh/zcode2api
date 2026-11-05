@@ -43,6 +43,11 @@
       <input class="input" id="account-concurrency" type="number" min="2" max="2" step="1" value="2" disabled>
     </div>
     <div class="settings-row">
+      <label>同时使用账号数</label>
+      <div class="hint">最多同时向几个 ZCode 账号发请求（0 = 不限）。超出的号留作备用，在用的号冷却/额度用完时自动顶上。上游实测同一出口 3 个号并发会被 405 拒，默认 2。修改后即时生效。</div>
+      <input class="input" id="max-accounts" type="number" min="0" step="1" placeholder="2">
+    </div>
+    <div class="settings-row">
       <label>bigmodel Key 回退通道</label>
       <div class="hint">开启后 <code>bigmodel/模型名</code> 前缀与 <code>x-provider: bigmodel</code> 头才会路由到 API Key 通道（默认关闭：该通道欠费时上游 429 且网关原地重试，请求会挂起约 2 分钟）。关闭时请求即时返回 403。修改后即时生效。</div>
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -125,6 +130,7 @@ async function load(){
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
     document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
     document.getElementById('account-concurrency').value=2;
+    document.getElementById('max-accounts').value=d.max_active_accounts??2;
     document.getElementById('bigmodel-channel').checked=!!d.bigmodel_channel_enabled;
     document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
     document.getElementById('claim-round-stagger').value=d.claim_round_stagger??0;
@@ -215,6 +221,8 @@ async function saveSettings(){
   const quota_refresh_interval=parseInt(document.getElementById('quota-interval').value,10);
   if(!admin_key)return showToast('后台密码不能为空','error');
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
+  const max_active_accounts=parseInt(document.getElementById('max-accounts').value,10);
+  if(isNaN(max_active_accounts)||max_active_accounts<0)return showToast('同时使用账号数必须是非负整数（0 = 不限）','error');
   const claim_round_interval=parseInt(document.getElementById('claim-round-interval').value,10);
   if(isNaN(claim_round_interval)||claim_round_interval<0)return showToast('自动领取轮间隔必须是非负整数（0 = 关闭）','error');
   const claim_round_stagger=parseInt(document.getElementById('claim-round-stagger').value,10);
@@ -223,7 +231,7 @@ async function saveSettings(){
   if(claim_round_hours && claim_round_hours!=='*' &&
      !claim_round_hours.replace(/，/g,',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
     return showToast('领取窗口必须是 0-23 的小时，逗号分隔（留空 = 全天）','error');
-  const payload={quota_refresh_interval,claim_round_interval,claim_round_stagger,claim_round_hours,
+  const payload={quota_refresh_interval,max_active_accounts,claim_round_interval,claim_round_stagger,claim_round_hours,
                  bigmodel_channel_enabled:document.getElementById('bigmodel-channel').checked,
                  auto_sync_client_version:document.getElementById('auto-sync-version').checked};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;
