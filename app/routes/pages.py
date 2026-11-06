@@ -56,4 +56,5 @@ async def admin_settings():
 
 @router.get("/meta", include_in_schema=False)
 async def meta():
-    return {"version": settings.APP_VERSION}
+    from app import inflight_metrics
+    return {"version": settings.APP_VERSION, **inflight_metrics.snapshot()}

@@ -172,6 +172,11 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="zcode-hub", version=settings.APP_VERSION, lifespan=lifespan)
 
+    # 进程级在途计数（看板「实时/并发」小卡真源）。
+    # 只统计业务请求路径，观测端点(/meta 等)不计入，避免看板轮询自抬曲线。
+    from app import inflight_metrics
+    app.add_middleware(inflight_metrics.InflightMiddleware)
+
     app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
 
     app.include_router(pages.router)
