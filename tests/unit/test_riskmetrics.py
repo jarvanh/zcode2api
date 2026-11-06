@@ -38,3 +38,15 @@ def test_aggregate_days_clamped(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path))
     assert len(riskmetrics.aggregate(days=999)["days"]) == riskmetrics.MAX_DAYS
     assert len(riskmetrics.aggregate(days=0)["days"]) == 1
+
+def test_edge_event_recorded(tmp_path, monkeypatch):
+    """IP/出口级 405 必须落盘并计入 edge（2026-11-06 载体分流）。"""
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path))
+    riskmetrics.record("edge", "zai-156", status=405, egress="direct", carrier="ip")
+    day_files = list(tmp_path.glob("risk-*.jsonl"))
+    assert len(day_files) == 1
+    row = json.loads(day_files[0].read_text().splitlines()[0])
+    assert row["kind"] == "edge"
+    assert row["carrier"] == "ip"
+    agg = riskmetrics.aggregate(days=1)
+    assert agg["days"][-1]["edge"] == 1

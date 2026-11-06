@@ -29,14 +29,15 @@ _PREFIX = "risk-"
 _hist_lock = threading.Lock()
 _last_prune_day = ""
 
-_KINDS = ("risk", "rate", "net", "wave")
+_KINDS = ("risk", "rate", "net", "wave", "edge")
 
 
 def record(kind: str, account: str = "", **fields) -> None:
     """记一条风控相关事件（best-effort，失败不影响请求）。
 
-    kind: risk（上游风控命中）/ rate（429 限流换号）/ net（连接失败）/
-    wave（频道级波次确认）。fields 随事件类型不同：signal/lane/strikes、
+    kind: risk（账号级上游风控）/ edge（IP/出口级 WAF 拦截）/
+    rate（429 限流换号）/ net（连接失败）/ wave（多账号波次确认）。
+    fields 随事件类型不同：signal/lane/strikes、carrier、egress、
     model、err、provider 等；值一律截断防刷盘。
     """
     if kind not in _KINDS:
@@ -85,6 +86,7 @@ def aggregate(days: int = 7) -> dict:
             "rate": sum(buckets["rate"].values()),
             "net": sum(buckets["net"].values()),
             "wave": sum(buckets["wave"].values()),
+            "edge": sum(buckets["edge"].values()),
             "risk_by_signal": dict(by_signal.most_common()),
             "risk_net_by_account": dict(by_account.most_common(20)),
         })

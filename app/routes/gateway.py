@@ -466,7 +466,8 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
             account.cooling_until = account.worst_lane_until() or res["until"]
         store.update_account(account)
         riskmetrics.record("risk", account.name, signal=signal, lane=res["lane"],
-                           strikes=res["strikes"], model=model or "")
+                           strikes=res["strikes"], model=model or "",
+                           carrier="account")
         return (f"通道 {lane} 冷却至 {until_str}（第 {res['strikes']} 次"
                 f"{'，整号全部服务通道均已冷却' if res['all_blocked'] else '，其余通道不受影响'}）")
 
@@ -516,7 +517,8 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
         )
         note = f"冷却至 {cool_until}（第 {account.risk_strikes:.0f} 次）"
     riskmetrics.record("risk", account.name, signal=signal, lane="account",
-                       strikes=account.risk_strikes, model=model or "")
+                       strikes=account.risk_strikes, model=model or "",
+                       carrier="account")
     store.update_account(account)
     return note
 
@@ -1851,7 +1853,7 @@ def _risk_wave_confirm(provider: str, account_id: str) -> bool:
     if cur is None or new_until > cur:
         _risk_wave_until[provider] = new_until
     riskmetrics.record("wave", account_id, provider=provider,
-                       pause=int(pause), level=level)
+                       pause=int(pause), level=level, carrier="ip")
     # B 档验证码波次助推：暂停到期前后的试探/恢复期验证码消耗最集中，
     # 预热目标临时抬升 + 闲置停解压制（到期自动回落，见 captcha.notify_wave_pause）
     captcha_manager.notify_wave_pause(pause)
@@ -2406,7 +2408,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     status=status_code, ms=(time.time() - attempt_t0) * 1000,
                     error="出口 IP 被拦（WAF 拦截页）",
                 )
-                riskmetrics.record("edge", account.name, status=status_code)
+                riskmetrics.record("edge", account.name, status=status_code,
+                                   egress=captcha_egress, carrier="ip")
                 logs.warn(
                     req_id,
                     f"账号 {account.name} 命中阿里云 WAF 拦截页（出口 IP 级，非账号风控），"
