@@ -36,8 +36,20 @@ def end() -> None:
 
 
 def snapshot() -> dict:
+    from .store import store
+    # 单账号并发上限 × 同时投入账号数 = 网关有效并发上限。
+    # 运行时 meta 可覆盖 max_active_accounts，所以从 store 实时读，不写死。
+    per_acc = store.account_concurrency()
+    active_cap = store.max_active_accounts()
+    max_conc = per_acc * active_cap if active_cap > 0 else None
     with _lock:
-        return {"inflight": _cur, "inflight_peak": _peak}
+        return {
+            "inflight": _cur,
+            "inflight_peak": _peak,
+            "max_concurrency": max_conc,
+            "max_per_account": per_acc,
+            "max_active_accounts": active_cap,
+        }
 
 
 class InflightMiddleware(BaseHTTPMiddleware):
