@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 
 from app import settings
-from app.models import Account, Status
+from app.models import Account
 
 
 def _acct(name: str) -> Account:
@@ -72,7 +72,7 @@ def test_hold_settings_defaults():
 
 def test_concurrency_classification_for_hold():
     """线上回归：3008 账号级频控必须扣号；只豁免 3009 模型并发槽。"""
-    from app.routes.gateway import _is_model_concurrency_hit, _is_concurrency_hit
+    from app.routes.gateway import _is_concurrency_hit, _is_model_concurrency_hit
 
     rate_3008 = '{"code":3008,"msg":"user concurrency limit exceeded"}'
     rate_3009 = '{"code":3009,"msg":"model concurrency limit exceeded"}'
