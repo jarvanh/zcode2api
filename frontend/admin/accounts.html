@@ -57,6 +57,7 @@
     <div class="section-meta" id="risk-updated"></div>
   </div>
   <div class="usage-grid" id="risk-grid"></div>
+  <div id="risk-attr-wrap"></div>
   <div id="risk-lane-wrap"></div>
 
   <div class="section-head">
@@ -320,6 +321,46 @@ function renderRisk(d){
   const wrap=document.getElementById('risk-lane-wrap');
   if(wrap)wrap.innerHTML=rows?`<div class="acct-scroll"><table class="acct-table"><thead><tr><th>账号</th><th>状态</th><th>lane 冷却</th><th>strikes</th><th>最近错误</th></tr></thead><tbody>${rows}</tbody></table></div>`
     :'<div class="section-meta" style="padding:8px 2px">当前无账号处于风控冷却 / 打击状态</div>';
+  renderAttribution(r.attribution||{});
+}
+const _ATTR_COLOR={ip:'var(--red)',account:'var(--amber)',busy:'var(--blue)',rate:'var(--purple)',clean:'var(--mint)'};
+function renderAttribution(attr){
+  const wrap=document.getElementById('risk-attr-wrap');
+  if(!wrap)return;
+  if(!attr||!attr.layers){wrap.innerHTML='';return;}
+  const color=_ATTR_COLOR[attr.cause]||'var(--mint)';
+  const bh=attr.busy_hold;
+  const bhNote=bh?` <span style="color:var(--blue)">· BUSY_HOLD 静默中剩 ${bh.remain_s}s</span>`:'';
+  const layers=(attr.layers||[]).map(l=>{
+    const lc=l.active?_ATTR_COLOR[l.key]:'var(--text-dim, #888)';
+    const dot=l.active?'●':'○';
+    return `<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0">
+      <span style="color:${lc};flex:none">${dot}</span>
+      <span style="color:${l.active?'var(--text, inherit)':'var(--text-dim, #888)'}">${l.label}${l.count?` <b>${l.count}</b>`:''} —— ${l.desc}</span>
+    </div>`;
+  }).join('');
+  const eg=attr.egress_distribution||{};
+  const egStr=Object.entries(eg).map(([k,v])=>`${k}×${v.accounts}`).join(' · ')||'—';
+  const KIND_LABEL={wave:'IP波次',edge:'WAF拦截',risk:'账号风控',busy:'并发饱和',net:'连接失败',rate:'频控扣号'};
+  const fmtTs=ts=>ts?new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false}):'';
+  const recent=(attr.recent||[]).map(e=>{
+    const label=KIND_LABEL[e.kind]||e.kind;
+    const extra=[e.signal, e.level?`L${e.level}`:'', e.pause?`暂停${e.pause}s`:'',
+                 e.status?`HTTP ${e.status}`:'', e.model].filter(Boolean).join(' ');
+    const cc=_ATTR_COLOR[e.carrier]||'var(--text-dim, #888)';
+    return `<tr><td>${fmtTs(e.ts)}</td><td style="color:${cc}">${label}</td><td>${e.account||'—'}</td><td>${extra||'—'}</td></tr>`;
+  }).join('');
+  const recentTbl=recent?`<div class="acct-scroll" style="margin-top:10px"><table class="acct-table"><thead><tr><th>时间</th><th>事件</th><th>账号</th><th>详情</th></tr></thead><tbody>${recent}</tbody></table></div>`
+    :'<div class="section-meta" style="padding:6px 2px">近 24h 无风控事件记录</div>';
+  wrap.innerHTML=`
+    <div class="usage-card" style="margin:10px 0;border-left:3px solid ${color}">
+      <div class="usage-label">归因结论</div>
+      <div style="font-size:14px;line-height:1.6;color:${color}">${attr.verdict||''}${bhNote}</div>
+      <div class="section-meta" style="padding:0">${attr.egress_hint||''}</div>
+    </div>
+    <div style="padding:4px 2px 8px;font-size:13px">${layers}</div>
+    <div class="section-meta" style="padding:2px">出口分布：${egStr}</div>
+    ${recentTbl}`;
 }
 function startRiskPolling(){
   if(_riskTimer)clearInterval(_riskTimer);

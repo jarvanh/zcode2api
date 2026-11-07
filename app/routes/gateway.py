@@ -83,6 +83,8 @@ def _busy_record_saturated() -> None:
         hits.clear()
         logs.warn("BUSY", f"60s 内 {settings.BUSY_N} 次持续饱和，全池静默 {settings.BUSY_HOLD}s"
                           "（赶在 WAF 封 IP 之前刹车，magpie plugins#503 同款）")
+        riskmetrics.record("busy", "", carrier="ip", event="armed",
+                           n=settings.BUSY_N, hold=settings.BUSY_HOLD)
 
 router = APIRouter()
 
@@ -2699,6 +2701,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     # 首次重问（retries_busy==1）后若再次被拒，即「首拒+1s
                     # 重问仍拒」；此处的第二次执行正是重问失败点。
                     if retries_busy >= 2:
+                        riskmetrics.record("busy", account.name, carrier="busy",
+                                           reason="concurrency", model=str(body.get("model") or ""))
                         _busy_record_saturated()
                     reqlog.note_retry(req_id, "429")
                     reqlog.note_wait(req_id, "rl", wait)
@@ -2719,6 +2723,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                         status=429, ms=(time.time() - attempt_t0) * 1000,
                                         error="429 并发槽饱和")
                     account.record_result(False, "429 并发槽饱和（不扣号）")
+                    riskmetrics.record("busy", account.name, carrier="busy",
+                                       reason="concurrency_exhausted", model=str(body.get("model") or ""))
                     logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和，原地重问用尽，换号")
                     return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
@@ -2747,7 +2753,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                         channel=_lane_for(force_fallback, plan_channel, url),
                                         status=429, ms=(time.time() - attempt_t0) * 1000, error="429 频控，换号优先")
                     account.record_result(False, "429 频控，换号优先（不原地静默等待）")
-                    riskmetrics.record("rate", account.name, model=str(body.get("model") or ""))
+                    riskmetrics.record("rate", account.name, carrier="rate",
+                                       status=status_code, model=str(body.get("model") or ""))
                     logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号"
                               + (f"（429 扣号 {hold_secs}s 至 "
                                  f"{time.strftime('%H:%M', time.localtime(until))}）" if hold_secs else ""))

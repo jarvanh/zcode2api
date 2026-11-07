@@ -155,19 +155,139 @@ async def risk_overview(days: int = 7):
                 "level": int(getattr(gw, "_risk_wave_level", {}).get(provider, 0)),
             })
 
+    # BUSY_HOLD 静默（v2.9.29：3008 并发槽持续饱和的全池刹车，进程内存态）
+    busy_hold = None
+    if getattr(gw, "_busy_held", None) and gw._busy_held():
+        busy_hold = {
+            "remain_s": gw._busy_hold_remaining(),
+            "hold": int(getattr(gw.settings, "BUSY_HOLD", 0)),
+        }
+
+    # ── 风控归因（2026-11-07）：「这次限流是因为 IP 还是什么」一屏回答 ──
+    # 四层归因按「最近 24h 滑窗 + 实时状态」判定（日历今午夜后会清零，
+    # 滑窗才能回答「刚才/今晚到底发生了什么」），前端直接渲染结论：
+    #   ip     波次暂停 / WAF 拦截页（出口地址连坐，换账号无用）
+    #   account 3012 账号风控（单号 strike，其余号可用）
+    #   busy   3008/3009/3010 并发槽饱和 + BUSY_HOLD（容量问题，自动恢复）
+    #   rate   真频控 1302/1303 账号级扣号等待
+    win = riskmetrics.window_counts(24)
+    ip_events = win.get("wave", 0) + win.get("edge", 0)
+    account_events = win.get("risk", 0)
+    busy_events = win.get("busy", 0)
+    rate_events = today.get("rate", 0)  # rate 量大，用日历今计数（滑窗剔除 rate）
+    egress_dist = _egress_distribution()
+    layers = [
+        {"key": "ip", "label": "IP/出口层",
+         "desc": "波次暂停或 WAF 拦截：出口地址被上游连坐，换账号无效，等暂停到期或换出口",
+         "count": ip_events, "active": bool(waves) or ip_events > 0},
+        {"key": "account", "label": "账号风控层",
+         "desc": "3012 unusual activity：单号被上游风控 strike/冷却，其余账号不受影响",
+         "count": account_events, "active": account_events > 0 or bool(lanes)},
+        {"key": "busy", "label": "并发饱和层",
+         "desc": "3008/3009/3010 并发槽「没轮到」+ BUSY_HOLD 全池刹车：容量问题，自动恢复",
+         "count": busy_events, "active": busy_events > 0 or busy_hold is not None},
+        {"key": "rate", "label": "频控扣号层",
+         "desc": "1302/1303 真频控：按账号扣号冷却（Retry-After 窗口），到期自动回池",
+         "count": rate_events, "active": rate_events > 0},
+    ]
+    # 一句话结论：按活跃层择重（IP 层优先级最高 —— 换号无效，运维动作不同）
+    if waves:
+        w = waves[0]
+        verdict = (f"IP 级波次暂停中（level {w['level']}，剩 "
+                   f"{max(1, w['remain_s'] // 60)}min）：出口地址被上游连坐，换账号无效")
+        cause = "ip"
+    elif busy_hold:
+        verdict = (f"并发槽持续饱和，BUSY_HOLD 全池静默中（剩 "
+                   f"{max(1, busy_hold['remain_s'])}s）：容量问题，到期自动恢复")
+        cause = "busy"
+    elif ip_events:
+        verdict = f"近 24h 有 {ip_events} 次 IP 级事件（波次/WAF），已结束；关注是否复发"
+        cause = "ip"
+    elif busy_events:
+        verdict = (f"并发槽饱和（3008 系）近 24h {busy_events} 次：多会话把活跃号打满，"
+                   "请求本地重问/排队已吸收，属容量波动")
+        cause = "busy"
+    elif account_events or lanes:
+        verdict = (f"账号风控（3012）近 24h {account_events} 次，"
+                   f"{len(lanes)} 个账号在冷却/strike：单号问题，其余号正常服务")
+        cause = "account"
+    elif rate_events:
+        verdict = f"仅频控扣号（今日 {rate_events} 次）：短窗口账号级限流，无 IP/风控问题"
+        cause = "rate"
+    else:
+        verdict = "近 24h 无风控/限流事件，各层干净"
+        cause = "clean"
+    if len(egress_dist) <= 1:
+        egress_hint = ("全部账号共用同一出口 IP（direct/本机出口）："
+                       "IP 级风控（波次/WAF）会全池连坐，建议按账号分散出口")
+    else:
+        egress_hint = f"出口已分散在 {len(egress_dist)} 个出口上，IP 级风控影响被隔离"
+    # 最近事件（跨北京日期的滑窗，含 ts/账号/归因字段，直接展示）
+    recent_rows = []
+    for row in riskmetrics.recent_events(24, limit=12):
+        recent_rows.append({
+            "ts": row.get("ts"), "kind": row.get("kind"),
+            "account": row.get("account") or "",
+            "carrier": str(row.get("carrier") or ""),
+            "signal": row.get("signal") or "",
+            "level": row.get("level") or "",
+            "pause": row.get("pause") or "",
+            "status": row.get("status") or "",
+            "egress": row.get("egress") or "",
+            "model": row.get("model") or "",
+            "event": row.get("event") or "",
+        })
+    attribution = {
+        "verdict": verdict, "cause": cause, "layers": layers,
+        "egress_distribution": egress_dist,
+        "egress_hint": egress_hint,
+        "window_hours": 24,
+        "recent": recent_rows,
+        "busy_hold": busy_hold,
+    }
+
     # 新鲜度现算并回写（同 /sections/freshness，消巡检盲窗；30s 轮询也吃到官方升版漂移）
     fresh = freshness.refresh()
 
     return {
         "data": {
             "days": day_rows,
-            "today": {k: today.get(k, 0) for k in ("risk", "rate", "net", "wave")},
+            "today": {k: today.get(k, 0) for k in ("risk", "rate", "net", "wave", "busy", "edge")},
             "accounts": lanes,
             "waves": waves,
             "freshness": fresh,
             "dedup": dedup.stats(),
+            "attribution": attribution,
         }
     }
+
+
+def _egress_distribution() -> dict:
+    """当前账号池的出口分布：proxy_url 分组计数（IP 归因的静态面）。
+
+    账号带独立 proxy_url 的各自成组；无代理的全部落在 direct 组 ——
+    组数 = 出口数，直接回答「是否全部共宅一个 IP」。
+    """
+    from collections import Counter
+    c = Counter()
+    for a in store.list_accounts("zai"):
+        if not a.enabled:
+            continue
+        px = (getattr(a, "proxy_url", None) or "").strip()
+        if px:
+            # 只取 host:port 归组，不落完整代理串（防凭据进前端）
+            host = px.split("//", 1)[-1].split("@", 1)[-1].split("/", 1)[0]
+            c[f"proxy:{host}"] += 1
+        else:
+            c["direct"] += 1
+    ips = {k: v for k, v in c.items()}
+    out = {}
+    for k, v in ips.items():
+        out[k] = {"accounts": v}
+    # direct 组附注出口 tag（reqlog eg 的 direct/proxy 与此同口径）
+    if "direct" in out:
+        out["direct"]["ips"] = "direct（本机出口）"
+    return out
 
 
 # ── 风控指标（2026-10-30）───────────────────────────────────────────────────
