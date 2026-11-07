@@ -19,36 +19,36 @@ def _setup(monkeypatch, n=5, window=60, hold=180):
     monkeypatch.setattr(settings, "BUSY_HOLD", hold)
 
 
-def test_busy_hold_arms_after_n_saturations(monkeypatch):
+async def test_busy_hold_arms_after_n_saturations(monkeypatch):
     _setup(monkeypatch)
     gw._busy_hold["hits"].clear()
     gw._busy_hold["until"] = 0.0
     for _ in range(settings.BUSY_N - 1):
-        gw._busy_record_saturated()
+        await gw._busy_record_saturated()
         assert not gw._busy_held()
-    gw._busy_record_saturated()
+    await gw._busy_record_saturated()
     assert gw._busy_held()
     assert 0 < gw._busy_hold_remaining() <= settings.BUSY_HOLD
 
 
-def test_busy_hold_does_not_self_extend(monkeypatch):
+async def test_busy_hold_does_not_self_extend(monkeypatch):
     _setup(monkeypatch)
     gw._busy_hold["hits"].clear()
     gw._busy_hold["until"] = 0.0
     for _ in range(settings.BUSY_N + 3):
-        gw._busy_record_saturated()
+        await gw._busy_record_saturated()
     until = gw._busy_hold["until"]
     for _ in range(3):
-        gw._busy_record_saturated()  # 静默期内的饱和不计数
+        await gw._busy_record_saturated()  # 静默期内的饱和不计数
     assert gw._busy_hold["until"] == until
 
 
-def test_busy_hold_disabled(monkeypatch):
+async def test_busy_hold_disabled(monkeypatch):
     _setup(monkeypatch, hold=0)
     gw._busy_hold["hits"].clear()
     gw._busy_hold["until"] = 0.0
     for _ in range(20):
-        gw._busy_record_saturated()
+        await gw._busy_record_saturated()
     assert not gw._busy_held()
 
 

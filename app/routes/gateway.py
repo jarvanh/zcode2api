@@ -56,6 +56,7 @@ _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染�
 # 429+Retry-After，零上游压力），赶在阿里云 WAF 把整个出口 IP 405 封禁之前
 # 刹车。状态只在进程内存：重启即清，与 magpie 同款。
 _busy_hold = {"hits": [], "until": 0.0}
+_busy_hold_lock = asyncio.Lock()  # 武装分支串行化：并发请求同时满员会双写 armed 事件
 
 
 def _busy_held() -> bool:
@@ -66,25 +67,32 @@ def _busy_hold_remaining() -> int:
     return max(1, int(_busy_hold["until"] - time.time() + 0.999))
 
 
-def _busy_record_saturated() -> None:
-    """记一次持续饱和；60s 窗口内满 BUSY_N 次即武装全池静默。"""
+async def _busy_record_saturated() -> None:
+    """记一次持续饱和；60s 窗口内满 BUSY_N 次即武装全池静默。
+
+    asyncio.Lock 串行化「检查满员 → 武装 → 清窗」：两个并发请求同时
+    满员会各自武装一次（实测 2026-11-08 双写 armed，ts 差 1ms）。
+    """
     if settings.BUSY_HOLD <= 0 or settings.BUSY_N <= 0:
         return
     if _busy_held():
         return  # 静默期内的饱和不再计数，防自我延长
-    now = time.time()
-    hits = _busy_hold["hits"]
-    hits.append(now)
-    window = settings.BUSY_WINDOW
-    while hits and now - hits[0] > window:
-        hits.pop(0)
-    if len(hits) >= settings.BUSY_N:
-        _busy_hold["until"] = now + settings.BUSY_HOLD
-        hits.clear()
-        logs.warn("BUSY", f"60s 内 {settings.BUSY_N} 次持续饱和，全池静默 {settings.BUSY_HOLD}s"
-                          "（赶在 WAF 封 IP 之前刹车，magpie plugins#503 同款）")
-        riskmetrics.record("busy", "", carrier="ip", event="armed",
-                           n=settings.BUSY_N, hold=settings.BUSY_HOLD)
+    async with _busy_hold_lock:
+        if _busy_held():  # 双检：等锁期间另一请求可能已武装
+            return
+        now = time.time()
+        hits = _busy_hold["hits"]
+        hits.append(now)
+        window = settings.BUSY_WINDOW
+        while hits and now - hits[0] > window:
+            hits.pop(0)
+        if len(hits) >= settings.BUSY_N:
+            _busy_hold["until"] = now + settings.BUSY_HOLD
+            hits.clear()
+            logs.warn("BUSY", f"60s 内 {settings.BUSY_N} 次持续饱和，全池静默 {settings.BUSY_HOLD}s"
+                              "（赶在 WAF 封 IP 之前刹车，magpie plugins#503 同款）")
+            riskmetrics.record("busy", "", carrier="ip", event="armed",
+                               n=settings.BUSY_N, hold=settings.BUSY_HOLD)
 
 router = APIRouter()
 
@@ -2703,7 +2711,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     if retries_busy >= 2:
                         riskmetrics.record("busy", account.name, carrier="busy",
                                            reason="concurrency", model=str(body.get("model") or ""))
-                        _busy_record_saturated()
+                        await _busy_record_saturated()
                     reqlog.note_retry(req_id, "429")
                     reqlog.note_wait(req_id, "rl", wait)
                     logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和（3008/3009），"
