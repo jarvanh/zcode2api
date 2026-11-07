@@ -52,6 +52,11 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        # 粘性活跃集（magpie maxAccounts 语义，plugins#649）：活跃名额只给
+        # 「结构失效」（禁用/额度耗尽/整号冷却）的号让位，短暂不可用（风控
+        # lane 冷却、429 扣号、并发满）不换班 —— 备用号保持静默，避免同 IP
+        # 多账号高频轮流敲门（2026-11-07 att=4 残留形态根因之一）。
+        self._active_set: dict[str, set[str]] = {p: set() for p in PROVIDERS}
         self._init_db()
         self._load()
 
@@ -405,6 +410,7 @@ class Store:
         inflight: dict[str, int] | None = None,
         pinned_id: str | None = None,
         max_inflight: int = settings.ACCOUNT_CONCURRENCY,
+        ignore_rate_hold: bool = False,
     ) -> Account | None:
         """选择下一个可用账号（fork 保留模型级判定 + 上游负载/亲和）。
 
@@ -419,12 +425,33 @@ class Store:
         skip_ids = skip_ids or set()
         inflight_map = inflight or {}
         now = time.time()
-        # 同时投入账号数上限（0 = 不限）。按「有在飞请求的账号」计数：已在用的
-        # 号优先继续用（保住缓存与亲和），名额未满时才允许拉新号进来。
-        # 必须在拿锁前读设置（get_setting 自己会拿同一把 RLock，语义上也更安全）。
-        active_cap = self.max_active_accounts()
         with self._lock:
-            accounts = self._accounts.get(provider, [])
+            accounts = list(self._accounts.get(provider, []))
+        # 同时投入账号数上限（0 = 不限）。粘性活跃集语义（magpie maxAccounts）：
+        # 名额满时新请求只落在活跃集内；成员在选中时进入，仅当结构失效（禁用/
+        # 额度耗尽/整号冷却）或被移出池子时让位 —— 短暂不可用不换班。
+        # 集为空（冷启动/全部退场）时按 inflight 回退，避免历史行为骤变。
+        # 必须在拿锁前读设置（get_setting 自己会拿同一把 RLock）。
+        active_cap = self.max_active_accounts()
+        active_set = self._active_set.get(provider, set())
+        if active_cap > 0 and not active_set:
+            active_set = {a.id for a in accounts if inflight_map.get(a.id, 0) > 0}
+            self._active_set[provider] = active_set
+        if active_cap > 0 and active_set:
+            by_id = {a.id: a for a in accounts}
+            vacated = {
+                aid for aid in active_set
+                if aid not in by_id
+                or not by_id[aid].enabled
+                or by_id[aid].status in (Status.EXHAUSTED, Status.INVALID, Status.DISABLED)
+                or (by_id[aid].is_cooling() and by_id[aid].cooling_until
+                    and by_id[aid].cooling_until > now)
+            }
+            if vacated:
+                active_set -= vacated
+        else:
+            active_set = set()
+        with self._lock:
             # 1. 亲和号尝试
             if pinned_id and pinned_id not in skip_ids:
                 for a in accounts:
@@ -436,17 +463,29 @@ class Store:
             # 2. 候选池过滤
             pool = [
                 a for a in accounts
-                if a.is_selectable(now, model=model)
+                if (a.is_selectable(now, model=model)
+                    or (ignore_rate_hold and model and a.is_rate_held(model, now)
+                        and not a.is_model_cooling(model, now)
+                        and not a.lane_blocked_for_model(model, now)
+                        and a.enabled and a.status not in (Status.EXHAUSTED, Status.INVALID, Status.DISABLED)))
                 and a.id not in skip_ids
                 and inflight_map.get(a.id, 0) < max_inflight
             ]
             if active_cap > 0 and pool:
-                active = {
-                    a.id for a in accounts if inflight_map.get(a.id, 0) > 0
-                }
-                if len(active) >= active_cap:
-                    # 名额已满：只允许把请求交给已在用的号，新号留作备用
-                    pool = [a for a in pool if a.id in active]
+                if ignore_rate_hold:
+                    # 换号判定：忽略扣号/短暂不可用，看结构可用性（判定本身
+                    # 不改活跃集，由 _dispatch 的正常选号路径维护成员）。
+                    pass
+                elif active_set:
+                    if len(active_set) >= active_cap:
+                        # 名额已满：恒收缩到集内（负载+轮询在集内分配，保缓存
+                        # 保亲和）。集内号短暂不可用（429 扣号/lane 冷却）被
+                        # 过滤后若无人可选 → 503/排队，**不拉备用顶班** ——
+                        # magpie 换班只发生在结构失效让位（vacated）后。
+                        pool = [a for a in pool if a.id in active_set]
+                    # 名额未满：全池参与负载+轮询（v2.9.21 语义），选中的号
+                    # 下方入集 —— 冷启动/重启恢复期逐步把活跃集补到 cap，
+                    # 之后满员收缩，备用号保持静默。
             if not pool:
                 return None
 
@@ -464,6 +503,8 @@ class Store:
 
             account = pool[best_idx]
             self._rotation[provider] = (best_idx + 1) % n
+            if active_cap > 0:
+                self._active_set[provider].add(account.id)
             return account
 
     def next_lane_uncooldown_at(self, provider: str, model: str) -> float | None:

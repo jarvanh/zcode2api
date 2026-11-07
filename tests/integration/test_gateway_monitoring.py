@@ -305,11 +305,15 @@ class TestMonitoringEnrichedFields:
         e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
         assert e["ok"] is False and e["status"] == 503
         att = e["att"]
-        assert len(att) == 2
+        # 粘性活跃集（magpie maxAccounts）+ 429 扣号：首个 429 后只换号一次
+        #（第二号被扣住后无号可选 → 排队关闭 → 503），梯子不再把两个号都
+        # 原地重试 5 遍 —— 这正是本扣号机制要消灭的「轮流敲门」。单次尝试
+        # + 1 次换号 = att 1～2，取决于扣号后是否还有一轮选号。
+        assert 1 <= len(att) <= 2
         assert {a["st"] for a in att} == {429}
-        assert {a["acc"] for a in att} == {"mono-a", "mono-b"}
+        assert {a["acc"] for a in att} <= {"mono-a", "mono-b"}
         assert all(a["ch"] == "plan" for a in att)
-        assert e["retry_429"] == 2
+        assert 1 <= e["retry_429"] <= 2
         assert e["wait_rl"] == 0  # 换号优先 = 没有静默等待
         assert e["up"] is True
 

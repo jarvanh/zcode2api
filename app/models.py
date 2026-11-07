@@ -134,6 +134,11 @@ class Account:
     rotate_count: int = 0
     last_rotate_at: float | None = None
     rate_strikes: int = 0  # 连续 429 重试梯耗尽次数（自动熔断）；成功即清零
+    # 429 频控扣号（magpie plugins#503「扣住直到上游等待期结束」）：
+    # 普通 429 后不再秒回池子，按模型记一个到期时刻，期间 is_selectable
+    # 直接跳过该号，避免换号梯子把全池每个号都敲一遍、拉长 IP 级风控窗口。
+    # 与 model_cooling（无资源包，指数退避）/risk_lane_cooling（3012 风控）语义分立。
+    rate_hold: dict = field(default_factory=dict)      # model_key -> until_epoch
     # ── 连接失败独立计数（2026-10-30，与上游风控分开）──
     # 网络层失败发生在本地/出口链路，请求未达上游、对风控评分零影响，故
     # 不进 risk_strikes/lane 冷却（那会像旧版那样被死节点烧到禁用）；走
@@ -594,6 +599,31 @@ class Account:
         """模型冷却键：统一小写，避免 GLM-5.3-Flash / glm-5.3-flash 分家。"""
         return (model or "").strip().lower()
 
+    def is_rate_held(self, model: str, now: float | None = None) -> bool:
+        """该账号是否处于 429 频控扣号期（magpie plugins#503 语义）。"""
+        key = self.model_key(model)
+        if not key:
+            return False
+        return float(self.rate_hold.get(key) or 0) > (now or time.time())
+
+    def hold_rate(self, model: str, seconds: float) -> float:
+        """429 后扣住该账号到 seconds 秒后（取已有截止时刻的较晚者）。
+
+        只延长不缩短：并发请求同时扣号时不会互相把等待期改短。
+        """
+        key = self.model_key(model)
+        if not key or seconds <= 0:
+            return 0.0
+        until = max(float(self.rate_hold.get(key) or 0), time.time() + float(seconds))
+        self.rate_hold[key] = until
+        return until
+
+    def clear_rate_hold(self, model: str) -> None:
+        """上游成功（2xx）即放回账号，清除该模型扣号。"""
+        key = self.model_key(model)
+        if key:
+            self.rate_hold.pop(key, None)
+
     def is_model_cooling(self, model: str, now: float | None = None) -> bool:
         """该账号是否因「该模型无资源包」处于冷却期。"""
         key = self.model_key(model)
@@ -640,6 +670,8 @@ class Account:
         """
         if not self.enabled:
             return False
+        if model and self.is_rate_held(model, now):
+            return False  # 429 频控扣号期内：换号/新请求都不得再打这个号
         if model and self.is_model_cooling(model, now):
             return False
         if model and self.lane_blocked_for_model(model, now):

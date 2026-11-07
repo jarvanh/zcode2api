@@ -136,6 +136,10 @@ RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信
 #（HTTP 524），且等待期间零字节发给客户端。改成立刻换号（workbuddy-gateway
 # 同型做法）。仅当池内无其他账号可换（全池限流）时才回退到原地等待兜底。
 RETRY_429_FAILOVER_FIRST = _bool("ZCODE_RETRY_429_FAILOVER_FIRST", True)
+# 429 频控扣号（magpie plugins#503）：换号后把该号扣住到上游 Retry-After 期满，
+# 无 Retry-After 时用默认秒数；上限防 CDN 边缘超时。0 = 关闭（退回旧行为）。
+RETRY_429_HOLD_DEFAULT = _int("ZCODE_RETRY_429_HOLD_DEFAULT", 30)
+RETRY_429_HOLD_MAX = _int("ZCODE_RETRY_429_HOLD_MAX", 60)
 # 429 自动熔断：重试梯连续耗尽 RATE_BREAK_THRESHOLD 轮即熔断冷却（指数退避：
 # RATE_COOL_BASE 起、每次翻倍、RATE_COOL_MAX 封顶）。冷却到期自动回轮询，
 # 任何成功请求清零计数 —— 「自动禁用 + 自动启用」闭环，无需人工介入。
@@ -328,7 +332,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.25"
+APP_VERSION = "2.9.26"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

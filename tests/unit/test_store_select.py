@@ -12,7 +12,10 @@ class TestStoreSelectLoadBalancing:
     def test_least_inflight_preferred(self, fresh_app: Store):
         a = fresh_app.add_account("zai", "a", "jwt.token.a")
         b = fresh_app.add_account("zai", "b", "jwt.token.b")
-
+        # 粘性活跃集语义（2026-11-07）：集内负载均衡仍生效，先用两个请求
+        # 让 a、b 都进集，再验证集内负载最小优先。
+        fresh_app.select("zai", inflight={a.id: 0, b.id: 0})
+        fresh_app.select("zai", inflight={a.id: 0, b.id: 0})
         # a 有 1 个在飞请求，b 有 0 个在飞请求 -> 优先选负载最小的 b
         inflight = {a.id: 1, b.id: 0}
         pick = fresh_app.select("zai", inflight=inflight)
@@ -23,7 +26,7 @@ class TestStoreSelectLoadBalancing:
         a = fresh_app.add_account("zai", "a", "jwt.token.a")
         b = fresh_app.add_account("zai", "b", "jwt.token.b")
 
-        # 负载相同（均为 0），依次轮流分流
+        # 负载相同（均为 0），依次轮流分流；首两次把两号都拉入活跃集
         inflight = {a.id: 0, b.id: 0}
         picks = [fresh_app.select("zai", inflight=inflight).id for _ in range(4)]
         assert picks == [a.id, b.id, a.id, b.id]

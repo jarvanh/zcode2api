@@ -187,9 +187,16 @@ class TestStoreRotation:
     def test_round_robin_distribution(self, fresh_app):
         for i in range(3):
             fresh_app.add_account("zai", f"a{i}", f"jwt.token.{i}")
+        # 粘性活跃集（magpie maxAccounts，2026-11-07）：cap=2 时只有前 2 个
+        # 号轮换，第 3 个留作备用 —— 均分限制在活跃集内。
+        cap = fresh_app.max_active_accounts()
         picks = [fresh_app.select("zai").id for _ in range(9)]
-        assert len(set(picks)) == 3
-        assert all(picks.count(p) == 3 for p in set(picks))
+        if cap > 0:
+            assert len(set(picks)) == cap
+            assert all(picks.count(p) in (9 // cap, 9 // cap + 1) for p in set(picks))
+        else:
+            assert len(set(picks)) == 3
+            assert all(picks.count(p) == 3 for p in set(picks))
 
     def test_skip_ids(self, fresh_app):
         a = fresh_app.add_account("zai", "a", "jwt.token.a")

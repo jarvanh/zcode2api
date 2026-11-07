@@ -43,10 +43,12 @@ class TestMaxActiveAccounts:
         c = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "m-c")
         fresh_app.set_setting("max_active_accounts", "2")
 
-        # 只有一个号在飞：名额还有空位，备用号可以被拉进来
+        # 粘性活跃集（magpie，2026-11-07）：未满员时逐步扩集（a→b），
+        # 补到 cap=2 后 b/c 中只有先进集的 b 参与轮换，c 恒为备用静默。
         inflight = {a.id: 1}
         picked = {fresh_app.select("zai", inflight=inflight).id for _ in range(20)}
-        assert c.id in picked
+        assert c.id not in picked
+        assert len(picked) <= 2  # cap=2 上限不破
 
     def test_zero_means_unlimited(self, fresh_app):
         a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "m-a")

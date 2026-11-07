@@ -321,9 +321,13 @@ def _has_other_selectable(account: Account, model: str | None = None) -> bool:
 
     只看「其他账号」，不把同账号的 API Key 回退通道当作换号目标 —— 回退
     通道由 force_fallback 单独处理，两者语义不同（换号 vs 换通道）。
+    ignore_rate_hold：忽略 429 扣号只看结构可用性 —— 扣号是「本请求刚把
+    某号扣住」的结果，不该让换号判定误判成「无号可换」而退化成原地重试 5
+    次（那样反而把同一个号打得更多）。
     """
     try:
-        return store.select(account.provider, skip_ids={account.id}, model=model) is not None
+        return store.select(account.provider, skip_ids={account.id}, model=model,
+                            ignore_rate_hold=True) is not None
     except Exception:  # noqa: BLE001 - 判定失败按「无其他账号」兑底，走原有兜底
         return False
 
@@ -394,14 +398,23 @@ def _is_risk_control(status_code: int, text: str) -> bool:
 
 
 def _is_concurrency_hit(text: str) -> bool:
-    """429 body 是否为 3009「模型并发已满」（区别于真频控，等待策略不同）。
+    """429 body 是否为「并发争用」（区别于账号级频控，等待策略不同）。
 
     业务码必须解析后精确比较：logid 是 20 位随机数字，裸子串 "3009" 会撞车
     （constants.CONCURRENCY_BUSINESS_CODE 注记的同款教训）；非 JSON 形态退回
-    文案匹配兜底。
+    文案匹配兜底。3008/user concurrency 同样秒级释放，与 3009 一起短退避。
     """
     code = business_error.business_code(_safe_json(text))
-    return code == constants.CONCURRENCY_BUSINESS_CODE or "concurrency limit" in text.lower()
+    return code in (constants.CONCURRENCY_BUSINESS_CODE, 3008) or "concurrency limit" in text.lower()
+
+
+def _is_model_concurrency_hit(text: str) -> bool:
+    """仅 3009「模型并发已满」：槽位秒级释放，不该扣号（扣了会让本来马上
+    可用的账号白等 30s）。3008 是账号级频控，必须扣号——2026-11-07 线上
+    429 主力就是 3008，误按 3009 语义放行会导致扣号不生效、att=4 照旧。
+    """
+    code = business_error.business_code(_safe_json(text))
+    return code == constants.CONCURRENCY_BUSINESS_CODE
 
 
 def _parse_retry_after(value: str | None) -> int | None:
@@ -1090,6 +1103,7 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Re
                     account.last_used_at = time.time()
                     account.record_result(True, f"HTTP 200 · {model_name} · openai-stream")
                     account.clear_model_cooling(model_name)
+                    account.clear_rate_hold(model_name)  # 上游 2xx 成功即放回 429 扣号
                     store.update_account(account)
                     t_first = time.time() - t0
                     reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
@@ -1118,6 +1132,7 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Re
                     account.last_used_at = time.time()
                     account.record_result(True, f"HTTP 200 · {model_name} · openai")
                     account.clear_model_cooling(model_name)
+                    account.clear_rate_hold(model_name)  # 上游 2xx 成功即放回 429 扣号
                     store.update_account(account)
                     reqlog.finish_ok(req_id, t_first=time.time() - t0, status=200,
                                      input_tokens=usage.get("prompt_tokens"),
@@ -2583,13 +2598,28 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(
                     account, str(body.get("model") or "")
                 ):
+                    # 扣号到上游 Retry-After 期满；无 Retry-After 用默认 30s，
+                    # 上限 60s 防客户端吊死。只豁免 3009（模型并发槽秒级释放）；
+                    # 3008 账号级频控是线上 429 主力，必须扣号。
+                    # 仅在「其他号可服务」时扣：全池被限流时由下方原地等待兜底，
+                    # 不额外延长全池不可用时间。
+                    hold_model = str(body.get("model") or "")
+                    hold_secs = 0
+                    if settings.RETRY_429_HOLD_DEFAULT > 0 and not _is_model_concurrency_hit(text):
+                        hold_secs = _parse_retry_after(resp.headers.get("retry-after")) \
+                            or settings.RETRY_429_HOLD_DEFAULT
+                        hold_secs = min(hold_secs, settings.RETRY_429_HOLD_MAX)
+                        until = account.hold_rate(hold_model, hold_secs)
+                        store.update_account(account)
                     reqlog.note_retry(req_id, "429")
                     reqlog.mark_attempt(req_id, account.name, account.mode,
                                         channel=_lane_for(force_fallback, plan_channel, url),
                                         status=429, ms=(time.time() - attempt_t0) * 1000, error="429 频控，换号优先")
                     account.record_result(False, "429 频控，换号优先（不原地静默等待）")
                     riskmetrics.record("rate", account.name, model=str(body.get("model") or ""))
-                    logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号")
+                    logs.warn(req_id, f"账号 {account.name} 被限流 429，池内有其他账号，立刻换号"
+                              + (f"（429 扣号 {hold_secs}s 至 "
+                                 f"{time.strftime('%H:%M', time.localtime(until))}）" if hold_secs else ""))
                     return _NEXT_ACCOUNT
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
@@ -2803,6 +2833,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 计数；风控冷却未到期同样不洗（与下方流式路径同一守卫语义，
                 # 否则 3012 后同请求走 Key 回退成功会把冷却洗掉，立刻重打 Plan）
                 account.clear_model_cooling(str(body.get("model") or ""))
+                account.clear_rate_hold(str(body.get("model") or ""))  # 上游 2xx 成功即放回 429 扣号
                 # 真实成功按实际通道聚合解封（url 判通道：内部 lane 重路由时
                 # force_fallback 仍为 False，不能用请求参数猜通道）
                 channel_used = "plan" if "/zcode-plan/" in url else "apikey"
@@ -2853,6 +2884,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         # Plan 通道已解除，洗掉会立刻重打 Plan 并累加计数）。冷却已过期后的
         # Plan 通道成功即证明恢复，全量清理（清风控计数）。
         account.clear_model_cooling(str(body.get("model") or ""))
+        account.clear_rate_hold(str(body.get("model") or ""))  # 上游 2xx 成功即放回 429 扣号
         # 真实成功按实际通道聚合解封（url 判通道，见同步直通出口注释）
         channel_used = "plan" if "/zcode-plan/" in url else "apikey"
         account.clear_channel_cooling(channel_used)
