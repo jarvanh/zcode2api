@@ -503,7 +503,11 @@ class Store:
 
             account = pool[best_idx]
             self._rotation[provider] = (best_idx + 1) % n
-            if active_cap > 0:
+            # ignore_rate_hold 的调用（429 换号判定）只探可用性，不得把
+            # 被跳过的备用号写入活跃集 —— 否则每次全池 429 风暴都会把备用
+            # 号逐个拖进来轮着吃 429（2026-11-07 08:25 实测：storm 把
+            # zai-176/131 顶进了集，破坏「正式工+备用」粘性）。
+            if active_cap > 0 and not ignore_rate_hold:
                 self._active_set[provider].add(account.id)
             return account
 
