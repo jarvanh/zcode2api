@@ -49,6 +49,41 @@ from ..token_estimate import estimate_input_tokens_after_transform
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
+# ── BUSY_HOLD（magpie plugins#503 同款全池刹车）──────────────────────────
+# 429 body 3008/3009/3010 = 并发槽「没轮到」：同一请求 1s/2s 重问两次仍被拒
+# 才算「持续饱和」（busy_saturated 计一次）；60s 窗口内累计 BUSY_N 次即全池
+# 静默 BUSY_HOLD 秒（所有账号的 zcode.z.ai Start Plan 请求在本地直接
+# 429+Retry-After，零上游压力），赶在阿里云 WAF 把整个出口 IP 405 封禁之前
+# 刹车。状态只在进程内存：重启即清，与 magpie 同款。
+_busy_hold = {"hits": [], "until": 0.0}
+
+
+def _busy_held() -> bool:
+    return settings.BUSY_HOLD > 0 and time.time() < _busy_hold["until"]
+
+
+def _busy_hold_remaining() -> int:
+    return max(1, int(_busy_hold["until"] - time.time() + 0.999))
+
+
+def _busy_record_saturated() -> None:
+    """记一次持续饱和；60s 窗口内满 BUSY_N 次即武装全池静默。"""
+    if settings.BUSY_HOLD <= 0 or settings.BUSY_N <= 0:
+        return
+    if _busy_held():
+        return  # 静默期内的饱和不再计数，防自我延长
+    now = time.time()
+    hits = _busy_hold["hits"]
+    hits.append(now)
+    window = settings.BUSY_WINDOW
+    while hits and now - hits[0] > window:
+        hits.pop(0)
+    if len(hits) >= settings.BUSY_N:
+        _busy_hold["until"] = now + settings.BUSY_HOLD
+        hits.clear()
+        logs.warn("BUSY", f"60s 内 {settings.BUSY_N} 次持续饱和，全池静默 {settings.BUSY_HOLD}s"
+                          "（赶在 WAF 封 IP 之前刹车，magpie plugins#503 同款）")
+
 router = APIRouter()
 
 # ── X-Probe 探测打标 ──────────────────────────────────────────────
@@ -573,6 +608,16 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
         return "quota", quota_wait
     if lane_wait:
         return "lane", lane_wait
+    # 429 扣号/全池静默的到期时刻 → 429+Retry-After（非 503）：短窗口必然
+    # 恢复，语义是「稍后重试必有」，且 OmniRoute 对 429 走限流退避而非熔断。
+    if _busy_held():
+        return "busy", _busy_hold["until"]
+    key = Account.model_key(model_key)
+    holds = [float(a.rate_hold.get(key) or 0)
+             for a in store.list_accounts(provider) if a.enabled]
+    holds = [u for u in holds if u > now]
+    if holds:
+        return "rate", min(holds)
     return None, None
 
 
@@ -1595,6 +1640,33 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 status_code=503,
                 headers={"Retry-After": str(max(remaining, 1))},
             )
+        # BUSY_HOLD 武装（3008 持续饱和达阈值）：全池静默，请求不发上游。
+        # 流式排队预算 240s ≥ HOLD 180s：本地等完静默自动恢复，成功率不吃亏；
+        # 同步预算 60s < HOLD：直接 429+Retry-After 由客户端重试，不强行吊满
+        # 3 分钟撞 CDN 100s 红线。
+        if _busy_held():
+            wait = _busy_hold_remaining()
+            max_wait = settings.QUEUE_WAIT if budget is None else budget
+            can_wait = max_wait >= wait and (deadline == 0 or time.time() - t0 + wait <= deadline)
+            if can_wait and queued + wait <= max_wait:
+                logs.warn(req_id, f"BUSY_HOLD 静默中（剩 ~{wait}s），本地排队等待恢复")
+                reqlog.note_wait(req_id, "q", wait)
+                await _sleep(wait)
+                queued += wait
+                tried.clear()  # 静默结束后按粘性活跃集重新选号
+                continue
+            logs.warn(req_id, f"BUSY_HOLD 静默中（剩 ~{wait}s），429 快速返回不试探账号")
+            reqlog.finish_error(req_id, "BUSY_HOLD 全池静默", status=429, kind="rate")
+            return JSONResponse(
+                {"error": {
+                    "message": (f"上游并发槽持续饱和，全池静默 {wait}s 后恢复"
+                                "（防止出口 IP 被防火墙封禁；稍后自动重试即可）"),
+                    "type": "rate_limit_error", "code": "busy_hold",
+                    "next_available_at": round(time.time() + wait),
+                }},
+                status_code=429,
+                headers={"Retry-After": str(wait)},
+            )
         account = store.select(
             provider,
             skip_ids=tried,
@@ -1674,9 +1746,9 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         kind, wait = _recovery(provider, model_key)
         reqlog.finish_error(
             req_id, f"无可用账号 / 额度均已耗尽 / 并发已满（已排队 {queued:.0f}s）",
-            status=429 if (kind == "model" and wait) else (
+            status=429 if (kind in ("model", "rate", "busy") and wait) else (
                 402 if kind == "quota" else 503),
-            kind="quota" if kind == "quota" else ("rate" if kind == "model" and wait else "no_account"),
+            kind="quota" if kind == "quota" else ("rate" if kind in ("model", "rate", "busy") else "no_account"),
         )
         if wait and wait > time.time():
             retry_after = max(1, int(wait - time.time() + 0.999))
@@ -1707,6 +1779,22 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                     status_code=402,
                     headers={"Retry-After": str(retry_after)},
                 )
+            # 429 频控扣号/并发槽饱和/全池静默：短窗口必然恢复 → 429 而非
+            # 503（「稍后重试必有」；OmniRoute 对 429 走限流退避而非熔断）
+            if kind in ("rate", "busy"):
+                why = ("上游并发槽持续饱和，全池静默中" if kind == "busy"
+                       else "全部账号被上游限流（频控/并发槽），短窗口自动恢复")
+                return JSONResponse(
+                    {"error": {
+                        "message": (f"{why}（已排队等待 {queued:.0f}s），"
+                                    f"预计 {time.strftime('%H:%M', time.localtime(wait))} 恢复"),
+                        "type": "rate_limit_error", "code": "rate_limited",
+                        "model": model_key, "queued_seconds": round(queued),
+                        "next_available_at": round(wait),
+                    }, "retry_after": retry_after},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
             # 风控通道冷却：封锁按通道，换模型无济于事 → 503 而非 429 语义
             return JSONResponse(
                 {"error": {
@@ -1729,9 +1817,9 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     kind, wait = _recovery(provider, model_key)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
-                        status=429 if (kind == "model" and wait) else (
+                        status=429 if (kind in ("model", "rate", "busy") and wait) else (
                             402 if kind == "quota" else 503),
-                        kind="quota" if kind == "quota" else ("rate" if kind == "model" and wait else "no_account"))
+                        kind="quota" if kind == "quota" else ("rate" if kind in ("model", "rate", "busy") else "no_account"))
     if wait and wait > time.time():
         retry_after = max(1, int(wait - time.time() + 0.999))
         if kind == "model":
@@ -1753,6 +1841,18 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                     "model": model_key, "next_available_at": round(wait),
                  }, "retry_after": retry_after},
                 status_code=402,
+                headers={"Retry-After": str(retry_after)},
+            )
+        if kind in ("rate", "busy"):
+            why = ("上游并发槽持续饱和，全池静默中" if kind == "busy"
+                   else "全部账号被上游限流（频控/并发槽），短窗口自动恢复")
+            return JSONResponse(
+                {"error": {
+                    "message": f"{why}，预计 {time.strftime('%H:%M', time.localtime(wait))} 恢复",
+                    "type": "rate_limit_error", "code": "rate_limited",
+                    "model": model_key, "next_available_at": round(wait),
+                }, "retry_after": retry_after},
+                status_code=429,
                 headers={"Retry-After": str(retry_after)},
             )
         return JSONResponse(
@@ -2237,6 +2337,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     """
     captcha_retries = 0
     retries_429 = 0
+    retries_busy = 0  # 3008/3009/3010 并发槽原地重问次数（BUSY_WAITS 节奏）
     retries_5xx = 0
     force_fallback = False  # 本请求瞬态走 Key 回退（不改账号持久化状态）
     model_name = str(body.get("model") or "-")
@@ -2586,6 +2687,40 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         f"账号 {account.name} 429 为 1309 Coding Plan 到期，{model_key} 冷却，跳过等待重试",
                     )
                     return _NEXT_ACCOUNT
+                # ── 3008/3009/3010 并发槽「没轮到」（magpie plugins#503）──
+                # 优先于换号：换号会放大上游压力（magpie 对 busy 不换号）。
+                # 官方客户端节奏 1s/2s 原地重问两次，不占 429 频控梯、不扣号；
+                # 重问仍被拒 = 持续饱和，进程级计数 60s 内 BUSY_N 次武装
+                # BUSY_HOLD 全池刹车（赶在 WAF 封 IP 之前）。
+                busy_hit = _is_concurrency_hit(text)
+                if busy_hit and retries_busy < len(settings.BUSY_WAITS):
+                    wait = settings.BUSY_WAITS[retries_busy]
+                    retries_busy += 1
+                    # 首次重问（retries_busy==1）后若再次被拒，即「首拒+1s
+                    # 重问仍拒」；此处的第二次执行正是重问失败点。
+                    if retries_busy >= 2:
+                        _busy_record_saturated()
+                    reqlog.note_retry(req_id, "429")
+                    reqlog.note_wait(req_id, "rl", wait)
+                    logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和（3008/3009），"
+                              f"{wait}s 后原地重问（{retries_busy}/{len(settings.BUSY_WAITS)}）")
+                    _park_slot(slot_box)
+                    await _sleep(wait)
+                    if not _reacquire_slot(account, slot_box):
+                        logs.warn(req_id, f"账号 {account.name} 并发槽等待后已满，切换下一个")
+                        return _NEXT_ACCOUNT
+                    continue
+                if busy_hit and retries_busy >= len(settings.BUSY_WAITS):
+                    # 用尽官方节奏仍饱和：不扣号不计失败，换号（若还有号）；
+                    # 持续饱和已在上方计入 BUSY_HOLD。
+                    reqlog.note_retry(req_id, "429")
+                    reqlog.mark_attempt(req_id, account.name, account.mode,
+                                        channel=_lane_for(force_fallback, plan_channel, url),
+                                        status=429, ms=(time.time() - attempt_t0) * 1000,
+                                        error="429 并发槽饱和")
+                    account.record_result(False, "429 并发槽饱和（不扣号）")
+                    logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和，原地重问用尽，换号")
+                    return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
                 # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
                 #（与上方 3012/401/403 切回退同一语义）
@@ -2598,14 +2733,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if settings.RETRY_429_FAILOVER_FIRST and _has_other_selectable(
                     account, str(body.get("model") or "")
                 ):
-                    # 扣号到上游 Retry-After 期满；无 Retry-After 用默认 30s，
-                    # 上限 60s 防客户端吊死。只豁免 3009（模型并发槽秒级释放）；
-                    # 3008 账号级频控是线上 429 主力，必须扣号。
-                    # 仅在「其他号可服务」时扣：全池被限流时由下方原地等待兜底，
-                    # 不额外延长全池不可用时间。
+                    # 真·频控（1302/1303/无码 429）才扣号；3008 已在上方单独处理。
                     hold_model = str(body.get("model") or "")
                     hold_secs = 0
-                    if settings.RETRY_429_HOLD_DEFAULT > 0 and not _is_model_concurrency_hit(text):
+                    if settings.RETRY_429_HOLD_DEFAULT > 0:
                         hold_secs = _parse_retry_after(resp.headers.get("retry-after")) \
                             or settings.RETRY_429_HOLD_DEFAULT
                         hold_secs = min(hold_secs, settings.RETRY_429_HOLD_MAX)
@@ -2624,10 +2755,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
                     reqlog.note_retry(req_id, "429")
-                    # 3009「model concurrency limit exceeded」= 并发争用，不是频控：
-                    # 上游不给 Retry-After，槽位通常几秒内释放。等默认 60s 会把
-                    # 客户端白白吊死。短退避 + 抖动打散重试。
-                    concurrency_hit = _is_concurrency_hit(text)
+                    concurrency_hit = busy_hit
                     wait = _parse_retry_after(resp.headers.get("retry-after"))
                     if wait is None:
                         if concurrency_hit:
@@ -2663,6 +2791,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     needs_captcha = False
                     force_fallback = True
                     retries_429 = 0
+                    retries_busy = 0
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
                 reqlog.mark_attempt(req_id, account.name, account.mode,

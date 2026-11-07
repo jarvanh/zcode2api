@@ -300,10 +300,10 @@ class TestMonitoringEnrichedFields:
         res = await client.post("/v1/messages", json={
             "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "hi"}],
         })
-        assert res.status_code == 503  # 全池被限流且不排队 → 快速失败
+        assert res.status_code == 429  # 全池被限流且不排队 → 429+Retry-After（v2.9.29）
 
         e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
-        assert e["ok"] is False and e["status"] == 503
+        assert e["ok"] is False and e["status"] == 429
         att = e["att"]
         # 粘性活跃集（magpie maxAccounts）+ 429 扣号：首个 429 后只换号一次
         #（第二号被扣住后无号可选 → 排队关闭 → 503），梯子不再把两个号都
