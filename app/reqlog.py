@@ -358,6 +358,8 @@ def _row_to_entry(row: dict) -> dict:
         "mode": row.get("mode") or "",
         "channel": row.get("ch") or "",
         "egress": row.get("eg") or "",
+        "egress_ip": row.get("eg_ip") or "",
+        "egress_location": row.get("eg_loc") or "",
         "up": bool(row.get("up")),
         # 尝试梯子明细未落盘：还原条数与汇总计数（详情页显示聚合形态）
         "att": [{"restored": True}] * att_n,
@@ -448,6 +450,8 @@ def begin(req_id: str, endpoint: str, model: str, stream: bool, preview: str = "
         "mode": "",
         "channel": "",
         "egress": "",
+        "egress_ip": "",
+        "egress_location": "",
         "up": False,
         "att": [],
         "wait_q": 0.0,
@@ -516,12 +520,34 @@ def mark_channel(req_id: str, channel: str) -> None:
             entry["channel"] = _clip(channel, 20)
 
 
-def mark_egress(req_id: str, egress: str) -> None:
-    """记录最后一次尝试的出口：direct / proxy / account（账号级代理）。"""
+def mark_egress(req_id: str, egress: str, *, account_name: str = "") -> None:
+    """记录出口（direct/proxy/account）+ 出口公网 IP 与位置。
+
+    IP/位置取拓扑快照（egress_topology，1h 缓存，零网络阻塞）；账号名
+    优先精确匹配，直连回落到直连条目。观测字段任何失败不影响请求。
+    """
     with _lock:
         entry = _inflight.get(req_id)
         if entry is not None:
             entry["egress"] = _clip(egress, 20)
+
+    # 出口 IP/位置：拓扑快照缓存读取（不网络请求），账号名优先匹配
+    try:
+        from . import egress_topology
+        topo = egress_topology.topology()
+        hit = next((a for a in topo.get("accounts", [])
+                    if account_name and a.get("account") == account_name), None)
+        if hit is None and egress == "direct":
+            hit = next((a for a in topo.get("accounts", [])
+                        if a.get("egress") == "direct"), None)
+        if hit is not None:
+            with _lock:
+                entry = _inflight.get(req_id)
+                if entry is not None:
+                    entry["egress_ip"] = _clip(hit.get("ip") or "", 64)
+                    entry["egress_location"] = _clip(hit.get("location") or "", 96)
+    except Exception:  # noqa: BLE001 - 观测字段绝不影响请求
+        pass
 
 
 def mark_upstream(req_id: str) -> None:
@@ -819,6 +845,8 @@ def _persist(entry: dict) -> None:
             "mode": entry.get("mode") or "",
             "ch": entry.get("channel") or "",
             "eg": entry.get("egress") or "",
+            "eg_ip": entry.get("egress_ip") or "",
+            "eg_loc": entry.get("egress_location") or "",
             "up": bool(entry.get("up") or False),
             "model": entry.get("model") or "",
             "endpoint": entry.get("endpoint") or "",
@@ -990,6 +1018,77 @@ def _top(buckets: dict[str, dict]) -> list[dict]:
     rows = [_finalize(b) for b in buckets.values()]
     rows.sort(key=lambda r: (-r["calls"], r["name"]))
     return rows[:TOP_GROUPS]
+
+
+def history_total() -> dict:
+    """全量历史总计（不受 HISTORY_DAYS 30 天窗口限制）。
+
+    扫描磁盘上现存的所有 reqlog-*.jsonl（即「曾落盘的全部」——30 天前
+    的文件已被保留策略物理删除，所以总计 = 磁盘全量），聚合出与
+    history() 同构的 totals + accounts/models/clients/errors 排行，
+    但不带 daily 曲线（跨度太大，前端走势用 30d 档即可）。
+    缓存 10 分钟：全量扫描开销大，总计本就是低频查阅。
+    """
+    global _total_cache
+    now = time.time()
+    if _total_cache["at"] and now - _total_cache["at"] < 600:
+        return _total_cache["data"]
+    data_dir = _hist_dir()
+    paths = sorted(data_dir.glob(f"{_PREFIX}*.jsonl"))
+    total = _new_bucket("总计")
+    accounts: dict[str, dict] = {}
+    models: dict[str, dict] = {}
+    clients: dict[str, dict] = {}
+    errors: dict[str, int] = {}
+    first_day = last_day = ""
+    for path in paths:
+        day = path.name[len(_PREFIX):-len(".jsonl")]
+        if not first_day:
+            first_day = day
+        last_day = day
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            _acc(total, row)
+            acc_key = row.get("account") or "—"
+            accounts.setdefault(acc_key, _new_bucket(acc_key))
+            _acc(accounts[acc_key], row)
+            mdl_key = row.get("model") or "—"
+            models.setdefault(mdl_key, _new_bucket(mdl_key))
+            _acc(models[mdl_key], row)
+            cli_key = row.get("ip") or "—"
+            clients.setdefault(cli_key, _new_bucket(cli_key))
+            _acc(clients[cli_key], row)
+            if not row.get("ok"):
+                ek = (row.get("kind") or (str(row.get("status")) if row.get("status") else "unknown"))
+                errors[ek] = errors.get(ek, 0) + 1
+    data = {
+        "from": first_day, "to": last_day,
+        "days": len(paths),
+        "totals": _finalize(total),
+        "accounts": [_finalize(b) for b in sorted(accounts.values(),
+                      key=lambda b: -b["calls"])[:TOP_GROUPS]],
+        "models": [_finalize(b) for b in sorted(models.values(),
+                   key=lambda b: -b["calls"])[:TOP_GROUPS]],
+        "clients": [_finalize(b) for b in sorted(clients.values(),
+                    key=lambda b: -b["calls"])[:TOP_GROUPS]],
+        "errors": [{"error": k, "count": v} for k, v in
+                   sorted(errors.items(), key=lambda kv: -kv[1])[:TOP_ERRORS]],
+    }
+    _total_cache = {"at": now, "data": data}
+    return data
+
+
+_total_cache: dict = {"at": 0.0, "data": None}
 
 
 def history(days: int = 7) -> dict:

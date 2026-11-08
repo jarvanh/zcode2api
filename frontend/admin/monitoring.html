@@ -15,7 +15,7 @@
   <div class="page-hd">
     <div>
       <div class="page-title">请求监控</div>
-      <div class="page-sub">网关请求观测 · 实时为内存环形日志（最近 500 条；重启时自动从磁盘回放最近终态，不丢）· 7 / 30 天取自磁盘历史（按天聚合，保留 30 天）<br>行点开看详情：来源 IP / UA、通道与出口、账号尝试梯子、排队与重试拆解、业务错误码、上游追踪 ID</div>
+      <div class="page-sub">网关请求观测 · 实时为内存环形日志（最近 500 条；重启时自动从磁盘回放最近终态，不丢）· 7 / 30 天取自磁盘历史（按天聚合，保留 30 天）<br>行点开看详情：来源 IP / UA、通道与出口（含出口公网 IP + 位置）、账号尝试梯子、排队与重试拆解、业务错误码、上游追踪 ID</div>
     </div>
     <div class="page-actions">
       <span class="live-dot" id="live-dot">实时监控中</span>
@@ -132,8 +132,9 @@ const state = { range: 'today', status: 'all', q: '', keep: 500, accounts: [] };
 let pollTimer = null;
 
 // 7 / 30 天走磁盘历史聚合；其余走内存实时日志
-const HIST_DAYS = { '7d': 7, '30d': 30 };
+const HIST_DAYS = { '7d': 7, '30d': 30, 'all': 0 };
 const isHist = () => state.range in HIST_DAYS;
+const isTotal = () => state.range === 'all';
 
 const $ = id => document.getElementById(id);
 const openDetails = new Set();
@@ -189,7 +190,7 @@ function filtered(){
   if(state.status==='dedup'&&!e.dedup)return false;
   if(state.status==='queue'&&waitTotal(e)<=0)return false;
     if(q){
-      const hay=`${e.account} ${e.model} ${e.model_req} ${e.preview} ${e.error} ${e.endpoint} ${e.path} ${e.client_ip} ${e.ua} ${e.req_id} ${e.channel} ${e.egress} ${e.err_code||''} ${e.dedup||''} ${(e.att||[]).map(a=>a.acc+' '+a.err).join(' ')}`.toLowerCase();
+      const hay=`${e.account} ${e.model} ${e.model_req} ${e.preview} ${e.error} ${e.endpoint} ${e.path} ${e.client_ip} ${e.ua} ${e.req_id} ${e.channel} ${e.egress} ${e.egress_ip||''} ${e.egress_location||''} ${e.err_code||''} ${e.dedup||''} ${(e.att||[]).map(a=>a.acc+' '+a.err).join(' ')}`.toLowerCase();
       if(!hay.includes(q))return false;
     }
     return true;
@@ -308,7 +309,7 @@ function detailHtml(e){
     ${kv('UA', e.ua)}
     ${kv('模型', e.model_req&&e.model_req!==e.model?`${e.model_req} → ${e.model}`:e.model)}
     ${kv('账号 / 凭证', `${e.account||'—'}${e.mode?' · '+e.mode:''}`)}
-    ${kv('通道 / 出口', `${e.channel||'—'}${e.egress?' · '+e.egress:''}`)}
+    ${kv('通道 / 出口', `${e.channel||'—'}${e.egress?' · '+e.egress:''}${e.egress_ip?` · <span title="${esc(e.egress_location||'')}">${esc(e.egress_ip)}</span>${e.egress_location?` · ${esc(e.egress_location)}`:''}`:''}`)}
     ${kv('请求形状', e.msgs!=null?`${e.msgs} 条消息${e.max_tokens?` · max_tokens ${e.max_tokens}`:''}`:'')}${e.stop_reason==='max_tokens'||e.stop_reason==='length'?`<span class="vital is-bad" title="撞 max_tokens 预算：结合上面的 max_tokens 判断是客户端给小了还是上游真的长">输出被截断</span>`:''}
     ${kv('耗时', [e.t_first!=null?`首字 ${fmtSec(e.t_first)}`:'',e.t_total!=null?`总 ${fmtSec(e.t_total)}`:'',e.t_up!=null?`净上游 ${fmtSec(e.t_up)}`:'',tps].filter(Boolean).join(' · '), true)}
     ${kv('Token', `输入 ${fmtTok(e.input_tokens)} · 输出 ${fmtTok(e.output_tokens)}${e.cache_read?` · 缓存 ${fmtTok(e.cache_read)}`:''}`)}
@@ -404,7 +405,7 @@ function histRows(key){
 function renderHistStats(){
   const t=hist.totals;
   $('s-calls').textContent=t.calls;
-  $('s-calls-sub').textContent=`${hist.from} ~ ${hist.to} · 磁盘历史 · 探测 ${t.probe||0}`;
+  $('s-calls-sub').textContent=`${hist.from||'?'} ~ ${hist.to||'?'} · ${isTotal()?'历史总计（磁盘现存全部）':'磁盘历史'} · 探测 ${t.probe||0}`;
   $('s-rate').textContent=t.rate!=null?t.rate.toFixed(1)+'%':'—';
   $('s-rate-sub').textContent=`成功 ${t.ok} · 失败 ${t.fail}`;
   $('s-fail').textContent=t.fail;
@@ -422,7 +423,7 @@ function renderHistStats(){
   $('s-retry').textContent=t.retry||0;
   $('s-retry-sub').textContent=`排队累计 ${fmtSec(t.wait||0)}`;
   // 走势改为按天调用量（历史视图没有分钟级数据）
-  $('s-calls-spark').innerHTML=spark(hist.daily.map(d=>d.calls),'var(--amber)');
+  $('s-calls-spark').innerHTML=(hist.daily&&hist.daily.length)?spark(hist.daily.map(d=>d.calls),'var(--amber)'):'';
   $('live-count').textContent='';
 }
 
@@ -554,7 +555,7 @@ function syncMode(){
 }
 
 function renderChips(){
-  const defs=[['1h','1 小时'],['today','今天'],['7d','7 天'],['30d','30 天']];
+  const defs=[['1h','1 小时'],['today','今天'],['7d','7 天'],['30d','30 天'],['all','总计']];
   $('range-chips').innerHTML=defs.map(([v,label])=>
     `<button class="filter-chip${state.range===v?' active':''}" onclick="setRange('${v}')">${label}</button>`).join('');
 }
@@ -576,7 +577,9 @@ function onSearch(v){state.q=v;render();}
 function onStatus(v){state.status=v;render();}
 
 async function load(){
-  if(isHist()){
+  if(isTotal()){
+    hist=await api('GET','/monitoring/total');
+  }else if(isHist()){
     hist=await api('GET',`/monitoring/history?days=${HIST_DAYS[state.range]}`);
   }else{
     const res=await api('GET','/monitoring');

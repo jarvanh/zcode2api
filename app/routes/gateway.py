@@ -1256,7 +1256,8 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Re
         reqlog.mark_account(req_id, account.name, account.mode)
         reqlog.mark_channel(req_id, "apikey")
         reqlog.mark_egress(req_id, "account" if account.proxy_kwargs()
-                           else egress.egress_for(url))
+                           else egress.egress_for(url),
+                           account_name=account.name)
         # 打标：本请求已发起上游调用（监控区分调度/上游失败，同 zai 主链路）
         reqlog.mark_upstream(req_id)
         try:
@@ -2549,7 +2550,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             egress_seen = "account"
         else:
             egress_seen = egress.egress_for(url)
-        reqlog.mark_egress(req_id, egress_seen)
+        reqlog.mark_egress(req_id, egress_seen, account_name=account.name)
         # 打标：本请求已发起上游调用（含连接失败/4xx/5xx）；调度层放弃的行
         # 无此标记，监控端据此区分「调度失败·未达上游」与「上游失败」
         reqlog.mark_upstream(req_id)

@@ -1009,6 +1009,23 @@ async def monitoring_concurrency_history(days: int = 7):
     return reqlog.conc_history(days)
 
 
+@router.get("/monitoring/total")
+async def monitoring_total():
+    """全量历史总计（不受 30 天保留窗限制，磁盘现存全部）。
+
+    缓存 10 分钟（reqlog.history_total 内部）；total = 磁盘现存全量 ——
+    超过 HISTORY_DAYS 的天文件已被保留策略物理删除。
+    """
+    return reqlog.history_total()
+
+
+@router.get("/egress-topology")
+async def egress_topology():
+    """账号 → 出口 → 公网 IP + 地理位置（观测/看板共用，1h 缓存）。"""
+    from .. import egress_topology
+    return egress_topology.topology()
+
+
 @router.get("/monitoring/history")
 async def monitoring_history(days: int = 7):
     """磁盘请求历史聚合（近 days 天，默认 7）。
