@@ -980,6 +980,26 @@ async def _stream_or_biz_error(up: _Upstream, req_id: str):
 _EARLY_FLUSH_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
+def _sse_ping_chunk(style: str) -> str:
+    """等待期心跳的真 SSE 事件（非注释行）。
+
+    OmniRoute 的 stream readiness 只认「event:/data: + 空行」的完整事件，
+    注释行（":" 开头）永远不算 —— 纯注释心跳的流在它那里是零事件流，
+    STREAM_READINESS/首事件超时后判 502/504 并按 combo 回退下一档。
+    Anthropic 官方协议有 event: ping；OpenAI 无 ping 语义，用带 usage 占位
+    的 chunk 会污染客户端计数，故用 data 空对象（多数客户端忽略未知字段，
+    StreamConverter 对未知 chunk 容忍）。
+    """
+    if style == "openai":
+        # OpenAI 无 ping 事件语义；发标准空 delta chunk（id/choices 齐全、
+        # delta 空对象）—— OpenAI 客户端与 OmniRoute 都把它当空操作忽略。
+        payload = {"id": "chatcmpl-keepalive", "object": "chat.completion.chunk",
+                   "created": 0, "model": "keepalive",
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+        return f"data: {json.dumps(payload)}\n\n"
+    return 'event: ping\ndata: {"type": "ping"}\n\n'
+
+
 def _sse_error_chunk(style: str, status_code: int, etype: str, message: str) -> str:
     """按端点协议构造 SSE 错误事件（early flush 后状态码不可改，只能事件化）。"""
     if style == "openai":
@@ -1008,12 +1028,19 @@ async def _early_flush_anthropic_stream(task: asyncio.Task, req_id: str):
     """
     beat = settings.EARLY_FLUSH_BEAT if settings.EARLY_FLUSH_BEAT > 0 else 15
     yield ": early-flush\n\n"
+    sent_ping = False  # 首个真事件已发（readiness 放行后改回注释心跳省流）
     while True:
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=beat)
             break
         except TimeoutError:
-            yield ": keepalive\n\n"
+            # v2.9.34：心跳用真 ping 事件。注释行在 OmniRoute stream readiness
+            # 里不算事件（s() 对 ":" 行直接跳过），纯注释流 80s 判 502 回退。
+            if not sent_ping:
+                yield _sse_ping_chunk("anthropic")
+                sent_ping = True
+            else:
+                yield ": keepalive\n\n"
         except asyncio.CancelledError:
             # 客户端断开必须显式取消派生任务——分离任务不会随请求取消而终止
             task.cancel()
@@ -1076,12 +1103,18 @@ async def _early_flush_openai_stream(task: asyncio.Task, req_id: str, model: str
     """/v1/chat/completions 的 early flush 流（OpenAI chunk 语义，走 StreamConverter）。"""
     beat = settings.EARLY_FLUSH_BEAT if settings.EARLY_FLUSH_BEAT > 0 else 15
     yield ": early-flush\n\n"
+    sent_ping = False
     while True:
         try:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=beat)
             break
         except TimeoutError:
-            yield ": keepalive\n\n"
+            # 同 anthropic 侧：真 ping 事件放行 OmniRoute readiness（注释行不算）
+            if not sent_ping:
+                yield _sse_ping_chunk("openai")
+                sent_ping = True
+            else:
+                yield ": keepalive\n\n"
         except asyncio.CancelledError:
             task.cancel()
             reqlog.finish_error(req_id, "客户端断开", status=499)
