@@ -7,9 +7,11 @@
   - 绑定前实测每个出口的公网 IP，要求账号间出口 IP 互不相同
     （与直连 IP 也不得相同）；IP 相同/不可用的出口跳过不绑；
   - 强约束（2026-11-08 主人实证：单 IP 挂 2+ 账号触发风控连坐全灭）：
-    启用账号数 ≤ 1 + 可用独立出口数；分不到独立出口的账号自动停用
-    （名单记 egress-state.json，在 /dropbox 持久化），出口恢复重跑
-    本脚本自动启回；每轮缺口发 Telegram 通知。
+    「同时使用账号数」（max_active_accounts）≤ 1 + 可用独立出口数。
+    出口不足时**不停用账号**，把 meta 里的 max_active_accounts 压到
+    出口容量（超出者自动变备用不接客），并发 TG 通知；出口恢复重跑
+    本脚本恢复该值。管理台手动改的值会被覆盖——覆盖前会先读旧值，
+    恢复时优先回到手工值。
 
 出口池实况（2026-11-08 实测，mihomo pinned listeners）：
   7891 → 38.28.193.1  7892 → 74.82.60.31
@@ -125,28 +127,45 @@ def api_set_proxy(account_id: str, proxy_url: str | None) -> bool:
         return False
 
 
-def api_set_enabled(account_id: str, enabled: bool) -> bool:
+def api_get_max_active() -> int | None:
+    """读 meta 里的 max_active_accounts；读不到返回 None。"""
     key = admin_key()
     if not key:
-        print("[error] 无 ZCODE_ADMIN_KEY，无法经 admin API 操作")
+        return None
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{os.environ.get('ZCODE_PORT', '8319')}"
+        f"/admin/api/settings",
+        headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return int(json.load(r).get("max_active_accounts") or 0)
+    except Exception as err:  # noqa: BLE001
+        print(f"[warn] 读 max_active_accounts 失败: {err}")
+        return None
+
+
+def api_set_max_active(cap: int) -> bool:
+    key = admin_key()
+    if not key:
+        print("[error] 无 ZCODE_ADMIN_KEY，无法经 admin API 写设置")
         return False
     req = urllib.request.Request(
         f"http://127.0.0.1:{os.environ.get('ZCODE_PORT', '8319')}"
-        f"/admin/api/accounts/{account_id}/enabled",
-        data=json.dumps({"enabled": enabled}).encode(), method="POST",
+        f"/admin/api/settings",
+        data=json.dumps({"max_active_accounts": cap}).encode(), method="PUT",
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {key}"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.status == 200
     except Exception as err:  # noqa: BLE001
-        print(f"[error] API 启停失败 {account_id}: {err}")
+        print(f"[error] 写 max_active_accounts 失败: {err}")
         return False
 
 
-# 本脚本因出口不足停用的账号名单（持久化）：恢复启回只认这份名单，
-# 不碰人工/风控停用的账号。落 /dropbox/self-hosted/zcode2api/proxy/
-# （与 mihomo assigned.json 同目录，/tmp 重置不丢——2026-11-08 实证教训）。
+# 本脚本因出口不足压制的 max_active_accounts 原值（持久化）：
+# 恢复时回到它；管理台在压制期间手动改值则尊重新值（读旧值 > 记录值即视为手工干预）。
+# 落 /dropbox/self-hosted/zcode2api/proxy/（与 assigned.json 同目录，/tmp 重置不丢）。
 STATE = ("/dropbox/self-hosted/zcode2api/proxy/egress-state.json"
          if os.path.isdir("/dropbox/self-hosted/zcode2api/proxy")
          else os.path.join(BASE, "egress-state.json"))
@@ -163,25 +182,40 @@ def _save_state(state: dict) -> None:
     json.dump(state, open(STATE, "w"), ensure_ascii=False, indent=1)
 
 
-def api_disable_for_shortage(account_id: str) -> bool:
-    if not api_set_enabled(account_id, False):
-        return False
+def cap_active_to_capacity(capacity: int) -> bool:
+    """出口不足：把「同时使用账号数」压到出口容量，记录原值供恢复。"""
     state = _load_state()
-    ids = state.setdefault("shortage_disabled", [])
-    if account_id not in ids:
-        ids.append(account_id)
+    current = api_get_max_active()
+    if current is None:
+        return False
+    if "max_active_saved" not in state:
+        state["max_active_saved"] = current
+    if current <= capacity:
+        print(f"[cap] 当前同时使用账号数 {current} ≤ 出口容量 {capacity}，无需压制")
+        return True  # 已在容量内（可能手工改过更小值），不动
+    if not api_set_max_active(capacity):
+        return False
     _save_state(state)
+    print(f"[cap] 同时使用账号数 {current} → {capacity}（出口容量；原值 {state['max_active_saved']} 已记）")
     return True
 
 
-def api_enable_if_shortage(account_id: str) -> bool:
-    if not api_set_enabled(account_id, True):
-        return False
+def restore_active_cap() -> bool:
+    """出口恢复：把「同时使用账号数」还原（手工改过的更大值尊重手工值）。"""
     state = _load_state()
-    ids = state.get("shortage_disabled", [])
-    if account_id in ids:
-        ids.remove(account_id)
+    saved = state.get("max_active_saved")
+    if saved is None:
+        return True
+    current = api_get_max_active()
+    if current is not None and current != saved:
+        # 手工改过（升或降）：尊重新值，清记录不再自动恢复
+        state.pop("max_active_saved", None)
         _save_state(state)
+        print(f"[restore] 检测到手工值 max_active={current}（记录原值 {saved}），尊重新值")
+        return True
+    state.pop("max_active_saved", None)
+    _save_state(state)
+    print(f"[restore] 同时使用账号数保持 {saved}（无缺口，记录清空）")
     return True
 
 
@@ -212,20 +246,8 @@ def main() -> int:
         print(f"[info] 出口 {port}: {ip} ✓")
     print(f"[info] 可用独立出口: {len(pool)} 个 + 直连 1 个")
 
-    # 2) 分配：账号1直连；账号2+按序吃 pool。
-    #    先把上轮因出口不足停用的账号捞回参与分配（只认本脚本名单）；
-    #    席位 = 1 直连 + len(pool)。捞回后仍分不下的会在下方再次停用。
-    seats = 1 + len(pool)
-    taken = len(accounts)
-    for acct in store.list_accounts("zai"):
-        if acct.enabled or acct.id not in _load_state().get("shortage_disabled", []):
-            continue
-        if taken >= seats:
-            break
-        if api_enable_if_shortage(acct.id):
-            taken += 1
-            print(f"[enable] {acct.name}: 出口有位，自动启回")
-    accounts = [a for a in store.list_accounts("zai") if a.enabled]
+    # 2) 分配：账号1直连；账号2+按序吃 pool。所有账号保持启用——
+    #    出口不足时压制 max_active_accounts（同时使用账号数）而非停用。
     plans: list[tuple[Account, str | None, str | None]] = []  # (account, target_url, target_ip)
     ports = sorted(pool)
     for i, acct in enumerate(accounts):
@@ -246,14 +268,7 @@ def main() -> int:
     for acct, target, ip in plans:
         if target == "SHORTAGE":
             shortage.append(acct.name)
-            if acct.enabled:
-                if api_disable_for_shortage(acct.id):
-                    changed += 1
-                    print(f"[disable] {acct.name}: 无独立出口 → 停用（出口恢复后重跑自动启回）")
-                else:
-                    print(f"[error] {acct.name}: 停用失败")
-            else:
-                print(f"[skip] {acct.name}: 已停用（上轮出口不足）")
+            print(f"[warn] {acct.name}: 无独立出口，保持现绑定（将压制同时使用账号数）")
             continue
         current = (acct.proxy_url or "").strip() or None
         if current == target:
@@ -271,16 +286,22 @@ def main() -> int:
                 return 2
             final_ips[acct.name] = ip
 
-    # 4) 汇总 + 缺口通知
+    # 4) 汇总 + 出口容量约束（压制/恢复 max_active_accounts）+ 缺口通知
     print("\n=== 最终出口拓扑 ===")
     for name, ip in final_ips.items():
         print(f"  {name}: {ip}")
+    capacity = 1 + len(ports)
     if shortage:
-        msg = ("⚠️ zcode2api 出口不足，已自动停用超出账号\n"
-               f"独立出口 {len(ports) + 1} 个（含直连），本轮启用 "
-               f"{len(accounts) - len(shortage)} 个\n"
-               f"停用账号: {', '.join(shortage)}\n"
-               "补 mihomo 节点后重跑 assign_egress.py 自动启回")
+        if not cap_active_to_capacity(capacity):
+            print("[error] 压制 max_active_accounts 失败")
+            return 4
+    else:
+        restore_active_cap()
+    if shortage:
+        msg = ("⚠️ zcode2api 出口不足，已压低「同时使用账号数」\n"
+               f"独立出口 {len(ports) + 1} 个（含直连）；超出容量的账号"
+               f"（{', '.join(shortage)}）暂不接客（仍启用，保持备用）\n"
+               "补 mihomo 节点后重跑 assign_egress.py 自动恢复")
         notify_telegram(msg)
         print(f"\n[summary] 变更 {changed} 项；出口缺口 {len(shortage)} 个（已通知）")
         return 3
