@@ -294,10 +294,11 @@ EDGE_HOLD_SECONDS = _int("ZCODE_EDGE_HOLD_SECONDS", 180)
 # 405 拒，2 个不会（plugins#649 引用 01huadalang 的 Discord 反馈）。
 # 控制台可改（meta 表即时生效）；超出的号留作备用，在用的号冷却/耗尽时顶上。
 MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
-# 单账号并发上限。2026-11-04 线上实测写死为 2（每个账号同一时刻最多 2 个在飞
-# 请求，超限自动切下一账号）：不再读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台
-# meta 覆盖，历史 meta 值一律作废
-ACCOUNT_CONCURRENCY = 2
+# 单账号并发上限（env 默认值）。控制台可改（meta 表即时生效，与
+# MAX_ACTIVE_ACCOUNTS 同模式）。2026-11-04 曾按线上实测写死 2；2026-11-08
+# 恢复可改 —— v2.9.32 的 startGate 排队闸已把「并发满 → 敲上游 → 503」
+# 的放大链吃掉，上调并发不再有 3008 风暴放大风险，交还运营调节。
+ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -349,7 +350,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.32"
+APP_VERSION = "2.9.33"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

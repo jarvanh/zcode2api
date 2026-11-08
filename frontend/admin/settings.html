@@ -39,8 +39,8 @@
     </div>
     <div class="settings-row">
       <label>单账号并发上限</label>
-      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。已按 2026-11-04 线上实测结果写死为 2，不可修改。</div>
-      <input class="input" id="account-concurrency" type="number" min="2" max="2" step="1" value="2" disabled>
+      <div class="hint">每个账号同时处理的最大请求数（0 = 不限）；某账号并发满时自动切下一个账号。上游并发槽饱和时会自动本地排队，上调不再放大 3008 风暴。修改后即时生效。</div>
+      <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="2">
     </div>
     <div class="settings-row">
       <label>同时使用账号数</label>
@@ -129,7 +129,7 @@ async function load(){
     document.getElementById('admin-key').value=d.admin_key_masked||'';
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
     document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
-    document.getElementById('account-concurrency').value=2;
+    document.getElementById('account-concurrency').value=d.account_concurrency??2;
     document.getElementById('max-accounts').value=d.max_active_accounts??2;
     document.getElementById('bigmodel-channel').checked=!!d.bigmodel_channel_enabled;
     document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
@@ -223,6 +223,8 @@ async function saveSettings(){
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
   const max_active_accounts=parseInt(document.getElementById('max-accounts').value,10);
   if(isNaN(max_active_accounts)||max_active_accounts<0)return showToast('同时使用账号数必须是非负整数（0 = 不限）','error');
+  const account_concurrency=parseInt(document.getElementById('account-concurrency').value,10);
+  if(isNaN(account_concurrency)||account_concurrency<0)return showToast('单账号并发上限必须是非负整数（0 = 不限）','error');
   const claim_round_interval=parseInt(document.getElementById('claim-round-interval').value,10);
   if(isNaN(claim_round_interval)||claim_round_interval<0)return showToast('自动领取轮间隔必须是非负整数（0 = 关闭）','error');
   const claim_round_stagger=parseInt(document.getElementById('claim-round-stagger').value,10);
@@ -231,7 +233,7 @@ async function saveSettings(){
   if(claim_round_hours && claim_round_hours!=='*' &&
      !claim_round_hours.replace(/，/g,',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
     return showToast('领取窗口必须是 0-23 的小时，逗号分隔（留空 = 全天）','error');
-  const payload={quota_refresh_interval,max_active_accounts,claim_round_interval,claim_round_stagger,claim_round_hours,
+  const payload={quota_refresh_interval,max_active_accounts,account_concurrency,claim_round_interval,claim_round_stagger,claim_round_hours,
                  bigmodel_channel_enabled:document.getElementById('bigmodel-channel').checked,
                  auto_sync_client_version:document.getElementById('auto-sync-version').checked};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;

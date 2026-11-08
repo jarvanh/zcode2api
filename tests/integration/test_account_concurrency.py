@@ -84,8 +84,8 @@ class TestAccountConcurrency:
         statuses = [t.result().status_code for t in tasks]
         assert statuses == [200, 200, 200]
 
-    async def test_meta_zero_ignored(self, gateway_client, fresh_app):
-        """写死后 meta 覆盖作废：即使 meta=0（旧「不限」语义），仍按 2 封顶。"""
+    async def test_meta_zero_unlimited(self, gateway_client, fresh_app):
+        """v2.9.32 后 meta=0（不限）生效：4 并发全部落在同一凭证。"""
         client, mock = gateway_client
         fresh_app.set_setting("account_concurrency", "0")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-zero")
@@ -94,14 +94,13 @@ class TestAccountConcurrency:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
                      for _ in range(4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        # fork 保留限界排队：满号时等槽位释放后可能转成 200，故只断言
-        # 「没有 5xx 以外的异常 + 峰值不超过写死的 2」。
-        assert all(s in (200, 503) for s in statuses), statuses
-        assert statuses.count(200) >= 2, statuses
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
+        assert statuses == [200, 200, 200, 200], statuses
+        # 4 个请求非严格同刻到达，0.3s slow 窗口下观测峰值 3~4；关键断言是
+        # 「不被旧写死的 2 封顶」（>=3 即证），不钉具体峰值（时序竞态）。
+        assert _per_key_max(mock, acc.jwt_token[:16]) >= 3
 
-    async def test_meta_one_ignored(self, gateway_client, fresh_app):
-        """写死后 meta 覆盖作废：即使 meta=1，仍按 2 放行。"""
+    async def test_meta_one_enforced(self, gateway_client, fresh_app):
+        """v2.9.32 后 meta=1 生效：二号被切走或排队，单凭证峰值 ≤1。"""
         client, mock = gateway_client
         fresh_app.set_setting("account_concurrency", "1")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-one")
@@ -111,7 +110,7 @@ class TestAccountConcurrency:
                      for _ in range(2)]
         statuses = [t.result().status_code for t in tasks]
         assert statuses == [200, 200]
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
 
     def test_env_default_is_two(self):
         assert settings.ACCOUNT_CONCURRENCY == 2

@@ -239,9 +239,17 @@ class Store:
             return settings.QUOTA_REFRESH_INTERVAL
 
     def account_concurrency(self) -> int:
-        """单账号并发上限。写死 2（2026-11-04 线上实测）：env 与后台 meta 覆盖
-        一律作废（历史 meta 值如 account_concurrency=4 自动失效）。"""
-        return settings.ACCOUNT_CONCURRENCY
+        """单账号并发上限（0 = 不限），控制台可改、即时生效（meta 表）。
+
+        2026-11-04 曾按线上实测写死 2（当时「并发满 → 敲上游 → 扣号」会
+        放大 3008 风暴）；2026-11-08 恢复可改 —— v2.9.32 startGate 排队闸
+        把该放大链吃掉后，上限交还运营调节。历史 meta 值重新生效。
+        """
+        try:
+            return max(0, int(self.get_setting(
+                "account_concurrency", settings.ACCOUNT_CONCURRENCY)))
+        except (TypeError, ValueError):
+            return settings.ACCOUNT_CONCURRENCY
 
     def max_active_accounts(self) -> int:
         """同时投入的账号数上限（0 = 不限），后台可改、即时生效。

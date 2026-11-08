@@ -891,8 +891,13 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "刷新间隔必须是非负整数") from None
         store.set_setting("quota_refresh_interval", str(interval))
-    # account_concurrency 已写死为 2（2026-11-04 线上实测），不再接受后台修改；
-    # PUT 中携带该键直接忽略（不报错，兼容旧前端 payload）
+    if "account_concurrency" in payload:
+        # 单账号并发上限（0 = 不限），meta 即时生效（v2.9.32 后恢复可改）
+        try:
+            conc = max(0, int(payload["account_concurrency"]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "单账号并发上限必须是非负整数（0 = 不限）") from None
+        store.set_setting("account_concurrency", str(conc))
     if "max_active_accounts" in payload:
         # 同时投入的账号数（0 = 不限），对齐 magpie 的 maxAccounts
         try:

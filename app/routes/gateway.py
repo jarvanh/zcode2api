@@ -1672,7 +1672,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
     调度准则：
     1. 同一上下文亲和性：多轮请求绑定同一账号，提高 Cache 命中与局部性；
     2. 新请求多账号负载均衡：分配到在飞负载最低的账号（同负载轮询平局）；
-    3. 单账号并发限制：写死 2，满载或故障时无缝溢出至其他可用账号；
+    3. 单账号并发限制（控制台可改，meta 即时生效）：满载或故障时无缝溢出至其他可用账号；
     4. 满载跳过不计入 MAX_ACCOUNT_ATTEMPTS；全满/无号 → 503。
     """
     t0 = time.time()
@@ -1758,9 +1758,11 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             provider,
             skip_ids=tried,
             model=model_key,
-            inflight=_inflight if limit > 0 else None,
+            # limit=0（不限）时仍传 _inflight 作排序输入，max_inflight 给
+            # 足量大值让过滤恒通过 —— 否则亲和/负载排序退化（v2.9.33 修复）。
+            inflight=_inflight,
             pinned_id=pinned_id,
-            max_inflight=limit if limit > 0 else 2,
+            max_inflight=limit if limit > 0 else 10_000,
         )
         if account is None:
             # 选不到号：限界排队等一等，吃掉「额度分钟级滚动恢复」型故障。
@@ -2284,7 +2286,7 @@ reqlog.register_slot_source(_slot_view)
 
 
 def _limit() -> int:
-    """当前并发上限。写死 2（2026-11-04 线上实测），env/meta 一律无效。"""
+    """当前并发上限（0 = 不限）。控制台可改、meta 即时生效（v2.9.33 恢复）。"""
     return store.account_concurrency()
 
 
