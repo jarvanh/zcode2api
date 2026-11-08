@@ -201,6 +201,11 @@ BUSY_HOLD = _int("ZCODE_BUSY_HOLD", 180)
 # 持续饱和时的原地重问间隔（秒，官方客户端节奏）：3008/3009/3010 专用，
 # 不占 429 频控重试梯，不扣号。
 BUSY_WAITS = (1, 2)
+# startGate 本地排队闸（v2.9.32）：3008 用尽官方重问后，该账号本地闸门
+# 时长（秒）。闸门内新请求只排队、零上游压力；到期放一个进去试探。
+# 实测上游槽位释放中位 64.7s，默认 20s 平衡「早恢复」与「不空等」；
+# 仍 3008 会续闸（上限 QUEUE_WAIT 240s / 同步 60s 由请求预算兜底）。
+BUSY_GATE_WAIT = _int("ZCODE_BUSY_GATE_WAIT", 20)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -344,7 +349,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.31"
+APP_VERSION = "2.9.32"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

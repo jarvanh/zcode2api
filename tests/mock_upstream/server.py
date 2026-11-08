@@ -167,7 +167,7 @@ def build_app() -> FastAPI:
             if scenario == "slow":
                 await asyncio.sleep(0.3)
 
-            status, resp_body, extra_headers = _messages_result(scenario, payload)
+            status, resp_body, extra_headers = _messages_result(scenario, payload, n)
         finally:
             left = conc_in[bind_gauge] - 1
             if left <= 0:
@@ -206,7 +206,7 @@ def build_app() -> FastAPI:
         return Response(raw, status_code=200, media_type=media,
                         headers={"x-mock-call-index": str(n)})
 
-    def _messages_result(scenario: str, payload: dict) -> tuple[int, Any, dict]:
+    def _messages_result(scenario: str, payload: dict, n: int = 0) -> tuple[int, Any, dict]:
         """返回 (status, body, extra_headers)。"""
         model = payload.get("model", "GLM-5.2")
         mid = payload.get("id") or "msg_mock_001"
@@ -225,6 +225,14 @@ def build_app() -> FastAPI:
             return 400, {"code": 1002, "message": "额度已用完"}, {}
         if scenario == "rate_limited":
             return 429, _error_body("rate limited"), {"retry-after": "30"}
+        if scenario in ("concurrency_3008", "concurrency_3008_then_ok"):
+            # 线上主力形态：429 + {"code":3008,"msg":"user concurrency limit
+            # exceeded"}（并发槽「没轮到」，非频控非额度）。then_ok 变体第二轮起
+            # 返回成功，钉住「饱和是瞬态、重问/排队能恢复」的语义。
+            n = n  # 该凭证第 n 次调用（0 起）
+            if scenario == "concurrency_3008_then_ok" and n >= 1:
+                return 200, ok_body, {}
+            return 429, {"code": 3008, "msg": "user concurrency limit exceeded"}, {}
         if scenario == "rate_limited_quota_body":
             # 线上 2026-09-13 实测形态：api.z.ai 频控 429 但 body 带额度文案，
             # 不得被 _is_exhausted 关键词分支误判成「额度用完」。

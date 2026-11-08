@@ -58,6 +58,71 @@ _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染�
 _busy_hold = {"hits": [], "until": 0.0}
 _busy_hold_lock = asyncio.Lock()  # 武装分支串行化：并发请求同时满员会双写 armed 事件
 
+# ── startGate 本地排队闸（v2.9.32，magpie 实测对照）──────────────────────
+# 3008 = 上游并发槽残留占用（实测「饱和→恢复」中位 64.7s，p75 260s），
+# 1s/2s 重问用尽后**不换号敲第二遍、不秒回 503**：给该账号立一个本地
+# 闸门，闸门期内新请求在 _wait_for_account 里排队等（零上游压力），到期
+# 放一个请求进去试探；成功则清闸，仍 3008 则续闸。magpie 的 startGate
+# 是「在飞满 3 就本地排队」，我们这里是「上游说满了就本地排队」，同语义
+# 更贴实际（上游的槽位计数不透明，本地 inflight 未必等于上游）。
+_busy_gate_until: dict[str, float] = {}   # account_id → 本地闸门截止 epoch
+_busy_gate_lock = threading.Lock()
+
+
+def _busy_gate_arm(account_id: str, seconds: float | None = None) -> float:
+    """账号上游饱和：立/续本地闸门；期间该号新请求只排队不敲上游。"""
+    hold = float(seconds if seconds is not None else settings.BUSY_GATE_WAIT)
+    if hold <= 0:
+        return 0.0
+    with _busy_gate_lock:
+        until = max(_busy_gate_until.get(account_id, 0.0), time.time() + hold)
+        _busy_gate_until[account_id] = until
+    return until
+
+
+def _busy_gate_clear(account_id: str) -> None:
+    with _busy_gate_lock:
+        _busy_gate_until.pop(account_id, None)
+
+
+def _busy_gate_live(account_id: str) -> bool:
+    """账号是否处于上游闸门期；到期时原子领取唯一试探名额。
+
+    返回 True = 仍在闸内（本请求应跳过、排队等）；返回 False = 闸已到
+    期且本请求抢到试探名额（进上游），其余并发请求仍会拿到 True，
+    不会在到期瞬间一起涌到上游（magpie startGate 的 first-come 语义）。
+    """
+    now = time.time()
+    with _busy_gate_lock:
+        until = _busy_gate_until.get(account_id, 0.0)
+        if not until:
+            return False
+        if until <= now:
+            # 到期：发一个试探名额（把闸门续 BUSY_GATE_WAIT 作为试探窗口），
+            # 试探成功由 _busy_gate_clear 撤闸；仍 3008 由 _busy_gate_arm 续闸。
+            _busy_gate_until[account_id] = now + max(1.0, float(settings.BUSY_GATE_WAIT))
+            return False  # 本请求放行
+        return True
+
+
+def _busy_gate_active() -> bool:
+    """是否有闸门（含到期后仍在等待唯一试探名额的窗口）。
+
+    到期后闸门条目仍保留（由 _busy_gate_live 原子发放试探名额），
+    不可在这里按 until<=now 清除 —— 否则排队轮询会误判「无闸门」
+    而把全部账号重新敲一遍（v2.9.32 集成测试钉住）。
+    """
+    with _busy_gate_lock:
+        return bool(_busy_gate_until)
+
+
+def _busy_gate_next() -> float:
+    """全池最早闸门到期时刻（无闸门返回 0）：_recovery 用它给 Retry-After。"""
+    now = time.time()
+    with _busy_gate_lock:
+        live = [v for v in _busy_gate_until.values() if v > now]
+    return min(live) if live else 0.0
+
 
 def _busy_held() -> bool:
     return settings.BUSY_HOLD > 0 and time.time() < _busy_hold["until"]
@@ -423,11 +488,20 @@ def _has_recoverable_account(provider: str, now: float | None = None) -> bool:
     ):
         return True
     limit = _limit()
-    return limit > 0 and any(
+    if limit > 0 and any(
         a.enabled and a.status == Status.ACTIVE
         and _inflight.get(a.id, 0) >= limit
         for a in store.list_accounts(provider)
-    )
+    ):
+        return True
+    # v2.9.32（magpie startGate 对照实测）：上游并发槽饱和（3008 系）是
+    # 上游侧残留占用（实测中位 64.7s 释放）。被 3008 打过的账号进
+    # _busy_gate_until 本地闸门：闸门期新请求只排队等，不敲上游；到期
+    # 自动放一个进来试探。仅这类「有明确恢复时刻」的故障值得排队，
+    # 回到 2026-10-07 修掉的「普通 429 也空等 240s」老路。
+    if _busy_gate_active():
+        return True
+    return False
 
 
 def _is_risk_control(status_code: int, text: str) -> bool:
@@ -618,10 +692,13 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
         return "quota", quota_wait
     if lane_wait:
         return "lane", lane_wait
-    # 429 扣号/全池静默的到期时刻 → 429+Retry-After（非 503）：短窗口必然
-    # 恢复，语义是「稍后重试必有」，且 OmniRoute 对 429 走限流退避而非熔断。
+    # 429 扣号/全池静默/本地闸门的到期时刻 → 429+Retry-After（非 503）：
+    # 短窗口必然恢复，语义是「稍后重试必有」，OmniRoute 对 429 走限流退避。
     if _busy_held():
         return "busy", _busy_hold["until"]
+    gate_next = _busy_gate_next()
+    if gate_next:
+        return "busy", gate_next
     key = Account.model_key(model_key)
     holds = [float(a.rate_hold.get(key) or 0)
              for a in store.list_accounts(provider) if a.enabled]
@@ -1695,6 +1772,13 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             reqlog.note_wait(req_id, "q", waited)
             tried.clear()  # 期间账号状态可能已刷新，重新给每个账号机会
             continue
+        # v2.9.32 startGate 闸门：上游 3008 刚立过闸的账号直接跳过（不计
+        # attempts、不占槽），交给下方排队等闸门到期 —— 零上游压力。
+        if _busy_gate_live(account.id):
+            logs.warn(req_id, f"账号 {account.name} 上游并发闸门中，跳过并排队等闸门到期")
+            tried.add(account.id)
+            pinned_id = None
+            continue
         tried.add(account.id)
         pinned_id = None
 
@@ -1733,6 +1817,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
                 slot_box[0] = None
             continue
         if isinstance(result, _Upstream):
+            _busy_gate_clear(account.id)  # 上游通了：撤本地排队闸（v2.9.32）
             if ctx_info.key:
                 affinity_manager.bind(ctx_info.key, account.id)
             held = slot_box[0]
@@ -2143,6 +2228,11 @@ async def _wait_for_account(req_id, provider: str, t0: float,
             step = min(float(poll), remaining - waited)
             await _sleep(step)
             waited += step
+            # v2.9.32 startGate：闸门未到期前不重新选号（否则 tried.clear
+            # 后会把两号各再敲一遍 3008，放大上游压力 —— 2026-10-07 教训）。
+            # 到期瞬间由 _busy_gate_live 原子放唯一试探名额。
+            if _busy_gate_active() and time.time() < _busy_gate_next():
+                continue
             if store.select(provider) is not None:
                 logs.warn(req_id, f"排队 {waited:.0f}s 后账号恢复可用，继续调度")
                 return waited
@@ -2723,8 +2813,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         return _NEXT_ACCOUNT
                     continue
                 if busy_hit and retries_busy >= len(settings.BUSY_WAITS):
-                    # 用尽官方节奏仍饱和：不扣号不计失败，换号（若还有号）；
-                    # 持续饱和已在上方计入 BUSY_HOLD。
+                    # 用尽官方节奏仍饱和：不扣号不计失败。给该账号立本地
+                    # 排队闸门（v2.9.32 startGate 语义）：闸门内新请求排队
+                    # 等槽释放，不再把第二遍重问敲到上游；然后换号。
+                    gate_until = _busy_gate_arm(account.id)
+                    gate_note = (f"，闸门至 {time.strftime('%H:%M:%S', time.localtime(gate_until))}"
+                                 if gate_until else "")
                     reqlog.note_retry(req_id, "429")
                     reqlog.mark_attempt(req_id, account.name, account.mode,
                                         channel=_lane_for(force_fallback, plan_channel, url),
@@ -2733,7 +2827,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     account.record_result(False, "429 并发槽饱和（不扣号）")
                     riskmetrics.record("busy", account.name, carrier="busy",
                                        reason="concurrency_exhausted", model=str(body.get("model") or ""))
-                    logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和，原地重问用尽，换号")
+                    logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和，原地重问用尽，"
+                              f"立本地闸门{gate_note}后换号")
                     return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
                 # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
