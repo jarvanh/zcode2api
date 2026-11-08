@@ -6,7 +6,10 @@
   - 之后的账号按序绑 mihomo pinned listener（http://127.0.0.1:7891..789N）；
   - 绑定前实测每个出口的公网 IP，要求账号间出口 IP 互不相同
     （与直连 IP 也不得相同）；IP 相同/不可用的出口跳过不绑；
-  - 可用出口 < 需求时：能绑多少绑多少，缺口发 Telegram 通知。
+  - 强约束（2026-11-08 主人实证：单 IP 挂 2+ 账号触发风控连坐全灭）：
+    启用账号数 ≤ 1 + 可用独立出口数；分不到独立出口的账号自动停用
+    （名单记 egress-state.json，在 /dropbox 持久化），出口恢复重跑
+    本脚本自动启回；每轮缺口发 Telegram 通知。
 
 出口池实况（2026-11-08 实测，mihomo pinned listeners）：
   7891 → 38.28.193.1  7892 → 74.82.60.31
@@ -122,6 +125,66 @@ def api_set_proxy(account_id: str, proxy_url: str | None) -> bool:
         return False
 
 
+def api_set_enabled(account_id: str, enabled: bool) -> bool:
+    key = admin_key()
+    if not key:
+        print("[error] 无 ZCODE_ADMIN_KEY，无法经 admin API 操作")
+        return False
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{os.environ.get('ZCODE_PORT', '8319')}"
+        f"/admin/api/accounts/{account_id}/enabled",
+        data=json.dumps({"enabled": enabled}).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status == 200
+    except Exception as err:  # noqa: BLE001
+        print(f"[error] API 启停失败 {account_id}: {err}")
+        return False
+
+
+# 本脚本因出口不足停用的账号名单（持久化）：恢复启回只认这份名单，
+# 不碰人工/风控停用的账号。落 /dropbox/self-hosted/zcode2api/proxy/
+# （与 mihomo assigned.json 同目录，/tmp 重置不丢——2026-11-08 实证教训）。
+STATE = ("/dropbox/self-hosted/zcode2api/proxy/egress-state.json"
+         if os.path.isdir("/dropbox/self-hosted/zcode2api/proxy")
+         else os.path.join(BASE, "egress-state.json"))
+
+
+def _load_state() -> dict:
+    try:
+        return json.load(open(STATE))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    json.dump(state, open(STATE, "w"), ensure_ascii=False, indent=1)
+
+
+def api_disable_for_shortage(account_id: str) -> bool:
+    if not api_set_enabled(account_id, False):
+        return False
+    state = _load_state()
+    ids = state.setdefault("shortage_disabled", [])
+    if account_id not in ids:
+        ids.append(account_id)
+    _save_state(state)
+    return True
+
+
+def api_enable_if_shortage(account_id: str) -> bool:
+    if not api_set_enabled(account_id, True):
+        return False
+    state = _load_state()
+    ids = state.get("shortage_disabled", [])
+    if account_id in ids:
+        ids.remove(account_id)
+        _save_state(state)
+    return True
+
+
 def main() -> int:
     store = Store()
     accounts = [a for a in store.list_accounts("zai") if a.enabled]
@@ -149,7 +212,20 @@ def main() -> int:
         print(f"[info] 出口 {port}: {ip} ✓")
     print(f"[info] 可用独立出口: {len(pool)} 个 + 直连 1 个")
 
-    # 2) 分配：账号1直连；账号2+按序吃 pool
+    # 2) 分配：账号1直连；账号2+按序吃 pool。
+    #    先把上轮因出口不足停用的账号捞回参与分配（只认本脚本名单）；
+    #    席位 = 1 直连 + len(pool)。捞回后仍分不下的会在下方再次停用。
+    seats = 1 + len(pool)
+    taken = len(accounts)
+    for acct in store.list_accounts("zai"):
+        if acct.enabled or acct.id not in _load_state().get("shortage_disabled", []):
+            continue
+        if taken >= seats:
+            break
+        if api_enable_if_shortage(acct.id):
+            taken += 1
+            print(f"[enable] {acct.name}: 出口有位，自动启回")
+    accounts = [a for a in store.list_accounts("zai") if a.enabled]
     plans: list[tuple[Account, str | None, str | None]] = []  # (account, target_url, target_ip)
     ports = sorted(pool)
     for i, acct in enumerate(accounts):
@@ -170,7 +246,14 @@ def main() -> int:
     for acct, target, ip in plans:
         if target == "SHORTAGE":
             shortage.append(acct.name)
-            print(f"[warn] {acct.name}: 无可用独立出口，保持现状（需人工扩容出口池）")
+            if acct.enabled:
+                if api_disable_for_shortage(acct.id):
+                    changed += 1
+                    print(f"[disable] {acct.name}: 无独立出口 → 停用（出口恢复后重跑自动启回）")
+                else:
+                    print(f"[error] {acct.name}: 停用失败")
+            else:
+                print(f"[skip] {acct.name}: 已停用（上轮出口不足）")
             continue
         current = (acct.proxy_url or "").strip() or None
         if current == target:
@@ -193,10 +276,11 @@ def main() -> int:
     for name, ip in final_ips.items():
         print(f"  {name}: {ip}")
     if shortage:
-        msg = ("⚠️ zcode2api 出口不足\n"
-               f"启用账号 {len(accounts)} 个，可用独立出口仅 {len(ports) + 1} 个\n"
-               f"未绑定账号: {', '.join(shortage)}\n"
-               "这些账号暂保持现绑定；请在 mihomo 订阅补节点后重跑本脚本")
+        msg = ("⚠️ zcode2api 出口不足，已自动停用超出账号\n"
+               f"独立出口 {len(ports) + 1} 个（含直连），本轮启用 "
+               f"{len(accounts) - len(shortage)} 个\n"
+               f"停用账号: {', '.join(shortage)}\n"
+               "补 mihomo 节点后重跑 assign_egress.py 自动启回")
         notify_telegram(msg)
         print(f"\n[summary] 变更 {changed} 项；出口缺口 {len(shortage)} 个（已通知）")
         return 3
