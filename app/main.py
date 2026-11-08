@@ -142,16 +142,21 @@ async def lifespan(app: FastAPI):
     endpoint_routing.start()  # 端点映射跟随轮（agent/configs mapping，fail-open；fork 增强）
     version_tracker.init_from_store()
     version_tracker.start()   # 官方版本自动探测与同步（上游 2.7.16）
+    restored = reqlog.restore_recent_from_disk()  # 实时层回放：重启后仍可见重启前请求
     conc_task = reqlog.start_sampler()   # 并发仪表心跳（1s：槽位快照 + 分钟曲线）
     vitals.start()                       # 进程体征心跳（RSS/solver/池/loop 延迟）
     _run_install_sequence_on_start()
     _warn_version_drift()
     base = f"http://{_display_host()}:{settings.PORT}"
-    logs.banner([
+    banner_lines = [
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
         f"{logs._DIM}后台管理{logs._R}  {logs._C}{base}/admin/login{logs._R}",
         f"{logs._DIM}对话端点{logs._R}  {logs._C}{base}/v1/messages{logs._R}",
-    ])
+    ]
+    if restored:
+        banner_lines.append(
+            f"{logs._DIM}实时观测回放{logs._R}  {restored} 条重启前请求（磁盘终态）")
+    logs.banner(banner_lines)
     try:
         yield
     finally:

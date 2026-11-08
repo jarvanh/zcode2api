@@ -288,6 +288,111 @@ def conc_history(days: int = 7) -> dict:
     }
 
 
+def restore_recent_from_disk(limit: int = KEEP) -> int:
+    """启动时从磁盘历史回放最近 limit 条终态进实时环形缓冲。
+
+    解决「实时页 500 条重启清零」：落盘层本就保留了全部终态字段，
+    回放后实时页重启即可见重启前的请求（在途条目本就不落盘，无幽灵行）。
+    读今天 + 昨天两个文件（跨北京日界也不空），倒序取最新 limit 条，
+    ts 升序 append（与运行时行为一致，snapshot 的 reversed 自然最新在前）。
+    best-effort：读盘失败只记日志，绝不影响启动。
+    """
+    try:
+        data_dir = _hist_dir()
+        rows: list[dict] = []
+        now = datetime.now(_BJ)
+        for i in range(2):  # 今天 + 昨天
+            day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+            path = data_dir / f"{_PREFIX}{day}.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rows.append(json.loads(line))
+                        except ValueError:
+                            continue  # 半行写入跳过
+            except OSError as err:
+                logs.warn("reqlog", f"回放读取失败（忽略）: {path.name} {err}")
+        rows.sort(key=lambda r: float(r.get("ts") or 0))
+        picked = rows[-max(1, int(limit)):]
+        restored = 0
+        with _lock:
+            _entries.clear()
+            _inflight.clear()
+            for row in picked:
+                entry = _row_to_entry(row)
+                _entries.append(entry)
+                restored += 1
+        if restored:
+            logs.ok("reqlog", f"实时层已从磁盘回放 {restored} 条终态（重启前请求可见）")
+        return restored
+    except Exception as err:  # noqa: BLE001 —— 回放失败不挡启动
+        logs.warn("reqlog", f"实时层回放失败（忽略）: {err}")
+        return 0
+
+
+def _row_to_entry(row: dict) -> dict:
+    """磁盘行 → 实时层条目（_persist 的逆变换；缺的字段取安全默认）。"""
+    att_n = int(row.get("att") or 0)
+    retry_total = int(row.get("rt") or 0)
+    entry = {
+        "req_id": f"h-{row.get('ts', 0)}",  # 历史行无 req_id，合成防碰撞键
+        "ts": float(row.get("ts") or 0),
+        "endpoint": row.get("endpoint") or "",
+        "path": row.get("path") or "",
+        "model": row.get("model") or "",
+        "model_req": "",
+        "stream": bool(row.get("stream")),
+        "preview": "",
+        "client_ip": row.get("ip") or "",
+        "ua": row.get("ua") or "",
+        "probe": bool(row.get("probe")),
+        "msgs": row.get("msgs"),
+        "max_tokens": row.get("mt"),
+        "account": row.get("account") or "",
+        "mode": row.get("mode") or "",
+        "channel": row.get("ch") or "",
+        "egress": row.get("eg") or "",
+        "up": bool(row.get("up")),
+        # 尝试梯子明细未落盘：还原条数与汇总计数（详情页显示聚合形态）
+        "att": [{"restored": True}] * att_n,
+        "wait_q": float(row.get("q") or 0),
+        "wait_rl": float(row.get("rl") or 0),
+        "wait_5xx": float(row.get("5xx") or 0),
+        "wait_cap": float(row.get("cap") or 0),
+        "retry_429": row.get("rt"),
+        "retry_5xx": 0,
+        "retry_cap": 0,
+        "retry_fb": 0,
+        "ok": row.get("ok"),
+        "status": row.get("status"),
+        "error": row.get("err") or "",
+        "err_code": row.get("code"),
+        "err_kind": row.get("kind") or "",
+        "t_first": row.get("t_first"),
+        "t_total": row.get("t_total"),
+        "input_tokens": row.get("in"),
+        "output_tokens": row.get("out"),
+        "cache_read": row.get("cache_read"),
+        "sess": row.get("sess"),
+        "sess_repeat": row.get("sess_repeat"),
+        "sess_window": row.get("sw") or "",
+        "upstream_id": row.get("trace") or "",
+        "stop_reason": row.get("stop"),
+        "t_up": row.get("up_t"),
+        "dedup": row.get("dd") or "",
+    }
+    # rt 是总计数，标注 restored 让前端知道这是聚合形态
+    if retry_total:
+        entry["att_restored_total"] = retry_total
+    return entry
+
+
 def start_sampler():
     """启动 1s 采样心跳（lifespan 调）；无 running loop 时返回 None（单测直接调 sample）。"""
     import asyncio
