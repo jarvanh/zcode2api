@@ -76,7 +76,8 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        assert payload["max_tokens"] == 131072
+        # 先钳到上游硬上限 131072，再加默认 32K 思考预算，按模型 128K 输出上限截顶
+        assert payload["max_tokens"] == 128_000
 
     async def test_max_tokens_string_form_clamped(self, gateway_client, fresh_app):
         """字符串型 max_tokens 也要钳制，防止绕过类型检查打到上游 1210。"""
@@ -91,7 +92,7 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        assert payload["max_tokens"] == 131072
+        assert payload["max_tokens"] == 128_000
 
     async def test_max_tokens_floor_and_passthrough(self, gateway_client, fresh_app):
         client, mock = gateway_client
@@ -105,7 +106,8 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        assert payload["max_tokens"] == 1024  # 合法值原样透传
+        # 原生默认 max 思考：1024 正文额度 + 32K 预算
+        assert payload["max_tokens"] == 33_024
 
     async def test_stream_returns_openai_chunks(self, gateway_client, fresh_app):
         client, mock = gateway_client

@@ -257,7 +257,8 @@ class TestMonitoringEnrichedFields:
         assert e["path"] == "/v1/messages"
         assert e["probe"] is True          # X-Probe 落进监控行
         assert e["msgs"] == 3              # 请求形状（排障「超长上下文」用）
-        assert e["max_tokens"] == 128
+        # 原生入口默认 max 思考：128 + 32K 预算，记录的是转发上游的有效值
+        assert e["max_tokens"] == 32_128
 
     async def test_channel_and_egress_recorded(self, gateway_client, fresh_app):
         client, _ = gateway_client

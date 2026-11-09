@@ -33,6 +33,7 @@ from .. import (
     freshness,
     logs,
     quota_windows,
+    reasoning,
     reqlog,
     riskmetrics,
     session_ctx,
@@ -371,6 +372,9 @@ def _normalize_body(body: dict) -> dict:
             else:
                 bridged.append(msg)
         body["messages"] = bridged
+    # 原生 /v1/messages：GLM-5.3 家族未显式给 thinking → 默认 max 档。
+    # compat 路径已由 apply_reasoning 注入，此处见到 thinking 会跳过。
+    reasoning.apply_native_defaults(body)
     return body
 
 

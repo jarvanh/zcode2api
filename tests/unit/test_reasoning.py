@@ -36,6 +36,35 @@ def test_glm53_default_effort_max_and_budget_add():
     assert body["max_tokens"] == 36_096
 
 
+def test_native_defaults_inject_max_thinking():
+    """原生 /v1/messages：未显式给 thinking → 默认 max 档（32K 预算）。"""
+    body = {"model": "GLM-5.3-Flash", "max_tokens": 96,
+            "messages": [{"role": "user", "content": "hi"}]}
+    reasoning.apply_native_defaults(body)
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 32_000}
+    assert body["output_config"] == {"effort": "max"}
+    # 官方 bundle 口径：预算加在回答额度之外
+    assert body["max_tokens"] == 32_096
+
+
+def test_native_defaults_respect_explicit_thinking():
+    body = {"model": "GLM-5.3-Flash", "max_tokens": 4096,
+            "thinking": {"type": "disabled"}}
+    reasoning.apply_native_defaults(body)
+    assert body["thinking"] == {"type": "disabled"}
+    assert "output_config" not in body
+    assert body["max_tokens"] == 4096
+
+
+def test_native_defaults_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "THINKING_NATIVE_DEFAULT", False)
+    body = {"model": "GLM-5.3-Flash", "max_tokens": 96}
+    reasoning.apply_native_defaults(body)
+    assert "thinking" not in body
+    assert "output_config" not in body
+    assert body["max_tokens"] == 96
+
+
 def test_glm53_effort_mapping_rounds_up():
     from app.openai_compat import openai_to_anthropic
 

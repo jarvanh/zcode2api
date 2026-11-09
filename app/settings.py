@@ -356,7 +356,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.44"
+APP_VERSION = "2.9.45"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
@@ -420,6 +420,10 @@ SESSION_AFFINITY = _bool("ZCODE_SESSION_AFFINITY", True)
 # bundle 口径注入 thinking+output_config，max_tokens += 预算再按模型上限截
 # 顶。0 = 整体旁路（恢复直传形态）。
 THINKING_COMPAT = _bool("ZCODE_THINKING_COMPAT", True)
+# 原生 /v1/messages 默认思考档：GLM-5.3 家族未显式传 thinking 时注入 max
+# 档（thinking 32K + output_config.effort=max，预算加在 max_tokens 之外）。
+# 1 = 开启（默认，GLM-5.3-Flash 默认 max 思考）；0 = 原生透传。
+THINKING_NATIVE_DEFAULT = _bool("ZCODE_THINKING_NATIVE_DEFAULT", True)
 
 # ── 端点映射跟随（app/endpoint_routing.py）────────────────────────────
 # 周期拉 agent/configs 的 proxyEndpoint.mapping 表，按上游指令改写推理端点

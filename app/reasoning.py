@@ -164,3 +164,32 @@ def apply_reasoning(body: dict, payload: dict) -> None:
         _apply_thinking_compat(body)
     except Exception:  # noqa: BLE001 - 转换层绝不放大请求失败
         pass
+
+
+def apply_native_defaults(body: dict) -> None:
+    """Anthropic 原生 /v1/messages：GLM-5.3 家族默认 max 档思考。
+
+    与 `_inject_glm53` 的差别：原生请求的 thinking / reasoning_effort 就在
+    body 里。客户端显式给 thinking（enabled / disabled）时完全不动，尊重
+    客户端；未给时按 ZCode 目录默认 max 注入 thinking + output_config，并
+    按官方 bundle 口径把预算加到 max_tokens 之上，避免小额度请求被思考
+    吃光（200 但正文为空）。
+
+    幂等：compat 路径的 body 已带 thinking，本函数直接返回。原生默认可用
+    ZCODE_THINKING_NATIVE_DEFAULT=0 关闭，恢复纯透传。
+    """
+    if not settings.THINKING_COMPAT or not settings.THINKING_NATIVE_DEFAULT:
+        return
+    try:
+        model = str(body.get("model") or "")
+        if not is_glm53_model(model):
+            return
+        if isinstance(body.get("thinking"), dict):
+            return
+        effort = normalize_effort(body.get("reasoning_effort"))
+        budget = _clamp_budget_to_model(GLM53_THINKING_BUDGETS[effort], model)
+        body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        body["output_config"] = {"effort": effort}
+        _apply_thinking_compat(body)
+    except Exception:  # noqa: BLE001 - 转换层绝不放大请求失败
+        pass
