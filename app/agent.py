@@ -11,7 +11,7 @@ import uuid
 
 from . import body_transform, constants, endpoint_routing, settings
 from .captcha import captcha_manager
-from .identity import build_llm_identity_headers, build_trace_headers
+from .identity import build_identity_headers, build_trace_headers
 from .models import Account
 
 # 透传客户端 header 时需要剔除的字段
@@ -80,18 +80,18 @@ def build_request(
     账号 status 保持 ACTIVE，不能靠状态推导路由，须显式指定）。
 
     upstream_key：显式指定上游通道键（gateway 渠道优先梯驱动）；None 时按
-    账号能力自动选：JWT + oauth_token → `zai_plan`（标准 Anthropic，Magpie
-    模式，免 zcode-plan WAF）→ `zai`（zcode-plan 代理）→ `zai_fallback`
-    （API Key）。
+    账号能力自动选：JWT → `zai`（zcode-plan 代理）→ `zai_fallback`
+    （API Key）。plan_std 通道已随上游 df42a2d 移除（OAuth token 打不了
+    标准 Anthropic 端点）。
 
-    fork 增强保留（v2.9.39 → v2.9.40 合并）：
-    - 自动路由先过 plan_lane_available：Plan 腿正在通道级风控冷却且有可用
-      回退 Key 时直接路由 Key 通道，不把封锁拆开重踩（选号能选中≠Plan 腿
-      可打；无回退时仍维持 Plan，交给上游定成败）。
-    - transform_body 透传 account（fork 扩展参数）。
-    - 端点映射跟随（endpoint_routing.apply，fail-open）仅作用于 zcode-plan
-      JWT 通道（zai）——标准 Anthropic 端点不经 zcode-plan 代理。
+    fork 增强保留（v2.9.41 合并，随上游 df42a2d 拆除 plan_std 后重挂）：
+    - 自动路由先过 plan_lane_available（通道级风控门禁）：plan 腿正在冷却
+      且有回退 Key 时直接路由 zai_fallback，不把封锁拆开重踩；无回退时
+      仍维持 zai，交给上游定成败。
+    - 端点映射跟随（endpoint_routing.apply，fail-open）作用于 zai 通道。
     - CAPTCHA_ATTACH_PLAN（C 档，默认关）：zai 通道每请求附一枚池内验证码。
+    plan_std 通道随上游 df42a2d 移除；fork per-account 环境注入随之退役
+    （上游按 Magpie dress() 固定环境段，与版本锁校验配套）。
     """
     provider = account.provider
 
@@ -99,12 +99,13 @@ def build_request(
         if upstream_key:
             key = upstream_key
         elif account.uses_plan_channel() and not force_fallback:
-            # 自动路由先过通道级风控门禁（fork）：plan_std 腿被冷却且有 Key
-            # 回退时直接打 Key 通道；冷却未生效则按 Magpie 优先 plan_std。
-            if account.supports_plan_std() and account.plan_lane_available(
+            # 通道级风控门禁（fork，挂回上游 zai/apikey 二元框架）：plan 腿
+            # 正在通道级冷却且有回退 Key 时直接走 Key 通道，不把封锁拆开重踩
+            # （plan_lane_available 语义：无回退时仍维持 zai，交给上游定成败）。
+            if account.api_key and not account.plan_lane_available(
                 body.get("model") if isinstance(body.get("model"), str) else ""
             ):
-                key = "zai_plan"
+                key = "zai_fallback"
             else:
                 key = "zai"
         elif account.api_key:
@@ -118,21 +119,13 @@ def build_request(
     else:
         raise RuntimeError(f"未知提供商: {provider}")
 
-    # 认证与目标 URL 选择；plan 系通道（zai / zai_plan / bigmodel_plan）共用
-    # 全量身份头 + 追踪头 + body transform 的「官方客户端形态」。
+    # 认证与目标 URL 选择；plan 系通道（zai）用全量身份头 + 追踪头 +
+    # body transform 的「官方客户端形态」。
     if key == "zai":
         if not account.jwt_token:
             raise RuntimeError("账号缺少 JWT")
         target_url = settings.UPSTREAM["zai"]
         auth = {"Authorization": f"Bearer {account.jwt_token}"}
-        bearer_token = account.jwt_token
-        plan_style = True
-    elif key in ("zai_plan", "bigmodel_plan"):
-        if not account.oauth_token:
-            raise RuntimeError("账号缺少 OAuth access_token")
-        target_url = settings.UPSTREAM[key]
-        auth = {"Authorization": f"Bearer {account.oauth_token}"}
-        bearer_token = account.oauth_token
         plan_style = True
     elif key == "zai_fallback":
         if not account.api_key:
@@ -163,31 +156,26 @@ def build_request(
         model = body.get("model") if isinstance(body.get("model"), str) else None
         body = body_transform.transform_body(
             body, user_id, model,
-            account=account,
             device_mid=profile.device_mid,
             session_id=session_id,
         )
+        # 端点映射跟随（fail-open，fork 移植）：按上游 agent/configs 快照
+        # 改写 URL；标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）。
+        # plan_style 现仅剩 zai（zcode-plan JWT）通道，端点代理语义不变。
         extra_headers: dict[str, str] = {}
-        if key == "zai":
-            # 端点映射跟随（fail-open，fork 移植）：按上游 agent/configs 快照
-            # 改写 URL；标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）。
-            # 仅 zcode-plan JWT 通道应用——标准 Anthropic 端点不经代理。
-            target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
+        target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
+        # Start Plan 请求头部对齐 Magpie packages/zcode/index.mjs startHeaders：
+        # 不带 anthropic-beta（工具搜索 beta 仅 coding-plan 用）、不带 x-api-key
+        # （仅 Authorization: Bearer JWT）。旧「vlelyanin 实证」下发的这两项
+        # 已于 3.17.2 对齐时移除。
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
-            # start-plan 网关的 harness 要求：mid-conversation system 能力位，
-            # 官方客户端 LLM 调用恒带（vlelyanin / TriDefender 双源一致）。
-            "anthropic-beta": "mid-conversation-system-2026-04-07",
-            **build_llm_identity_headers(account),
+            **build_identity_headers(account),
             **build_trace_headers(session_id),
             **extra_headers,
         }
-        # 官方 anthropic SDK 同时下发 x-api-key（与 Bearer 同值）；
-        # 缺失会被 start-plan 网关视为非客户端流量（vlelyanin 实证）。
-        if bearer_token:
-            headers["x-api-key"] = bearer_token
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
         headers = {

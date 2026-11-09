@@ -321,8 +321,6 @@ UPSTREAM = {
     "zai": os.getenv("ZAI_UPSTREAM_URL", constants.MESSAGES_URLS["zai"]),
     "zai_fallback": os.getenv("ZAI_FALLBACK_URL", constants.MESSAGES_URLS["zai_fallback"]),
     "bigmodel": os.getenv("BIGMODEL_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel"]),
-    "zai_plan": os.getenv("ZAI_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["zai_plan"]),
-    "bigmodel_plan": os.getenv("BIGMODEL_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel_plan"]),
 }
 
 # 跨 provider 降级顺序（Magpie 模式）：当前 provider 池无可用号时按此顺序下沉。
@@ -358,10 +356,10 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.40"
+APP_VERSION = "2.9.41"
 
-# system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
-# sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
+# system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
+# 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
 # 供 admin API（GET /admin/api/sections/freshness）与 healthcheck 读取；
 # 风控波次确认时若已过时，日志给「高度疑似措辞触发」提示（gateway 波次点）。
 SECTIONS_STALE_DAYS = _int("ZCODE_SECTIONS_STALE_DAYS", 21)

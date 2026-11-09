@@ -167,7 +167,7 @@ def build_app() -> FastAPI:
             if scenario == "slow":
                 await asyncio.sleep(0.3)
 
-            status, resp_body, extra_headers = _messages_result(scenario, payload, n)
+            status, resp_body, extra_headers = _messages_result(scenario, payload)
         finally:
             left = conc_in[bind_gauge] - 1
             if left <= 0:
@@ -175,12 +175,6 @@ def build_app() -> FastAPI:
             else:
                 conc_in[bind_gauge] = left
         if status != 200:
-            if scenario == "edge_block_page" and isinstance(resp_body, str):
-                # 拦截页是 HTML，不能 JSON 序列化（否则网关看到的是带引号的字符串）
-                return Response(
-                    resp_body, status_code=status, media_type="text/html",
-                    headers={"x-mock-call-index": str(n), **extra_headers},
-                )
             return Response(
                 json.dumps(resp_body), status_code=status,
                 media_type="application/json",
@@ -206,7 +200,7 @@ def build_app() -> FastAPI:
         return Response(raw, status_code=200, media_type=media,
                         headers={"x-mock-call-index": str(n)})
 
-    def _messages_result(scenario: str, payload: dict, n: int = 0) -> tuple[int, Any, dict]:
+    def _messages_result(scenario: str, payload: dict) -> tuple[int, Any, dict]:
         """返回 (status, body, extra_headers)。"""
         model = payload.get("model", "GLM-5.2")
         mid = payload.get("id") or "msg_mock_001"
@@ -225,14 +219,6 @@ def build_app() -> FastAPI:
             return 400, {"code": 1002, "message": "额度已用完"}, {}
         if scenario == "rate_limited":
             return 429, _error_body("rate limited"), {"retry-after": "30"}
-        if scenario in ("concurrency_3008", "concurrency_3008_then_ok"):
-            # 线上主力形态：429 + {"code":3008,"msg":"user concurrency limit
-            # exceeded"}（并发槽「没轮到」，非频控非额度）。then_ok 变体第二轮起
-            # 返回成功，钉住「饱和是瞬态、重问/排队能恢复」的语义。
-            n = n  # 该凭证第 n 次调用（0 起）
-            if scenario == "concurrency_3008_then_ok" and n >= 1:
-                return 200, ok_body, {}
-            return 429, {"code": 3008, "msg": "user concurrency limit exceeded"}, {}
         if scenario == "rate_limited_quota_body":
             # 线上 2026-09-13 实测形态：api.z.ai 频控 429 但 body 带额度文案，
             # 不得被 _is_exhausted 关键词分支误判成「额度用完」。
@@ -246,32 +232,19 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
-        if scenario == "edge_block_page":
-            # 阿里云 ESA/WAF 拦截页（plugins#649）：405 + HTML，封的是**出口 IP**，
-            # 不是账号。网关必须把它与上面的 3012 分开处置（不记 strike）。
-            return 405, (
-                '<!doctypehtml><html lang="zh-cn"><meta charset="utf-8">'
-                '<title>405</title><div>Sorry, your request has been blocked '
-                'due to unusual activity. errors.aliyun.com</div></html>'
-            ), {}
-        if scenario in ("risk_biz_3012", "risk_control_3012_200"):
-            # HTTP 200 内嵌业务码 3012 的风控形态（与 405 形态同因不同载体）。
-            # 原实现在此路径误调不存在的 Account.ban_for_risk → AttributeError 500
-            # 且账号不冷却；此场景钉住指数退避冷却与换号回归（2026-10-07 审查修复）。
-            return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
         if scenario == "quota_exhausted_200":
             # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
         if scenario == "quota_exhausted_1310":
-            # Magpie 模式实测形态（上游 e038650）：标准 Anthropic 端点对周/月使用上限回
-            # HTTP 200 + {"code":1310,"msg":"您已达到每周使用上限，将于 2026-11-15 23:59 重置"}
+            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2026-11-15 23:59 重置"}
             return 200, {
                 "code": 1310,
                 "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",
             }, {}
-        # risk_control_3012_200 场景在上方 fork 已定义（200 承载业务码 3012），
-        # 上游重复追加的同一场景不再重复。
+        if scenario == "risk_control_3012_200":
+            # 同形：风控拒绝也用 200 承载，最危险——当成功处理会洗掉 strikes
+            return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
         if scenario == "business_error_200_unknown":
             return 200, {"code": 3006, "msg": "model not allowed"}, {}
         if scenario == "server_error":
@@ -298,10 +271,6 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
-        if getattr(app.state, "billing_current_scenario", None) == "no_data":
-            # 上游投放空窗形态（2026-10-31 实测）：code=0 但**无 data 字段**
-            return Response(json.dumps({"code": 0, "msg": "", "logid": "mock"}),
-                            media_type="application/json")
         # billing_quota_200：Plan 通道真实形态——HTTP 200 + {"code":1005}
         scenario = _scenario_for(headers, _bind_key(headers))
         if scenario in ("billing_quota_200", "billing_all_quota_200"):
@@ -325,6 +294,8 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        # balance_expired：本地仍有余额、但窗口早已过期（2026-10-31 线上真实形态，
+        # 上游对这类请求一律 200+{"code":1005}）
         scenario = _scenario_for(headers, _bind_key(headers))
         if scenario == "billing_all_quota_200":
             return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
@@ -332,30 +303,21 @@ def build_app() -> FastAPI:
         if scenario == "billing_empty":
             return Response(json.dumps({"code": 0, "data": {"balances": []}}),
                             status_code=200, media_type="application/json")
-        payload = {"data": {"balances": [
-            {"model": "GLM-5.3", "show_name": "GLM-5.3",
-             "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
-             "expires_at": "2099-01-01T00:00:00Z"},
-            {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
-             "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
-             "expires_at": "2099-01-01T00:00:00Z"},
-        ]}}
-        # 测试协议：app.state.billing_balance_plans 设列表时，balance 附带已生效
-        # plans[]（真上游形态：current 空窗而 balance 带套餐，2026-10-31 实证）；
-        # app.state.billing_balance_windows 设列表时整体替换日窗（构造全耗尽场景）
-        windows = getattr(app.state, "billing_balance_windows", None)
-        if windows is not None:
-            payload["data"]["balances"] = list(windows)
-        plans = getattr(app.state, "billing_balance_plans", None)
-        if plans is not None:
-            payload["data"]["plans"] = list(plans)
         if scenario == "balance_expired":
-            # 上游侧场景：本地仍有余额、但窗口早已过期（2026-10-31 线上真实形态，
-            # 上游对这类请求一律 200+{"code":1005}）
-            payload = json.loads(json.dumps(payload))
-            for b in payload["data"]["balances"]:
-                b["expires_at"] = "2026-01-01T00:00:00Z"
-        return Response(json.dumps(payload), media_type="application/json")
+            expires_at = "2026-01-01T00:00:00Z"
+        else:
+            expires_at = "2099-01-01T00:00:00Z"
+        return Response(json.dumps({
+            "data": {"balances": [
+                {"model": "GLM-5.3", "show_name": "GLM-5.3",
+                 "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
+                 "expires_at": expires_at},
+                {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
+                 "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
+                 "expires_at": expires_at},
+            ]},
+        }), media_type="application/json")
+
     async def _usage(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         _record("GET", request.url.path, headers, b"")
@@ -405,11 +367,6 @@ def build_app() -> FastAPI:
         scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
         if scenario == "claim_none":
             plans: list = []
-        elif scenario == "claim_no_data":
-            # 上游投放空窗真实形态（2026-10-31 实测）：code=0 且**无 data 字段**，
-            # 但带明确 plan_id 打 claim 仍能 code=0 发放
-            return Response(json.dumps({"code": 0, "msg": "", "logid": "mock-logid"}),
-                            media_type="application/json")
         elif scenario == "claim_claimed":
             return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
                             media_type="application/json")
@@ -427,26 +384,6 @@ def build_app() -> FastAPI:
     async def _marketing_touch(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         _record("GET", request.url.path, headers, b"")
-        # fork 测试协议保留：app.state.touch_plans 设列表 → deliveries 包横幅
-        # （claim_zcode_plan action + zcode_plan 元数据，与真实横幅同形）；
-        # None → 走下方 scenario 协议（空 deliveries = feed 无活动）。
-        plans = getattr(app.state, "touch_plans", None)
-        if plans is not None:
-            deliveries = []
-            for p in plans:
-                deliveries.append({
-                    "banner": {
-                        "action": {"type": "claim_zcode_plan",
-                                   "args": {"plan_id": p["plan_id"]}},
-                        "background": {"args": {"zcode_plan": {
-                            "name": p.get("name") or p["plan_id"],
-                            "plan_id": p["plan_id"],
-                            "grant_units": p.get("grant_units", 300000000),
-                        }}},
-                    },
-                })
-            return Response(json.dumps({"code": 0, "data": {"deliveries": deliveries}}),
-                            media_type="application/json")
         scenario = getattr(app.state, "marketing_scenario", None) or headers.get("x-mock-marketing-scenario")
         if scenario == "marketing_plan":
             return Response(json.dumps({
@@ -515,27 +452,15 @@ releaseNotesByLocale:
         headers = {k.lower(): v for k, v in request.headers.items()}
         body = await request.body()
         _record("POST", request.url.path, headers, body)
+        if not headers.get("x-aliyun-captcha-verify-param"):
+            return Response(json.dumps({"code": 3007, "msg": "captcha required"}),
+                            media_type="application/json")
         try:
             payload = json.loads(body) if body else {}
         except json.JSONDecodeError:
             payload = {}
         if not payload.get("plan_id"):
             return Response(json.dumps({"code": 3001, "msg": "bad plan"}),
-                            media_type="application/json")
-        # 测试协议：app.state.claim_known_plan_ids 设列表时，套餐存在性/已持有
-        # 校验先于验证码（与真上游同序，2026-11-02 实测 1001/1003 均无验证码头
-        # 即返回）——兜底候选的免码探测靠这条才能被端到端测到。
-        # app.state.claim_held_plan_ids 设列表时，命中的 id 返回 1003。
-        known = getattr(app.state, "claim_known_plan_ids", None)
-        if known is not None and payload["plan_id"] not in known:
-            return Response(json.dumps({"code": 1001, "msg": "target not found"}),
-                            media_type="application/json")
-        held = getattr(app.state, "claim_held_plan_ids", None)
-        if held is not None and payload["plan_id"] in held:
-            return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
-                            media_type="application/json")
-        if not headers.get("x-aliyun-captcha-verify-param"):
-            return Response(json.dumps({"code": 3007, "msg": "captcha required"}),
                             media_type="application/json")
         scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
         if scenario == "claim_auth":
@@ -606,17 +531,6 @@ releaseNotesByLocale:
             })
         return Response(json.dumps({"data": data}), media_type="application/json")
 
-    @app.get("/api/oauth/userinfo")
-    async def oauth_userinfo(request: Request) -> Response:
-        """OAuth 用户名抓取端点（2026-10-03）：此前该 URL 硬编码指向真网
-        chat.z.ai，测试环境 poll ready 前同步打真网（DNS+TLS 可达 0.8s），
-        把 ready 响应拖超测试断言的 0.4s 死线。conftest 已把
-        OAUTH_USERINFO_URL 指到这里，永不打真网。"""
-        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
-        return Response(json.dumps({
-            "data": {"user_id": "mock", "username": "mock-user"}
-        }), media_type="application/json")
-
     @app.post("/api/auth/z/login")
     async def z_login(request: Request) -> Response:
         body = await request.body()
@@ -681,7 +595,6 @@ releaseNotesByLocale:
     app.get("/api/v1/zcode-plan/usage")(_usage)
     app.get("/api/v1/client/configs")(_client_configs)
     app.post("/api/v1/event/report")(_event_report)
-    app.get("/api/v1/marketing/touch")(_marketing_touch)
 
     return app
 

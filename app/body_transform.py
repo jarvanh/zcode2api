@@ -1,64 +1,42 @@
-"""请求体变换 —— 镜像官方 ZCode 3.17.2 ContextBuilder（bundle
-assembleSystemMessages；3.17.2 起默认链 system 块仅剩 cli_prefix+identity，
-env_info/model/current_date 迁 meta_user 附件 A3a、块3 默认为空——网关维持
-3 块线缆形状不变，块3/context_prefix 不受校验（10-31 实弹））。历史镜像：
-3.16.3/3.17.1 见 git 历史 zcode_sections_3163/3171.json。
+"""请求体变换 —— anthropic 通道上的「官方 ZCode 客户端形态」变换集。
 
-上游 WAF 对 system 块的校验史（同为 HTTP 405 承载的 3012 "unusual activity"，
-与账号/指纹/出口无关）：
-  2026-10-12 起  按块「形状」拦截：独立 Environment 块 + powered-by 独立块、
-                 2 块子代理形状均被拒，只认官方 3 块默认链（10-24 实弹修复）。
-  2026-10-31 起  按「文本」拦截：块1 cli_prefix 与块2 stable 的措辞必须与
-                 当前官方版本（3.17.1）一致——"an interactive coding agent"
-                 （3.16.3）与块2 里的 Desktop Context 追加段均触发 405；
-                 块3 dynamic 不校验（10-31 离线二分实弹：base 405 /
-                 3.17.1 块1+2 + 3.16.3 块3 200，交叉混合逐块定位）。
+system 三块 + 日期轮 + cache_control + metadata.user_id 的构造形态，逐字节
+对齐 Magpie packages/zcode/index.mjs 的 dress()（ZCode 3.17.2，见 zcode_system.json）：
+  1. system 身份块：严格三块（cliPrefix / stableSections / dynamic），客户端
+     自身 system 文本只许并入末块。网关做内容审查，缺官方块或多出第 4 块会被
+     拒为 405 3012 "unusual activity"；11-03 起上游对 body 文本锁版本，前两块
+     与版本头不等价即拒。
+  2. cache_control：最后一条非 system 消息的最后一个 content block 追加
+     `cache_control: {"type": "ephemeral"}`。Anthropic API 对低于缓存门槛的请求
+     静默忽略 cache_control，因此无条件追加是安全的。
+  3. metadata.user_id：注入 attribution blob
+     `{"device_id": mid, "account_uuid": "", "session_id": sid}`（device_mid /
+     session_id 优先）；JWT 账号无 device 档案时兜底用 JWT sub。
 
-官方桌面端默认装配（assembleSystemMessages）恰好 3 个线缆块：
-  块1 cli_prefix 单独一块，无 cache_control（3.15.1 起不再带）；
-  块2 全部 stable 段 \n\n 连接（3.17.1/3.17.2 同文：Agent Identity + Harness；
-      CLI 面不携带 Desktop Context；3.17.2 custom_system_prompt 归 stable 族，
-      但块2 文本被上游按版本校验，追加即破坏逐字节一致性——维持并入块3），ephemeral；
-  块3 全部 dynamic 段 \n\n 连接并带 "\n\n" 前缀（Dynamic Behavior /
-      Environment Info（powered-by 行并入本段末行）/ Context
-      Management），ephemeral。
-客户端自带 system（customSystemPrompt 语义）：官方 bundle 里本就是 stable
-  段（Oda cacheHint:"stable"），但块2 文本已被上游按版本校验，任何追加都会
-  破坏逐字节一致性——改并入块3（dynamic）尾部（Agent2API PR #343 同语义，
-  10-31 实弹 200）。
-另注入 meta_user context_prefix（currentDate 的 <system-reminder> 首条
-user 消息，官方客户端始终携带；10-31 实弹证实不受校验）。
-
-所有变换对畸形输入保持 no-op：解析失败返回原样，坏 body 永远不会被这里放大。
+所有变换对畸形输入保持 no-op：解析失败返回原样，坏 body 不会被这里放大。
 """
 
 from __future__ import annotations
 
 import base64
-import datetime
 import hashlib
 import json
-import os
 import time
 import uuid
 from pathlib import Path
 
-Sections = dict  # 侧车 zcode_sections_3172.json 的加载形态
+from . import constants
 
-
-def _load_sections() -> Sections | None:
-    global _SECTIONS
-    if _SECTIONS is None:
-        try:
-            _SECTIONS = json.loads(
-                (Path(__file__).with_name("zcode_sections_3172.json")).read_text("utf-8")
-            )
-        except (OSError, ValueError):
-            _SECTIONS = {}
-    return _SECTIONS or None
-
-
-_SECTIONS: Sections | None = None
+# ── ZCode 官方 client 提示词（3.17.2，逐字节移植自 Magpie packages/zcode/prompt.mjs）──
+# 结构：{cliPrefix, stableSections[2], dynamicBehavior, sessionGuidance,
+#        contextManagement, poweredBy, environment{...}, context{...}}。
+# 出处：ZCode 3.17.2 源码（zai-org/ZCode@a9fe401）经 Magpie plugins 仓库
+# packages/zcode/prompt.mjs 归档，start.test.mjs 对其逐段做 SHA-256 前 16 hex 校验。
+_PROMPT_JSON = Path(__file__).with_name("zcode_system.json")
+try:
+    _ZCODE_PROMPT: dict = json.loads(_PROMPT_JSON.read_text("utf-8"))
+except (OSError, ValueError):
+    _ZCODE_PROMPT = {}
 
 
 def _is_plain_dict(v: object) -> bool:
@@ -89,161 +67,82 @@ def _normalize_user_system(system: object) -> list[dict]:
     return out
 
 
-def _custom_system_text(system: object) -> str | None:
-    """客户端 system → customSystemPrompt 单字符串（bundle 语义 customSystemPrompt?.trim()）。
+def _environment_text() -> str:
+    """构建 environment 动态块（对齐 Magpie packages/zcode/index.mjs environment()）。
 
-    字符串原样（trim 后空 = 无）；数组取 text 块 \n\n 连接。全部为空视为无
-    custom（走默认三块身份路径，对齐 bundle !!o）。
-
-    严格三块（上游 2026-11-02 实弹，与本实现的形状结论一致）：网关校验的是
-    system 的**块结构**（cli_prefix 必须独立成首块），而非逐字内容——实测末块
-    内容可任意（空串 / 仅前缀 / 无前缀均 200）。外来 system 文本只许并入末块
-    内部；追加成第 4 块、或另起独立块，都会破坏形态 → 405 3012。
+    hub 是网关、不掌握下游 agent 的 cwd/git/shell，故按 Magpie 在「未知 place」
+    时的形态省略 cwd/git，只保留 platform / OS Version / untrustedNote 三行；
+    platform 与 OS Version 直接来自本服务伪装的身份常量，与 X-Platform /
+    X-Os-Version 头同源。
     """
-    if system is None:
-        return None
-    if isinstance(system, str):
-        text = system.strip()
-        return text or None
-    if not isinstance(system, list):
-        return None
-    parts: list[str] = []
-    for item in system:
-        if isinstance(item, str):
-            if item.strip():
-                parts.append(item)
-        elif isinstance(item, dict):
-            if item.get("type") == "text" and isinstance(item.get("text"), str) and item.get("text").strip():
-                # cache_control 有意丢弃 —— 见 build_start_plan_system 文档
-                parts.append(item["text"])
-    return "\n\n".join(parts) if parts else None
-
-
-def has_custom_system_prompt(system: object) -> bool:
-    """客户端 system 是否携带 customSystemPrompt（现并入 stable 块，不再走独立形状）。"""
-    return _custom_system_text(system) is not None
-
-
-def build_environment_section(env: dict, model: str | None, provider: str | None) -> str:
-    """Environment Info 段（bundle Eua）：真实运行时值 + powered-by 末行。"""
-    e = _load_sections()["environment"]
+    e = _ZCODE_PROMPT.get("environment") or {}
+    plat_and_arch = (constants.CLIENT_PLATFORM or "darwin-arm64").split("-", 1)
+    plat = plat_and_arch[0] or "darwin"
+    arch = plat_and_arch[1] if len(plat_and_arch) > 1 else "arm64"
     lines = [
-        e["heading"],
-        e["invokedLine"],
-        f"- {e['cwdLabel']}: {env.get('cwd', 'unknown')}",
-        f"- {e['gitLabel']}: {e['gitNo']}",
-        f"- {e['platformLabel']}: {env.get('platform', 'unknown')}",
-        f"- {e['shellLabel']}: {env.get('shell', 'unknown')}",
-        f"- {e['osVersionLabel']}: {env.get('osVersion', 'unknown')}",
+        e.get("heading", "# Environment"),
+        e.get("invokedLine", "You have been invoked in the following environment: "),
+        f" - {e.get('platformLabel', 'Platform')}: {plat}",
+        f" - {e.get('osVersionLabel', 'OS Version')}: {plat} {constants.IDENTITY_OS_VERSION} {arch}",
+        f" - {e.get('untrustedNote', '')}",
     ]
-    model_id = (model or "").strip()
-    if model_id and provider:
-        lines.append(
-            e["poweredByLine"].replace("{provider}", provider).replace("{model}", model_id)
-        )
     return "\n".join(lines)
 
 
-def build_start_plan_system(
-    existing_system: object,
-    model: str | None = None,
-    provider: str | None = None,
-    env: dict | None = None,
-) -> list[dict]:
-    """镜像官方 assembleSystemMessages 的 3 块默认装配；custom system 并入
-    dynamic 合并块尾部（块2 须保持 3.17.2 逐字节官方文本——与 3.17.1 同文，
-    见模块头注释）。
+def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
+    """前置 ZCode 官方 system 三块，并把客户端自身 system 并入末块。幂等。
 
-    env 段值必须与身份头同源（platform/osVersion 与 X-Platform/X-Os-Version
-    一致），混合组合是真实客户端不产生的形状。
+    严格三块 = dress() 逐字节同构（Magpie packages/zcode/index.mjs，ZCode 3.17.2）：
+      block[0] = cliPrefix
+      block[1] = stableSections 两段以 "\\n\\n" 拼接（官方前两块必须逐字节一致）
+      block[2] = "\\n\\n" + join("\\n\\n", [dynamicBehavior, (有 Skill 工具时
+                 sessionGuidance), environment, (有 model 时 poweredBy),
+                 contextManagement, ...客户端自身 system 文本])
+    trial/start-plan 下外来 system 文本只许并入末块内部；追加成第 4 块会破坏
+    形态 → 405 3012 "unusual activity"。11-03 起上游对 body 文本锁版本，前两块
+    与版本头不等价即拒（prompt.mjs 注释）。
     """
-    sec = _load_sections()
-    if not sec:
-        return []
-    custom = _custom_system_text(existing_system)
-    env = env or {}
-    stable = "\n\n".join(sec["stableSections"])
-    dynamic = "\n\n".join([
-        sec["dynamicSections"]["beforeEnvironment"],
-        build_environment_section(env, model, provider),
-        sec["dynamicSections"]["afterEnvironment"],
-    ])
-    if custom is not None:
-        # 2026-10-31 起 WAF 按版本校验块1/块2 文本：stable 块任何追加都会破坏
-        # 逐字节一致性（"an interactive coding agent" 旧措辞与 Desktop Context
-        # 追加段均 405）。custom（官方语义 stable 段）改并入不受校验的块3 尾部，
-        # 线缆仍为 3 块官方形状（Agent2API PR #343 同语义，10-31 实弹 200）。
-        dynamic = "\n\n".join([dynamic, custom])
-    return [
-        {"type": "text", "text": sec["cliPrefix"]},
-        {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": f"\n\n{dynamic}", "cache_control": {"type": "ephemeral"}},
-    ]
-
-
-def build_context_prefix_message(now: datetime.datetime | None = None) -> dict:
-    """meta_user context_prefix（bundle tct+Vre+blt）：首条 user 消息，单 text 块
-    为 <system-reminder> 包裹的 currentDate 段（官方客户端始终携带）。
-    """
-    sec = _load_sections()
-    if not sec:
-        return {}
-    cp = sec["contextPrefix"]
-    date = (now or datetime.datetime.now()).strftime("%Y-%m-%d")
-    current_date = f"{cp['currentDateHeading']}\n{cp['currentDateLine'].replace('{date}', date)}"
-    body = "\n".join([cp["intro"], current_date, "", cp["outro"]])
-    sr = sec["systemReminder"]
-    return {
-        "role": "user",
-        "content": [{"type": "text", "text": f"{sr['open']}{body}{sr['close']}"}],
-    }
-
-
-def resolve_env_info(account=None) -> dict:
-    """Environment 段的真实运行时值。与身份头同源：有账号取其指纹档案
-    （platform/osVersion 与 X-Platform/X-Os-Version 一致），无账号回退全局
-    伪装常量。cwd/shell 取本机真实值（真实客户端 cwd 永不为 unknown）。
-    """
-    from . import constants
-
-    if account is not None:
-        from .fingerprint import profile_for
-
-        profile = profile_for(account)
-        platform = profile.platform
-        os_version = profile.os_version
-    else:
-        platform = constants.CLIENT_PLATFORM.split("-")[0]
-        os_version = constants.IDENTITY_OS_VERSION
-    shell_raw = os.getenv("SHELL") or os.getenv("ComSpec") or ""
-    return {
-        "cwd": os.getcwd(),
-        "platform": platform,
-        "shell": os.path.basename(shell_raw) if shell_raw else "unknown",
-        "osVersion": os_version,
-    }
-
-
-def apply_start_plan_system(body: dict, model: str | None = None, account=None) -> bool:
-    """重写 system 为官方 3.16.3 线缆形状（默认 3 块 / custom 2 块）。
-
-    幂等：首块已是官方 cli_prefix 且块数匹配新形状则跳过（重复变换安全，
-    验证码重试时用同一 body 重建请求）。
-    """
-    sec = _load_sections()
-    if not sec:
+    cli_prefix = _ZCODE_PROMPT.get("cliPrefix")
+    stable = _ZCODE_PROMPT.get("stableSections")
+    if not cli_prefix or not isinstance(stable, list) or len(stable) < 2:
         return False
     existing = body.get("system")
+    # 幂等：首块已是 cliPrefix 则视为已注入
     if isinstance(existing, list) and existing:
         first = existing[0]
-        if (
-            isinstance(first, dict)
-            and first.get("text") == sec["cliPrefix"]
-            and len(existing) in (2, 3)
-        ):
+        if isinstance(first, dict) and first.get("text") == cli_prefix:
             return False
-    provider = "zai-api" if model else None
-    body["system"] = build_start_plan_system(existing, model, provider, resolve_env_info(account))
+
+    def cached(text: str) -> dict:
+        return {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}
+
+    own = [
+        b["text"] for b in _normalize_user_system(existing)
+        if isinstance(b.get("text"), str) and b["text"].strip()
+    ]
+    has_skill = any(
+        isinstance(t, dict) and t.get("name") == "Skill"
+        for t in (body.get("tools") or [])
+    )
+
+    dynamic: list[str] = [str(_ZCODE_PROMPT.get("dynamicBehavior") or "")]
+    if has_skill and _ZCODE_PROMPT.get("sessionGuidance"):
+        dynamic.append(str(_ZCODE_PROMPT["sessionGuidance"]))
+    dynamic.append(_environment_text())
+    if isinstance(model, str) and model.strip():
+        powered = str(_ZCODE_PROMPT.get("poweredBy") or "")
+        if powered:
+            dynamic.append(
+                powered.replace("{provider}", "zai-api").replace("{model}", model.strip())
+            )
+    dynamic.append(str(_ZCODE_PROMPT.get("contextManagement") or ""))
+    dynamic.extend(own)
+
+    body["system"] = [
+        cached(cli_prefix),
+        cached("\n\n".join(str(s) for s in stable)),
+        cached("\n\n" + "\n\n".join(dynamic)),
+    ]
     return True
 
 
@@ -253,10 +152,11 @@ def _is_date_turn_text(text: object) -> bool:
 
 
 def apply_current_date_turn(body: dict) -> bool:
-    """把官方 meta_user 的「当前日期」附件补进首条 user 轮（3.17.1 起不在 system 块里）。
+    """把官方「当前日期」提醒补进首条 user 轮（contextPrefix，Magpie 3.17.2 形态）。
 
-    形态：`<system-reminder>\nToday's date is YYYY-MM-DD.\n</system-reminder>` 的独立 user 轮。
-    幂等：首条消息已是该形态则跳过。
+    形态：`<system-reminder>Today's date is YYYY-MM-DD.</system-reminder>` 的独立
+    user 轮（无换行，逐字节对齐 dress() 的 contextPrefix）。幂等：首条消息已是
+    该形态则跳过。
     """
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -267,7 +167,9 @@ def apply_current_date_turn(body: dict) -> bool:
         if isinstance(content, list) and content and isinstance(content[0], dict):
             if _is_date_turn_text(content[0].get("text")):
                 return False
-    date_text = f"<system-reminder>\nToday's date is {time.strftime('%Y-%m-%d')}.\n</system-reminder>"
+    ctx = _ZCODE_PROMPT.get("context") or {}
+    line = str(ctx.get("currentDateLine") or "Today's date is {date}.")
+    date_text = f"<system-reminder>{line.replace('{date}', time.strftime('%Y-%m-%d'))}</system-reminder>"
     body["messages"] = [
         {"role": "user", "content": [{"type": "text", "text": date_text}]},
         *messages,
@@ -399,18 +301,15 @@ def transform_body(
     body: dict,
     user_id: str | None = None,
     model: str | None = None,
-    account=None,
     device_mid: str | None = None,
     session_id: str | None = None,
 ) -> dict:
     """按 anthropic 通道变换 body（原地修改并返回）。变换失败静默保持原样。
 
-    account 透传（Environment 段与身份头同源）；日期轮在此注入（官方客户端
-    始终携带）。attribution 优先用 device_mid/session_id 组官方 blob，user_id
-    （JWT sub）仅兜底。
+    user_id 为 JWT sub（仅用于兜底）；attribution 优先用 device_mid/session_id 组 blob。
     """
     try:
-        apply_start_plan_system(body, model, account)
+        apply_start_plan_system(body, model)
         apply_cache_control(body)
         apply_current_date_turn(body)
         attribution = attribution_user_id(device_mid, session_id) if (device_mid or session_id) else None
@@ -418,25 +317,6 @@ def transform_body(
             apply_user_id(body, attribution)
         elif user_id:
             apply_user_id(body, user_id)
-        ctx = build_context_prefix_message()
-        msgs = body.get("messages")
-        if ctx and isinstance(msgs, list) and not _has_context_prefix(msgs):
-            msgs.insert(0, ctx)
     except Exception:  # noqa: BLE001 - 变换永不放大请求失败
         pass
     return body
-
-
-def _has_context_prefix(msgs: list) -> bool:
-    """首条 user 消息是否已是 context_prefix（system-reminder 包裹）。幂等判定。"""
-    if not msgs or not isinstance(msgs[0], dict):
-        return False
-    first = msgs[0]
-    if first.get("role") != "user":
-        return False
-    content = first.get("content")
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        return str(content[0].get("text", "")).startswith("<system-reminder>")
-    if isinstance(content, str):
-        return content.lstrip().startswith("<system-reminder>")
-    return False

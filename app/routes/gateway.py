@@ -205,22 +205,22 @@ def _body_meta(body: dict) -> dict:
             "max_tokens": mt if isinstance(mt, int) else None}
 
 
-_CHANNEL_KEYS = ("zai", "zai_plan", "zai_fallback", "bigmodel", "bigmodel_plan")
+_CHANNEL_KEYS = ("zai", "zai_fallback", "bigmodel")
 
 
 def _lane_for(force_fallback: bool, plan_channel: bool, url: str, channel: str = "") -> str:
     """本次尝试实际走的业务通道（监控用）。
 
-    渠道梯语义（v2.9.40）：优先直接用通道键（zai/zai_plan/zai_fallback/
-    bigmodel*）；无键时与成功路径同口径按 url 判（/zcode-plan/ → plan）。
+    渠道语义：优先直接用通道键（zai/zai_fallback/bigmodel）；无键时与成功
+    路径同口径按 url 判（/zcode-plan/ → plan）。plan_std 系通道已随上游
+    df42a2d 移除（OAuth token 打不了标准 Anthropic 端点）。
     force_fallback 仅作旧口径兜底。
     """
     if channel in _CHANNEL_KEYS:
-        # 通道键 → 监控词表（fork 二元 plan/apikey）：plan 系通道（zcode-plan
-        # JWT / plan_std OAuth / bigmodel_plan）都消耗 Plan 套餐额度，统一记
-        # plan；Key 系（zai_fallback / bigmodel）记 apikey。前端 PLAN/KEY 徽章
-        # 与 reqlog 聚合词表不变；plan_std 细分靠 attempt 的 error 文案与 URL。
-        if channel in ("zai", "zai_plan", "bigmodel_plan"):
+        # 通道键 → 监控词表（fork 二元 plan/apikey）：zai（zcode-plan JWT）
+        # 消耗 Plan 套餐额度记 plan；Key 系（zai_fallback / bigmodel）记
+        # apikey。前端 PLAN/KEY 徽章与 reqlog 聚合词表不变。
+        if channel == "zai":
             return "plan"
         return "apikey"
     if url and "/zcode-plan/" in url:
@@ -2554,14 +2554,11 @@ class _Upstream:
 def _channel_ladder(account: Account) -> list[str]:
     """账号渠道优先梯（Magpie 模式）。
 
-    zai：plan_std（oauth access_token @ 标准 Anthropic，免验证码、免 zcode-plan
-         WAF）→ zcode_plan（jwt @ zcode-plan 代理）→ apikey（api.z.ai）；
+    zai：zcode_plan（jwt @ zcode-plan 代理）→ apikey（api.z.ai）；
     bigmodel：bigmodel（api key）。仅当账号确持对应凭证才入梯。
     """
     if account.provider == "zai":
         ladder: list[str] = []
-        if account.supports_plan_std():
-            ladder.append("zai_plan")
         if account.uses_plan_channel():
             ladder.append("zai")
         if bool((account.api_key or "").strip()):
@@ -2603,8 +2600,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     """尝试用单个账号转发，含渠道优先梯、验证码续期与可配置重试。
 
     渠道梯（Magpie 模式，见 _channel_ladder）：
-      zai：plan_std（oauth @ 标准 Anthropic，免验证码/免 WAF）→ zcode_plan
-           （jwt @ zcode-plan 代理）→ apikey（api.z.ai）
+      zai：zcode_plan（jwt @ zcode-plan 代理）→ apikey（api.z.ai）
     错误处理策略（参数见 settings，均可用环境变量调整）：
       - 验证码挑战：清池换码重建请求，最多 MAX_CAPTCHA_RETRIES 次（仅 zcode_plan）
       - 429 频控：**不冷却账号**，按上游 Retry-After（封顶 RETRY_429_WAIT_MAX）
@@ -2666,7 +2662,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
         verify_param = verify_region = None
-        # 仅 zcode-plan（`zai`）渠道用验证码；plan_std / apikey 免码
+        # 仅 zcode-plan（`zai`）渠道用验证码；apikey 免码
         if channel == "zai" and needs_captcha:
             _park_slot(slot_box)
             cap_t0 = time.time()
@@ -2939,20 +2935,6 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
-                # plan_std（标准 Anthropic）401：仅 OAuth token 失效，
-                # JWT 可能仍有效——下沉下一渠道，不判死账号（上游 e038650）
-                if channel in ("zai_plan", "bigmodel_plan"):
-                    reqlog.mark_attempt(req_id, account.name, account.mode,
-                                        channel=_lane_for(False, plan_channel, "", channel=channel), status=401,
-                                        ms=(time.time() - attempt_t0) * 1000, error="标准端点鉴权失败")
-                    account.record_result(False, "标准端点鉴权失败 HTTP 401")
-                    logs.warn(req_id, f"账号 {account.name} 标准端点 {channel} 鉴权失败 401，下沉下一渠道")
-                    if _jump_to_channel():
-                        continue
-                    return _NEXT_ACCOUNT
-                reqlog.mark_attempt(req_id, account.name, account.mode,
-                                    channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
-                                    status=401, ms=(time.time() - attempt_t0) * 1000, error="鉴权失败")
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
                 if _jump_to_fallback():
@@ -2964,19 +2946,6 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
 
             if status_code == 403:
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
-                # plan_std 403 同样仅 OAuth 失效，下沉下一渠道不判死（上游 e038650）
-                if channel in ("zai_plan", "bigmodel_plan"):
-                    reqlog.mark_attempt(req_id, account.name, account.mode,
-                                        channel=_lane_for(False, plan_channel, "", channel=channel), status=403,
-                                        ms=(time.time() - attempt_t0) * 1000, error="标准端点鉴权失败")
-                    account.record_result(False, "标准端点鉴权失败 HTTP 403")
-                    logs.warn(req_id, f"账号 {account.name} 标准端点 {channel} 鉴权失败 403，下沉下一渠道")
-                    if _jump_to_channel():
-                        continue
-                    return _NEXT_ACCOUNT
-                reqlog.mark_attempt(req_id, account.name, account.mode,
-                                    channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
-                                    status=403, ms=(time.time() - attempt_t0) * 1000, error="鉴权拒绝")
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
                 if _jump_to_fallback():

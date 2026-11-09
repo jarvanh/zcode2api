@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 # ── 上游 origin ──────────────────────────────────────────────────────────────
 # Plan 通道（JWT + 验证码）：zcode.z.ai 的 coding-plan 代理端点
@@ -25,18 +26,11 @@ MESSAGES_PATHS = {
     # zai + apiKey 回退通道（免验证码）
     "zai_fallback": "/api/anthropic/v1/messages",
     "bigmodel": "/api/anthropic/v1/messages",
-    # zai + OAuth access_token 打标准 Anthropic 端点（Plan 额度，免验证码、
-    # 免 zcode-plan WAF——Magpie 模式：同 token 实测返回合法 1310 而非 3012）
-    "zai_plan": "/api/anthropic/v1/messages",
-    # bigmodel 后台的 plan 账号走 BigModel 标准 Anthropic 端点（同上）
-    "bigmodel_plan": "/api/anthropic/v1/messages",
 }
 MESSAGES_URLS = {
     "zai": ZCODE_ORIGIN + MESSAGES_PATHS["zai"],
     "zai_fallback": ZAI_API_ORIGIN + MESSAGES_PATHS["zai_fallback"],
     "bigmodel": BIGMODEL_ORIGIN + MESSAGES_PATHS["bigmodel"],
-    "zai_plan": ZAI_API_ORIGIN + MESSAGES_PATHS["zai_plan"],
-    "bigmodel_plan": BIGMODEL_ORIGIN + MESSAGES_PATHS["bigmodel_plan"],
 }
 
 # ── 计费 / 额度端点（quota.py / 未来 claim.py）────────────────────────────────
@@ -59,22 +53,27 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源：官方客户端 3.17.2，2026-11-03 跟进）────────────────
-# 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-# 出处：2026-11-03 本机官方 ZCode Server current.json（appVersion=3.17.2；
-# 前值 3.16.3 为 2026-10-23 实测、3.14.4 为 2026-10-02 实测），Linux 无注册表
-# 改读 current.json。# zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
-# billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，静态基线钉此处，
-# 运行期由 version_tracker 轮询官方 manifest 接口自动更新活跃版本（2.7.16 引入）。
-# ⚠️ 上游按客户端版本门槛投放活动套餐：2026-11-03 实测旧版（3.16.3）打 claim 报
-# 1004「不符合领取条件（no permission）」，跟进 3.17.1 立即成功领取 3 亿 token。
-# 发现 preview 为空或 1004 时优先核对此常量是否落后于官方客户端。
-# 2026-11-03 跟进 3.17.2：块1/2 文本与 3.17.1 逐字节相同（bundle 重组对拍，
-# 见 zcode_sections_3172.json _meta），仅常量/侧车版本号跟进。
-DEFAULT_CLIENT_APP_VERSION = "3.17.2"
+# ── 客户端版本（单一真相源；3.17.2 对齐 Magpie packages/zcode/index.mjs 官方当前版）──
+# 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001。
+# 出处：Magpie packages/zcode/index.mjs APP_VERSION="3.17.2"（ZCode 3.17.2，
+# zai-org/ZCode@a9fe401；prompt.mjs 同源）。前值 3.17.1（2026-11-03 跟进）、
+# 3.16.3（2026-10-29）、3.14.4（2026-10-02）。
+# zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
+# billing；hub 跑 Linux 无注册表，静态基线钉此处，运行期由 version_tracker
+# 轮询官方 manifest 接口自动更新活跃版本。
+# ⚠️ 11-03 起 zcode.z.ai start-plan 对 body 提示词锁版本：版本头与 body 文本
+# 必须同版（prompt.mjs 注释：新版本头 + 旧版本文本 → 405/3012 "unusual activity"）。
+# 发现 preview 为空、1004（领取不落条件）或 405/3012 时优先核对此常量是否落后官方。
+
+# 提示词对齐版本（正文锁）：zcode_system.json 的文本取自该版本客户端。
+# 活跃版本永远不得越过此值——头比正文新就是 405/3012，比"落后一点"更致命。
+# 自动同步 / 手动设置统一由 set_active_version 钳制；真正升级 ZCode 版本时，
+# 先移植 Magpie prompt.mjs 文本进 zcode_system.json，再同步抬高此常量。
+PROMPT_ALIGNED_VERSION = "3.17.2"
+DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
-# bundle 实证（3.17.1）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
+# bundle 实证：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
@@ -193,21 +192,47 @@ MAX_TOKENS_LIMIT = 131072
 # ── 请求头 ───────────────────────────────────────────────────────────────────
 ANTHROPIC_VERSION = "2023-06-01"
 USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"
+# Start Plan messages 的 UA 后缀（官方 anthropic SDK 形状，billing 族不带）：
+# Magpie packages/zcode/index.mjs startHeaders UA = "ZCode/{ver} ai-sdk/anthropic/3.0.81"
+ANTHROPIC_SDK_UA = "ai-sdk/anthropic/3.0.81"
 X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
 X_ZCODE_AGENT = "glm"
 
 
-def set_active_version(new_version: str) -> None:
+def parse_semver(v: str) -> tuple[int, ...]:
+    """提取版本数字用于大小比较，如 '3.17.2' -> (3, 17, 2)。"""
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def is_newer_version(candidate: str, baseline: str) -> bool:
+    """candidate 是否比 baseline 更新（纯数字分量比较）。"""
+    c = parse_semver(candidate)
+    b = parse_semver(baseline)
+    max_len = max(len(c), len(b))
+    c_pad = c + (0,) * (max_len - len(c))
+    b_pad = b + (0,) * (max_len - len(b))
+    return c_pad > b_pad
+
+
+def set_active_version(new_version: str) -> str:
     """动态更新客户端与 billing 伪装版本号（当自动探测发现新版本时）。
 
     规范化：剥离首尾空白与前导 v/V——官方 CFBundleShortVersionString 与
     X-ZCode-App-Version 头均为纯数字形态，"v3.17.2" 会使 UA 变成
     "ZCode/v3.17.2" 产生指纹漂移。
+
+    正文锁：活跃版本永不越过 PROMPT_ALIGNED_VERSION（zcode_system.json 文本
+    所属版本）。上游按「版本头 + system 正文」同版校验，头新于正文即
+    405/3012，故越过时钳制到锁版本，返回实际生效版本。升级客户端必须先移植
+    prompt.mjs 文本并抬高 PROMPT_ALIGNED_VERSION，本函数不提供绕过。
     """
     global CLIENT_APP_VERSION, BILLING_APP_VERSION, USER_AGENT, X_ZCODE_APP_VERSION, CLIENT_CONFIGS_QUERY
     v = str(new_version or "").strip().lstrip("vV").strip()
     if not v:
-        return
+        return CLIENT_APP_VERSION
+    if is_newer_version(v, PROMPT_ALIGNED_VERSION):
+        v = PROMPT_ALIGNED_VERSION
     CLIENT_APP_VERSION = v
     BILLING_APP_VERSION = v
     USER_AGENT = f"ZCode/{v}"
@@ -220,6 +245,7 @@ def set_active_version(new_version: str) -> None:
             settings.USER_AGENT = USER_AGENT
     except (ImportError, AttributeError):
         pass
+    return CLIENT_APP_VERSION
 
 # 无尾斜杠：与 zcode-switch（billing 实证形态）及本服务 billing 头统一，
 # 消除 messages/billing 通道间 Referer 形状抖动

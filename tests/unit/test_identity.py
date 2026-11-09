@@ -14,7 +14,6 @@ import json
 from app import constants
 from app.agent import build_request
 from app.identity import build_identity_headers, build_trace_headers
-from app import identity as identity_module
 from app.models import Account
 
 
@@ -28,7 +27,7 @@ def test_identity_headers_pinned_to_darwin():
     assert h["X-Platform"] == "darwin-arm64"
     assert h["X-Os-Category"] == "macos"
     assert h["X-Os-Version"] == constants.IDENTITY_OS_VERSION
-    assert h["User-Agent"] == constants.USER_AGENT
+    assert h["User-Agent"] == constants.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA
     assert h["X-Device-Mid"]
 
 
@@ -111,12 +110,8 @@ class TestPassthroughFilter:
 
     def test_identity_headers_not_overridable(self):
         headers = self._build({"X-Device-Mid": "spoofed", "User-Agent": "evil"})
-        # LLM 请求不带 X-Device-Mid（bundle g6n 实证，2026-10-24 形状修复）；
-        # UA 为本服务自构造（含 SDK 后缀），客户端伪造值被丢弃。
-        assert "X-Device-Mid" not in headers
-        assert headers["User-Agent"] == (
-            f"{constants.USER_AGENT} {identity_module.ANTHROPIC_SDK_UA}"
-        )
+        assert headers["X-Device-Mid"] != "spoofed"
+        assert headers["User-Agent"] == constants.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA
 
     def test_lowercase_client_hop_headers_dropped(self):
         """Starlette dict(request.headers) 键全小写。cookie/referer/origin 等

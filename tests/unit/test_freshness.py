@@ -1,4 +1,6 @@
-"""system sidecar 文本新鲜度状态机（2026-10-31 文本校验波次防复发）。
+"""system 提示词真源新鲜度状态机（2026-10-31 文本校验波次防复发；
+2026-11-09 v2.9.41 随上游 ebbc73e 将探测对象从旧 sidecar 切到
+zcode_system.json 的 _meta，并新增 PROMPT_ALIGNED_VERSION 一致性）。
 
 锁三件事：_meta 缺失/版本不齐/超龄任一命中即 stale；全对齐 + 未超龄 =
 fresh；巡检结果落 meta 表供 admin API / healthcheck 读取。
@@ -25,10 +27,8 @@ def _isolated_sections(monkeypatch):
     """
     holder: dict = {"meta": {}}
 
-    def fake_load():
-        return {"_meta": holder["meta"], "cliPrefix": "x"}
-
-    monkeypatch.setattr(freshness, "_load_sections", fake_load)
+    monkeypatch.setattr(freshness, "_ZCODE_PROMPT",
+                        {"_meta": holder["meta"], "cliPrefix": "x"})
     monkeypatch.setattr(freshness.hostinfo, "local_client_version",
                         lambda: constants.CLIENT_APP_VERSION)
     yield holder
@@ -48,6 +48,20 @@ def test_version_mismatch_with_gateway_is_stale(_isolated_sections):
     st = freshness.status()
     assert st["stale"]
     assert any("≠ 网关身份版本" in p for p in st["problems"])
+
+
+def test_prompt_aligned_mismatch_is_stale(_isolated_sections):
+    """正文锁版本与 _meta 不同步（只抬 PROMPT_ALIGNED_VERSION 没移植文本）必须告警。"""
+    _isolated_sections["meta"] = _meta()
+    monkeypatch_obj = constants
+    old = constants.PROMPT_ALIGNED_VERSION
+    constants.PROMPT_ALIGNED_VERSION = "3.18.0"
+    try:
+        st = freshness.status()
+        assert st["stale"]
+        assert any("提示词正文版本" in p for p in st["problems"])
+    finally:
+        constants.PROMPT_ALIGNED_VERSION = old
 
 
 def test_fresh_when_aligned_and_recent(_isolated_sections):

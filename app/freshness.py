@@ -1,20 +1,24 @@
-"""system sidecar 文本新鲜度 —— 2026-10-31 WAF 文本校验波次的防复发哨兵。
+"""system 提示词真源新鲜度 —— 2026-10-31 WAF 文本校验波次的防复发哨兵。
 
 背景：上游按当前官方版本逐字节校验 system 块1（cli_prefix）与块2（stable）
-文本（见 body_transform 模块头）。sidecar 是手工跟进的镜像，官方升版后会
-悄悄过时——405 在日志里只表现为风控波次，没人会第一时间怀疑到措辞
-（2026-10-31 实弹定位：base 405 / 3.17.1 块1+2 + 3.16.3 块3 200）。
+文本，11-03 起更是「版本头 + 正文」同版校验（头新于正文即 405/3012）。
+提示词真源（app/zcode_system.json，_ZCODE_PROMPT）是手工跟进的移植，官方
+升版后会悄悄过时——405 在日志里只表现为风控波次，没人会第一时间怀疑到
+措辞（2026-10-31 实弹定位：base 405 / 3.17.1 块1+2 + 3.16.3 块3 200）。
 
-与既有防线的关系：
-  - 措辞锁死单测（tests/unit/test_body_transform_system.py）挡「改错」；
+与既有防线的关系（2026-11-09 v2.9.41 随上游 ebbc73e 重挂）：
+  - constants.PROMPT_ALIGNED_VERSION 正文锁挡「版本头越过正文」
+    （set_active_version 自动钳制，version_tracker 只提示不顶版）；
   - main._warn_version_drift 挡「网关身份常量落后本机官方客户端」；
-  - 本模块挡「sidecar 镜像落后官方」：版本比对 + captured_at 年龄 + 每日
-    巡检落 meta 表（admin API / healthcheck 读），风控波次确认点调
-    stale_hint() 叠加「高度疑似措辞触发」提示。
+  - 本模块挡「真源移植落后官方」：_meta 版本比对（身份/正文/billing 三常量
+    与 _meta 四方一致性）+ captured_at 年龄 + 每日巡检落 meta 表（admin API /
+    healthcheck 读），风控波次确认点调 stale_hint() 叠加「高度疑似措辞触发」。
 
 无远端「最新客户端版本」端点可查（configs 响应不含版本），故「过时」判定
-用三类本地信号：sidecar 版本 ≠ 网关身份版本、本机官方客户端版本 ≠ sidecar
-版本（检测得到才有此信号）、captured_at 年龄超阈值。任一命中即 stale。
+用三类本地信号：_meta 版本 ≠ 网关身份/正文锁版本、本机官方客户端版本 ≠
+_meta 版本（检测得到才有此信号）、captured_at 年龄超阈值。任一命中即 stale。
+
+历史字段名 sidecar_* 保留（前端 accounts.html 措辞与既有 API 消费方不变）。
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ import json
 import time
 
 from . import constants, hostinfo, logs, settings
-from .body_transform import _load_sections
+from .body_transform import _ZCODE_PROMPT
 from .store import store
 
 _FRESHNESS_KEY = "sections_freshness"
@@ -35,9 +39,8 @@ _task: asyncio.Task | None = None
 
 
 def sections_meta() -> dict:
-    """sidecar _meta（client_version / captured_at / source）；缺失返回 {}。"""
-    sec = _load_sections() or {}
-    meta = sec.get("_meta")
+    """真源 _meta（client_version / captured_at / source）；缺失返回 {}。"""
+    meta = _ZCODE_PROMPT.get("_meta") if isinstance(_ZCODE_PROMPT, dict) else None
     return meta if isinstance(meta, dict) else {}
 
 
@@ -51,15 +54,23 @@ def status() -> dict:
 
     problems: list[str] = []
     age_days: int | None = None
+    if not isinstance(_ZCODE_PROMPT, dict) or not _ZCODE_PROMPT:
+        problems.append("提示词真源 zcode_system.json 加载失败（_ZCODE_PROMPT 为空），"
+                        "system 三块注入不生效，请求会被上游 405/3012")
     if not sidecar_ver or not captured_at:
-        problems.append("sidecar 缺 _meta(client_version/captured_at)，无法自证对齐版本")
+        problems.append("真源缺 _meta(client_version/captured_at)，无法自证对齐版本")
     else:
-        if sidecar_ver != constants.CLIENT_APP_VERSION:
-            problems.append(
-                f"sidecar 版本 {sidecar_ver} ≠ 网关身份版本 {constants.CLIENT_APP_VERSION}"
-            )
+        for label, val in (
+            ("网关身份版本", constants.CLIENT_APP_VERSION),
+            ("提示词正文版本", constants.PROMPT_ALIGNED_VERSION),
+        ):
+            if sidecar_ver != val:
+                problems.append(
+                    f"真源版本 {sidecar_ver} ≠ {label} {val}"
+                    + ("（正文锁与 _meta 必须同升）" if label.startswith("提示词") else "")
+                )
         if local_ver and local_ver != sidecar_ver:
-            problems.append(f"本机官方客户端 {local_ver} ≠ sidecar {sidecar_ver}，官方可能已升版")
+            problems.append(f"本机官方客户端 {local_ver} ≠ 真源 {sidecar_ver}，官方可能已升版")
     # billing 侧一致性（claim/billing 全链路用 BILLING_APP_VERSION）：只改一个
     # 常量的「半更新」正是 2026-10-31 那轮「领取失败/措辞过时」的组合病因
     if constants.BILLING_APP_VERSION != constants.CLIENT_APP_VERSION:
@@ -72,11 +83,11 @@ def status() -> dict:
         age_days = max(0, (now - captured).days)
         if age_days > settings.SECTIONS_STALE_DAYS:
             problems.append(
-                f"sidecar 已 {age_days} 天未跟进（阈值 {settings.SECTIONS_STALE_DAYS}）"
+                f"提示词真源已 {age_days} 天未跟进（阈值 {settings.SECTIONS_STALE_DAYS}）"
             )
     except ValueError:
         if captured_at:
-            problems.append(f"sidecar captured_at 格式非法: {captured_at!r}")
+            problems.append(f"真源 captured_at 格式非法: {captured_at!r}")
 
     return {
         "sidecar_client_version": sidecar_ver,
@@ -96,9 +107,9 @@ def check_and_record() -> dict:
     st = status()
     store.set_setting(_FRESHNESS_KEY, json.dumps(st, ensure_ascii=False))
     if st["stale"]:
-        logs.warn("freshness", "system sidecar 文本疑似过时: " + "; ".join(st["problems"]))
+        logs.warn("freshness", "system 提示词真源疑似过时: " + "; ".join(st["problems"]))
     else:
-        logs.info("freshness", f"sidecar 对齐官方 {st['sidecar_client_version']}"
+        logs.info("freshness", f"提示词真源对齐官方 {st['sidecar_client_version']}"
                                f"（captured {st['captured_at']}）")
     return st
 
@@ -128,9 +139,9 @@ def refresh() -> dict:
         store.set_setting(_FRESHNESS_KEY, json.dumps(st, ensure_ascii=False))
     if prev is None or sig != prev_sig:
         if st["stale"]:
-            logs.warn("freshness", "system sidecar 文本疑似过时: " + "; ".join(st["problems"]))
+            logs.warn("freshness", "system 提示词真源疑似过时: " + "; ".join(st["problems"]))
         else:
-            logs.info("freshness", f"sidecar 对齐官方 {st['sidecar_client_version']}"
+            logs.info("freshness", f"提示词真源对齐官方 {st['sidecar_client_version']}"
                                    f"（captured {st['captured_at']}）")
     return st
 
