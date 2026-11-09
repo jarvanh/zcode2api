@@ -83,8 +83,8 @@ def _clamp_budget_to_model(budget: int, model: str) -> int:
 def _inject_glm53(body: dict, payload: dict, explicit: object) -> None:
     """GLM-5.3 家族：注入 thinking{enabled,budget} + output_config{effort}。
 
-    - 显式 thinking:{type:disabled} 原样保留（flash 上确实生效；对 5.3 是
-      最接近关思考的可用信号，不在网关层改写成档位）；
+    - 显式 thinking:{type:disabled} 原样保留（客户端若真要关，按官方语义透传；
+      上游对 5.3 会回 400 code 1210，由客户端自行决定是否改档）；
     - reasoning_effort: none/minimal 也走档位通道映射到 low（disabled 对
       5.3 无效，实测仍回思考）；
     - 显式预算 > 0 优先，档位预算兜底；output_config 恒附（缺它上游无视
