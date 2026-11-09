@@ -12,6 +12,7 @@ import time
 import pytest
 
 from app import identity as identity_module
+from app import constants, settings as app_settings
 from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
@@ -240,10 +241,13 @@ class TestBuildRequest:
         # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/production
         assert headers["X-Title"] == "Z Code@electron"
         assert headers["X-Release-Channel"] == "production"
-        # LLM 请求不带 X-Device-Mid（bundle g6n 实证，2026-10-24 形状修复；
-        # 3.16.3 bundle Y2/gjs 复核维持）；UA 带 anthropic SDK 后缀（g6n/Y2 形状）
-        assert "X-Device-Mid" not in headers
-        assert headers["User-Agent"].endswith(identity_module.ANTHROPIC_SDK_UA)
+        # v2.9.41 头形状随上游 ebbc73e 对齐 Magpie packages/zcode startHeaders
+        # （ZCode 3.17.2）：带 X-Device-Mid（与 attribution blob 同源同值）；
+        # UA = USER_AGENT + SDK 后缀（build_identity_headers 统一拼接）
+        assert headers["X-Device-Mid"]
+        assert headers["User-Agent"] == (
+            app_settings.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA
+        )
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 
     def test_apikey_routes_to_fallback(self):

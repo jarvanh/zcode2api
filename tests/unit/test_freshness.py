@@ -27,8 +27,9 @@ def _isolated_sections(monkeypatch):
     """
     holder: dict = {"meta": {}}
 
-    monkeypatch.setattr(freshness, "_ZCODE_PROMPT",
-                        {"_meta": holder["meta"], "cliPrefix": "x"})
+    # patch sections_meta（调用时求值）而非 _ZCODE_PROMPT（静态引用在 patch 时
+    # 固化 holder["meta"] 的当时值，用例后续赋值会读不到——v2.9.41 教训）。
+    monkeypatch.setattr(freshness, "sections_meta", lambda: holder["meta"])
     monkeypatch.setattr(freshness.hostinfo, "local_client_version",
                         lambda: constants.CLIENT_APP_VERSION)
     yield holder
