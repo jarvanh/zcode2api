@@ -421,16 +421,24 @@ def _date_plan_candidates(now: float | None = None) -> list[str]:
     preview 静默空窗、且池内没有任何账号已入账该套餐时，这是网关唯一能自己
     发现投放的渠道——否则每次都要主人先在官方客户端手动领一个，id 才会被
     balance 收割进候选池（2026-11-02 实证）。
+
+    2026-11-09 增补 `-global` 变体：当日主 id 上游响应 1001（不存在）、
+    而 `…-1109-global` 出现 429（有响应/名额/限流）——命名规律出现了新后缀，
+    猜测器必须覆盖，否则白天投放窗口全漏。探测有每日预算收口，多出的候选
+    只在预算内多打几个 1001 探测（无验证码消耗），代价可控。
     """
     ts = time.time() if now is None else now
     local = time.localtime(ts)
     today = time.strftime("%m%d", local)
-    out = [f"zcode-v3-start-plan-{today}"]
+    base = f"zcode-v3-start-plan-{today}"
+    out = [base]
     if local.tm_wday in (4, 5, 6):  # 周五~周日：周末活动
         # 后缀形态（…-1030-wk）为 10 月起现行；前缀（…-wk-0905）为 9 月实证
         # 旧形——两种都试，官方改回也不漏（feed 上线后这只是廉价保险）。
-        out.append(f"zcode-v3-start-plan-{today}-wk")
+        out.append(f"{base}-wk")
         out.append(f"zcode-v3-start-plan-wk-{today}")
+    # 2026-11-09 实测新后缀：主 id 1001 而 …-global 429 → 上游在用 global 位
+    out.append(f"{base}-global")
     return list(dict.fromkeys(out))
 
 
