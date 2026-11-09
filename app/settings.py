@@ -321,7 +321,15 @@ UPSTREAM = {
     "zai": os.getenv("ZAI_UPSTREAM_URL", constants.MESSAGES_URLS["zai"]),
     "zai_fallback": os.getenv("ZAI_FALLBACK_URL", constants.MESSAGES_URLS["zai_fallback"]),
     "bigmodel": os.getenv("BIGMODEL_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel"]),
+    "zai_plan": os.getenv("ZAI_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["zai_plan"]),
+    "bigmodel_plan": os.getenv("BIGMODEL_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel_plan"]),
 }
+
+# 跨 provider 降级顺序（Magpie 模式）：当前 provider 池无可用号时按此顺序下沉。
+# 首个为默认路由 provider；裸模型名与 zai/ 前缀均落在 providers[0]。
+PROVIDER_FALLBACK_ORDER = tuple(
+    os.getenv("ZCODE_PROVIDER_FALLBACK_ORDER", "zai,bigmodel").replace(" ", "").split(",")
+) if os.getenv("ZCODE_PROVIDER_FALLBACK_ORDER") else ("zai", "bigmodel")
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
@@ -350,7 +358,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.39"
+APP_VERSION = "2.9.40"
 
 # system sidecar 文本新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # sidecar _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

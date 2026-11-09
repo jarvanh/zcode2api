@@ -762,7 +762,10 @@ class RiskLaneProbeMonitor:
         except Exception:  # noqa: BLE001 - 验证码池不可用不阻塞探测
             verify_param = None
         try:
-            url, headers, payload = build_request(acc, body, verify_param, force_plan=True)
+            # 渠道梯语义（v2.9.40）：探测轮要测的是 plan 腿（zcode-plan JWT 通道）
+            # 通了没，必须显式指定 zai 通道顶过自动路由 —— 但上游 401 已改为
+            # 下沉而非判死（build_request 不再抛「缺 JWT」，此处异常仅剩配置错）。
+            url, headers, payload = build_request(acc, body, verify_param, upstream_key="zai")
         except Exception as err:  # noqa: BLE001
             logs.warn("risk-probe", f"账号 {acc.name} 构建 plan 探测请求失败: {err}")
             return False

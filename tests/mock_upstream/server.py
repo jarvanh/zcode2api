@@ -263,6 +263,15 @@ def build_app() -> FastAPI:
             # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
+        if scenario == "quota_exhausted_1310":
+            # Magpie 模式实测形态（上游 e038650）：标准 Anthropic 端点对周/月使用上限回
+            # HTTP 200 + {"code":1310,"msg":"您已达到每周使用上限，将于 2026-11-15 23:59 重置"}
+            return 200, {
+                "code": 1310,
+                "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",
+            }, {}
+        # risk_control_3012_200 场景在上方 fork 已定义（200 承载业务码 3012），
+        # 上游重复追加的同一场景不再重复。
         if scenario == "business_error_200_unknown":
             return 200, {"code": 3006, "msg": "model not allowed"}, {}
         if scenario == "server_error":

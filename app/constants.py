@@ -25,11 +25,18 @@ MESSAGES_PATHS = {
     # zai + apiKey 回退通道（免验证码）
     "zai_fallback": "/api/anthropic/v1/messages",
     "bigmodel": "/api/anthropic/v1/messages",
+    # zai + OAuth access_token 打标准 Anthropic 端点（Plan 额度，免验证码、
+    # 免 zcode-plan WAF——Magpie 模式：同 token 实测返回合法 1310 而非 3012）
+    "zai_plan": "/api/anthropic/v1/messages",
+    # bigmodel 后台的 plan 账号走 BigModel 标准 Anthropic 端点（同上）
+    "bigmodel_plan": "/api/anthropic/v1/messages",
 }
 MESSAGES_URLS = {
     "zai": ZCODE_ORIGIN + MESSAGES_PATHS["zai"],
     "zai_fallback": ZAI_API_ORIGIN + MESSAGES_PATHS["zai_fallback"],
     "bigmodel": BIGMODEL_ORIGIN + MESSAGES_PATHS["bigmodel"],
+    "zai_plan": ZAI_API_ORIGIN + MESSAGES_PATHS["zai_plan"],
+    "bigmodel_plan": BIGMODEL_ORIGIN + MESSAGES_PATHS["bigmodel_plan"],
 }
 
 # ── 计费 / 额度端点（quota.py / 未来 claim.py）────────────────────────────────
@@ -149,6 +156,17 @@ MODEL_NAME_MAP = {
 BIGMODEL_OPENAI_MODELS = ("glm-4.5-air", "glm-4.6v", "glm-4.7")
 # /v1/models 回退名单（capabilities 并集取不到时使用）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
+# provider 命名空间模型目录（Magpie 模式：`zai/GLM-5.3` 前缀供外部 Agent 选 provider；
+# 裸名仍向后兼容，默认路由 zai）
+# provider 命名空间模型目录（Magpie 模式，上游 e038650）：`zai/GLM-5.3` 前缀
+# 供外部 Agent 选 provider；裸名仍向后兼容，默认路由 zai。仅作 /v1/models
+# 池空时的展示回退；实际允许的模型由账号 entitlements 动态判定。
+MODEL_CATALOG_NAMESPACED = [
+    "zai/GLM-5.3-Flash",
+    "zai/GLM-5.3",
+    "bigmodel/GLM-5.3-Flash",
+    "bigmodel/GLM-5.3",
+]
 
 # 展示规格目录（context/max_output 同步自 zcode-api src/provider/models.ts，
 # 规格源自 ZCode 3.11.2 桌面端目录）。仅作 /v1/models 展示补充；实际允许
@@ -232,11 +250,12 @@ EXHAUST_HTTP_STATUSES = (402,)
 # 文案（含风控/验证码页）都会被判成「额度用完」而把号踢成 EXHAUSTED——比漏判更糟。
 # 改为 ① 业务码（Plan 通道 {"code":1005,"msg":"exceed quota limit"} 实测形态）
 #      ② 定量短语（完整词 + 明确的无额度语义），不再用裸词。
-EXHAUST_BUSINESS_CODES = (1005, 1113)   # 1005 exceed quota limit / 1113 无余额
+EXHAUST_BUSINESS_CODES = (1005, 1113, 1310)   # 1005 exceed quota limit / 1113 无余额 / 1310 周/月使用上限
 EXHAUST_KEYWORDS = (
     "exceed quota", "quota limit", "quota exceeded", "quota exhausted",
     "insufficient balance", "insufficient quota", "no balance",
     "额度已用完", "额度用完", "额度不足", "余额不足", "余额已用完", "无余额",
+    "使用上限", "weekly limit", "monthly limit", "rate limit exceeded",
 )
 # 验证码挑战：HTTP 403 + 文案，或 HTTP 400 + body {"code":3007}（docs 05 §被拒信号表）
 # 注意：403 不再无条件判 invalid —— 需先排除验证码挑战（captcha/verify 文案或
