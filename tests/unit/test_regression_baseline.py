@@ -35,6 +35,16 @@ class TestNormalizeBody:
         body = {"model": "bigmodel/GLM-5.2"}
         assert _normalize_body(body)["model"] == "GLM-5.3"
 
+    def test_provider_prefix_stripped_when_alias_unchanged(self):
+        # 回归（v2.9.44）：前缀剥离后映射结果与裸名相同 → 旧实现不写回，
+        # zai/ 前缀被原样透传，上游 3006。必须无条件写回剥前缀后的模型名。
+        body = {"model": "zai/GLM-5.3-Flash"}
+        assert _normalize_body(body)["model"] == "GLM-5.3-Flash"
+
+    def test_provider_prefix_stripped_lowercase_alias(self):
+        body = {"model": "zai/glm-5.3-flash"}
+        assert _normalize_body(body)["model"] == "GLM-5.3-Flash"
+
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
         assert _normalize_body(body)["model"] == "glm-unknown"

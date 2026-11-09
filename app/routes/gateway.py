@@ -336,6 +336,9 @@ def _detect_provider(body: dict, headers) -> str:
 def _normalize_body(body: dict) -> dict:
     model = body.get("model")
     if isinstance(model, str) and "/" in model:
+        # Magpie 命名空间前缀（zai/、bigmodel/）只用于路由识别，上游不认；
+        # 必须无条件剥掉并写回——否则映射后名称恰好不变时（如
+        # zai/GLM-5.3-Flash → GLM-5.3-Flash）前缀会被原样透传，上游 3006。
         model = "/".join(model.split("/")[1:])
     if isinstance(model, str):
         # 先按大小写别名改写，再兜底「已退役型号」→ 当前主力型号。上游对退役名
@@ -344,7 +347,7 @@ def _normalize_body(body: dict) -> dict:
         mapped = constants.RETIRED_MODEL_ALIASES.get(mapped, mapped)
         if mapped != model:
             logs.warn("gateway", f"模型 {model} → {mapped}（别名/退役型号改写）")
-            body["model"] = mapped
+        body["model"] = mapped
 
     # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间并记录钳制动作
     raw = body.get("max_tokens")

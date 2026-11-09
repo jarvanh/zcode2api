@@ -165,6 +165,15 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 - **网关鉴权（可选）**：在「设置」配置「网关 API Key」后，`/v1/messages` 与 `/v1/chat/completions` 须携带
   `Authorization: Bearer <key>` 或 `x-api-key: <key>`；留空则不校验。
 
+## 思考档（GLM-5.3 家族）
+
+- GLM-5.3 / GLM-5.3-Flash 是恒思考模型，默认带 thinking；ZCode 目录默认档位为 **max**。
+- OpenAI 兼容入口（`/v1/chat/completions`、`/v1/responses`）：未传 `reasoning_effort` 时按 **max** 注入
+  （thinking 32K 预算 + `output_config.effort=max`），预算加在 `max_tokens` 之外并按模型输出上限截顶。
+- Anthropic 原生入口（`/v1/messages`）：保持透传，由官方客户端自行控制 thinking 与预算；上游目录默认档位为 max。
+- 客户端只取 `text` 块时注意：小 `max_tokens` 会被思考吃满，出现 HTTP 200 但正文为空；直连原生入口或关闭
+  `ZCODE_THINKING_COMPAT` 时建议 `max_tokens` ≥ 1024。
+
 ## 环境变量
 
 `cp .env.example .env` 后按需修改（.env 永不入库）：
@@ -180,7 +189,7 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
 | `ZCODE_CLAIM_ROUND_INTERVAL` | 600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
-| `ZCODE_THINKING_COMPAT` | 1 | 思考预算契约（GLM-5.3 家族恒思考，小 max_tokens 会被吃光）：注入 thinking+output_config，max_tokens += 预算再截顶，thinking 开启时剔除采样参数；0 = 直传 |
+| `ZCODE_THINKING_COMPAT` | 1 | 思考预算契约（GLM-5.3 家族恒思考，默认 max 档）：注入 thinking+output_config，max_tokens += 预算再截顶，thinking 开启时剔除采样参数；0 = 直传 |
 | `ZCODE_ENDPOINT_ROUTING` | 1 | 端点映射跟随：周期拉 agent/configs 的 proxyEndpoint.mapping 表按上游指令改写推理端点（fail-open，不匹配原样放行）；0 = 关闭 |
 | `ZCODE_SESSION_OBSERVE` | 1 | 会话亲和观测档：reqlog 落会话键/复见标记与 cache_read，不改行为；`GET /admin/api/session-affinity` 看对比 |
 | `ZCODE_SESSION_AFFINITY` | 1 | 会话亲和 enforce 档：同会话转发稳定 x-session-id（六件 attribution 形状不变），提上游 prompt cache 命中；0 = 关闭 |
