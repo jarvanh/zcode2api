@@ -286,19 +286,20 @@ class TestDatePlanCandidates:
         return time.mktime((2026, m, d, 12, 0, 0, 0, 0, -1))
 
     def test_weekday_plain_id(self):
+        # 2026-11-09 起 -global 常驻（当日主 id 1001 而 …-global 429 实证）
         assert _date_plan_candidates(self._ts(11, 2)) == [
-            "zcode-v3-start-plan-1102"]
+            "zcode-v3-start-plan-1102", "zcode-v3-start-plan-1102-global"]
 
     def test_friday_includes_weekend_variants(self):
         # 后缀（…-1030-wk）为 10 月现行；前缀（…-wk-0905）为 9 月实证旧形
         assert _date_plan_candidates(self._ts(10, 30)) == [
             "zcode-v3-start-plan-1030", "zcode-v3-start-plan-1030-wk",
-            "zcode-v3-start-plan-wk-1030"]
+            "zcode-v3-start-plan-wk-1030", "zcode-v3-start-plan-1030-global"]
 
     def test_sunday_includes_weekend_variants(self):
         assert _date_plan_candidates(self._ts(11, 1)) == [
             "zcode-v3-start-plan-1101", "zcode-v3-start-plan-1101-wk",
-            "zcode-v3-start-plan-wk-1101"]
+            "zcode-v3-start-plan-wk-1101", "zcode-v3-start-plan-1101-global"]
 
 
 @pytest.mark.asyncio
