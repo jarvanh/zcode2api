@@ -28,6 +28,11 @@ from httpx import ASGITransport, AsyncClient
 # 故此处先占位成测试基线值：后台 key 用代码默认 zcode，网关 key 置空。
 os.environ["ZCODE_ADMIN_KEY"] = "zcode"
 os.environ["ZCODE_GATEWAY_KEY"] = ""
+# 领取窗口默认值：生产 .env 通常配 ZCODE_CLAIM_ROUND_HOURS=19,20,21,22,23,0，
+# load_dotenv() 会把 test_claim_window 的「默认 = [19]」基线顶掉（2026-11-10
+# 实证两例稳定失败）。与 admin/gateway key 同样钉回代码默认，测试要覆盖
+# env 行为时用 monkeypatch.setattr(settings, ...) 显式改。
+os.environ["ZCODE_CLAIM_ROUND_HOURS"] = "19"
 
 from app import constants, settings
 from tests.mock_upstream import server as mock_server_module
