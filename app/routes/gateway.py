@@ -701,52 +701,45 @@ def _apply_risk_strike(account: Account, signal: str, req_id: str,
     return note
 
 
-_pool_starved_alert_at: float = 0.0  # 上次「整池断粮」告警时刻（边沿 + 防抖）
-_POOL_STARVED_DEBOUNCE = 3600.0  # 断粮持续期 1h 提醒一次（恢复即清）
+_pool_starved_since: float = 0.0  # 整池断粮起始时刻（0=健康，边沿判定用）
+_pool_starved_logged_at: float = 0.0  # 上次记录断粮的时刻（持续期防抖）
+_POOL_STARVED_DEBOUNCE = 3600.0  # 断粮持续期 1h 记一次（恢复即清）
 
 
-def _maybe_alert_pool_starved(provider: str, model_key: str) -> None:
-    """整池断粮边沿告警（2026-11-09 主人要求）：全池 exhausted 且上游无可领
-    套餐（_recovery 判 quota）时发 TG，1h 防抖；额度恢复时发恢复通知。
+def _note_pool_starved(provider: str, model_key: str) -> None:
+    """整池断粮边沿记录（2026-11-10 主人要求：只写服务日志，不再发 TG）。
+
+    触发：全池 exhausted 且上游无可领套餐（_recovery 判 quota）→ warn 记开始，
+    持续期每 1h 记一次；额度恢复（首个上游成功）→ info 记结束并带持续时长。
+    TG 通知已下线（曾因恢复不防抖刷屏），需要看断粮就 grep 日志：
+    `journalctl --user -u zcode2api | grep 整池断粮`。
     best-effort，绝不影响请求。
     """
-    global _pool_starved_alert_at
-    now = time.time()
+    global _pool_starved_since, _pool_starved_logged_at
     try:
-        import os
-        import urllib.parse
-
-        def _env(k: str) -> str:
-            return os.environ.get(k, "")
-
-        token = _env("TELEGRAM_BOT_TOKEN_ALERT") or _env("TELEGRAM_BOT_TOKEN")
-        chat = _env("TELEGRAM_CHAT_ID_ALERT") or _env("TELEGRAM_CHAT_ID")
-        if not token or not chat:
-            return
+        now = time.time()
         accts = store.list_accounts(provider)
         starving = bool(accts) and all(
             (not a.enabled) or a.status == Status.EXHAUSTED for a in accts
         ) and any(a.enabled and a.status == Status.EXHAUSTED for a in accts)
         if starving:
-            if now - _pool_starved_alert_at < _POOL_STARVED_DEBOUNCE:
-                return
-            _pool_starved_alert_at = now
-            text = ("🚨 zcode2api 整池断粮\n"
-                    f"全部账号额度用尽且上游暂无可领套餐（模型 {model_key or '全部'}）\n"
-                    "自动领取轮持续探测中（600s 一轮）；上游投放后自动恢复\n"
-                    "如需立即恢复：官方客户端手动领一次套餐即可")
+            if not _pool_starved_since:
+                _pool_starved_since = _pool_starved_logged_at = now
+                logs.warn("pool", f"整池断粮开始：全部账号额度用尽且上游无可领套餐"
+                                  f"（模型 {model_key or '全部'}），自动领取轮持续探测中")
+            elif now - _pool_starved_logged_at >= _POOL_STARVED_DEBOUNCE:
+                _pool_starved_logged_at = now
+                held = int((now - _pool_starved_since) // 60)
+                logs.warn("pool", f"整池断粮持续 {held} 分钟"
+                                  f"（模型 {model_key or '全部'}），上游仍无套餐")
         else:
-            if not _pool_starved_alert_at:
+            if not _pool_starved_since:
                 return
-            _pool_starved_alert_at = 0.0
-            text = "✅ zcode2api 额度已恢复（整池断粮解除，请求可正常服务）"
-        body = urllib.parse.urlencode({"chat_id": chat, "text": text[:3800]}).encode()
-        urllib.request.urlopen(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=body, timeout=10).read()
-        logs.warn("pool", f"断粮告警已推送（{'断粮' if starving else '恢复'}）")
-    except Exception as err:  # noqa: BLE001 - 告警失败绝不影响请求
-        logs.warn("pool", f"断粮告警推送失败（忽略）: {err}")
+            held = int((now - _pool_starved_since) // 60)
+            _pool_starved_since = _pool_starved_logged_at = 0.0
+            logs.info("pool", f"额度已恢复（断粮持续 {held} 分钟），请求可正常服务")
+    except Exception as err:  # noqa: BLE001 - 记录失败绝不影响请求
+        logs.warn("pool", f"断粮状态记录失败（忽略）: {err}")
 
 
 def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
@@ -783,7 +776,7 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
     if model_wait and (not lane_wait or model_wait <= lane_wait):
         return "model", model_wait
     if quota_wait and (not lane_wait or quota_wait <= lane_wait):
-        _maybe_alert_pool_starved(provider, model_key)
+        _note_pool_starved(provider, model_key)
         return "quota", quota_wait
     if lane_wait:
         return "lane", lane_wait
@@ -2009,8 +2002,8 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                 continue
             if isinstance(result, _Upstream):
                 _busy_gate_clear(account.id)  # 上游通了：撤本地排队闸（v2.9.32）
-                if _pool_starved_alert_at:
-                    _maybe_alert_pool_starved(provider, model_key)  # 额度恢复边沿
+                if _pool_starved_since:
+                    _note_pool_starved(provider, model_key)  # 额度恢复边沿
                 if ctx_info.key:
                     affinity_manager.bind(ctx_info.key, account.id)
                 held = slot_box[0]
