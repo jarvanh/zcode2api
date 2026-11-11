@@ -154,9 +154,32 @@ function toggleReleaseNotes(){
   }
 }
 
+function _verParts(v){
+  return String(v || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+}
+function _verCmp(a, b){
+  const x = _verParts(a), y = _verParts(b);
+  for(let i = 0; i < Math.max(x.length, y.length); i++){
+    const d = (x[i] || 0) - (y[i] || 0);
+    if(d) return d;
+  }
+  return 0;
+}
+function _latestKnown(d){
+  // 两个「官方」口径：桌面端 electron 稳定清单（zcode_latest_version）与本机
+  // 官方运行时（zcode_local_official_version）；取较高者展示，避免清单滞后
+  // 时把已更新的运行时误报成「已是最新版」。
+  const cands = [d.zcode_latest_version, d.zcode_local_official_version].filter(Boolean);
+  return cands.reduce((a, b) => (_verCmp(b, a) > 0 ? b : a), '');
+}
+
 function renderVersionInfo(d){
+  const latestKnown = _latestKnown(d) || d.zcode_client_version || '';
   document.getElementById('cur-zcode-ver').textContent = 'v' + (d.zcode_client_version || '-');
-  document.getElementById('latest-zcode-ver').textContent = 'v' + (d.zcode_latest_version || d.zcode_client_version || '-');
+  document.getElementById('latest-zcode-ver').textContent = 'v' + (latestKnown || '-');
+  document.getElementById('latest-zcode-ver').title =
+    '桌面端稳定清单 v' + (d.zcode_latest_version || '-') +
+    ' · 本机官方运行时 v' + (d.zcode_local_official_version || '-');
   document.getElementById('auto-sync-version').checked = d.auto_sync_client_version !== false;
   const badge = document.getElementById('ver-status-badge');
   if(d.zcode_prompt_port_required){
@@ -164,8 +187,8 @@ function renderVersionInfo(d){
     badge.style.background = 'rgba(244,63,94,0.15)';
     badge.style.color = 'var(--rose, #f43f5e)';
     badge.style.border = '1px solid var(--rose, #f43f5e)';
-    badge.textContent = '需移植提示词 · 官方 v' + d.zcode_latest_version;
-  } else if(d.zcode_version_has_update){
+    badge.textContent = '需移植提示词 · 官方 v' + latestKnown;
+  } else if(d.zcode_version_has_update || _verCmp(latestKnown, d.zcode_client_version) > 0){
     badge.style.display = 'inline-block';
     badge.style.background = 'rgba(245,158,11,0.15)';
     badge.style.color = 'var(--amber)';

@@ -259,7 +259,10 @@ class VersionTracker:
             else:
                 logs.info("version", f"检测到 ZCode 官方新版 {info.version}（当前 {current_ver}，未开启自动对齐）")
         else:
-            logs.info("version", f"ZCode 官方版本核验: 当前 v{current_ver}，最新 v{info.version}（已是对齐状态）")
+            # current 可能高于清单（server/CLI 轨道已升、桌面端稳定清单尚未跟进）：
+            # 此时不是「已是最新」而是「清单滞后」，措辞不能误导成没升级。
+            relation = "清单滞后于当前版本" if is_newer_version(current_ver, info.version) else "已是对齐状态"
+            logs.info("version", f"ZCode 官方版本核验: 当前 v{current_ver}，清单最新 v{info.version}（{relation}）")
 
         return {
             "ok": True,

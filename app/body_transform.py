@@ -1,7 +1,7 @@
 """请求体变换 —— anthropic 通道上的「官方 ZCode 客户端形态」变换集。
 
 system 三块 + 日期轮 + cache_control + metadata.user_id 的构造形态，逐字节
-对齐 Magpie packages/zcode/index.mjs 的 dress()（ZCode 3.17.2，见 zcode_system.json）：
+对齐 Magpie packages/zcode/index.mjs 的 dress()（ZCode 3.18.0，见 zcode_system.json）：
   1. system 身份块：严格三块（cliPrefix / stableSections / dynamic），客户端
      自身 system 文本只许并入末块。网关做内容审查，缺官方块或多出第 4 块会被
      拒为 405 3012 "unusual activity"；11-03 起上游对 body 文本锁版本，前两块
@@ -27,11 +27,12 @@ from pathlib import Path
 
 from . import constants
 
-# ── ZCode 官方 client 提示词（3.17.2，逐字节移植自 Magpie packages/zcode/prompt.mjs）──
-# 结构：{cliPrefix, stableSections[2], dynamicBehavior, sessionGuidance,
+# ── ZCode 官方 client 提示词（3.18.0，逐字节移植自 ZCode 官方源码）──
+# 结构：{cliPrefix, stableSections[1], dynamicBehavior, sessionGuidance,
 #        contextManagement, poweredBy, environment{...}, context{...}}。
-# 出处：ZCode 3.17.2 源码（zai-org/ZCode@a9fe401）经 Magpie plugins 仓库
-# packages/zcode/prompt.mjs 归档，start.test.mjs 对其逐段做 SHA-256 前 16 hex 校验。
+# 出处：ZCode 3.18.0 源码（zai-org/ZCode@b95ebaffea）
+# apps/zcode-cli/packages/core/src/context/sections/identity.ts。3.18.0 起
+# Desktop 段不再进 system 块2（移入环境公告/meta_user），块2 仅身份+Harness。
 _PROMPT_JSON = Path(__file__).with_name("zcode_system.json")
 try:
     _ZCODE_PROMPT: dict = json.loads(_PROMPT_JSON.read_text("utf-8"))
@@ -92,9 +93,10 @@ def _environment_text() -> str:
 def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
     """前置 ZCode 官方 system 三块，并把客户端自身 system 并入末块。幂等。
 
-    严格三块 = dress() 逐字节同构（Magpie packages/zcode/index.mjs，ZCode 3.17.2）：
+    严格三块 = dress() 逐字节同构（ZCode 3.18.0）：
       block[0] = cliPrefix
-      block[1] = stableSections 两段以 "\\n\\n" 拼接（官方前两块必须逐字节一致）
+      block[1] = stableSections 片段以 "\\n\\n" 拼接（3.18.0 只有身份+Harness
+                 一段；3.17.2 还含 Desktop 段，已随官方移出 system）
       block[2] = "\\n\\n" + join("\\n\\n", [dynamicBehavior, (有 Skill 工具时
                  sessionGuidance), environment, (有 model 时 poweredBy),
                  contextManagement, ...客户端自身 system 文本])
@@ -104,7 +106,7 @@ def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
     """
     cli_prefix = _ZCODE_PROMPT.get("cliPrefix")
     stable = _ZCODE_PROMPT.get("stableSections")
-    if not cli_prefix or not isinstance(stable, list) or len(stable) < 2:
+    if not cli_prefix or not isinstance(stable, list) or len(stable) < 1:
         return False
     existing = body.get("system")
     # 幂等：首块已是 cliPrefix 则视为已注入

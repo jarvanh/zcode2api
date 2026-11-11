@@ -489,7 +489,7 @@ def build_app() -> FastAPI:
         scenario = getattr(app.state, "manifest_scenario", None) or headers.get("x-mock-manifest-scenario")
         if scenario == "fail_500":
             return Response("Internal Server Error", status_code=500)
-        ver = getattr(app.state, "mock_manifest_version", "3.17.2")
+        ver = getattr(app.state, "mock_manifest_version", "3.18.0")
         yaml_content = f"""version: {ver}
 releaseDate: "2026-11-02T06:43:49.471Z"
 releaseName: Release v{ver}

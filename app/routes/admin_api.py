@@ -15,6 +15,7 @@ from .. import (
     diaglog,
     forecast,
     freshness,
+    hostinfo,
     logs,
     reqlog,
     riskmetrics,
@@ -866,6 +867,10 @@ async def get_settings():
         "auto_sync_client_version": auto_sync,
         "zcode_client_version": constants.CLIENT_APP_VERSION,
         "zcode_latest_version": latest_ver,
+        # 本机官方运行时版本（~/.zcode/server/current.json appVersion）。桌面端
+        # electron 稳定清单可能滞后于 server/CLI 轨道，两个数并列展示，避免
+        # 「官方最新」只认一个源造成误读（2026-11-11 3.17.2 vs 3.18.0 事件）。
+        "zcode_local_official_version": hostinfo.local_client_version() or "",
         "zcode_version_has_update": has_update,
         "zcode_prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
         "zcode_prompt_port_required": bool(

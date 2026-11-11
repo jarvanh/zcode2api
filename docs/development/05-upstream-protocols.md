@@ -125,10 +125,14 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.17.2"`（官方客户端
-现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.17.2（2026-11-03 实测；
-前值 3.17.1 为 2026-10-31 实测、3.16.3 为 2026-10-23 实测；3.17.2 块1/2 文本与
-3.17.1 逐字节相同，仅版本常量/侧车跟进，对拍工具 scripts/capture_sections.py）；
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.18.0"`（官方
+现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.18.0（2026-11-11 实测；
+前值 3.17.2 为 2026-11-09 实测、3.17.1 为 2026-10-31、3.16.3 为 2026-10-23；
+3.18.0 提示词取自官方源码 identity.ts，正文与 3.17.2 同文，但 **Desktop 段
+（# ZCode Desktop Context）随官方移出 system 块2**，改由环境公告/meta_user
+下发，块2 只剩身份+Harness，见 zcode_system.json _meta）；桌面端 electron
+稳定清单（channel=1）2026-11-11 仍报 3.17.2——server/CLI 轨道与桌面稳定清单
+是两个发布轨道，升版以 server current.json / 官方源码为准，清单滞后不回退；
 zcode-switch Windows 路径读注册表本机真实版同源。
 **升版先改此常量**；网关启动时比对本机 current.json 并在落伍时告警
 （app/main.py `_warn_version_drift`）。

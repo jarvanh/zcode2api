@@ -53,11 +53,13 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源；3.17.2 对齐 Magpie packages/zcode/index.mjs 官方当前版）──
+# ── 客户端版本（单一真相源；3.18.0 对齐 ZCode 官方源码当前版）──
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001。
-# 出处：Magpie packages/zcode/index.mjs APP_VERSION="3.17.2"（ZCode 3.17.2，
-# zai-org/ZCode@a9fe401；prompt.mjs 同源）。前值 3.17.1（2026-11-03 跟进）、
-# 3.16.3（2026-10-29）、3.14.4（2026-10-02）。
+# 出处：ZCode 3.18.0 源码（zai-org/ZCode@b95ebaffea，package.json version=3.18.0；
+# 提示词见 apps/zcode-cli/packages/core/src/context/sections/）。前值 3.17.2
+# （2026-11-09 跟进）、3.17.1（2026-11-03）、3.16.3（2026-10-29）。
+# 注：桌面端 electron 稳定清单（channel=1）2026-11-11 仍报 3.17.2，3.18.x 先在
+# server/CLI 轨道落地（本机 ~/.zcode/server/current.json appVersion=3.18.0）。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
 # billing；hub 跑 Linux 无注册表，静态基线钉此处，运行期由 version_tracker
 # 轮询官方 manifest 接口自动更新活跃版本。
@@ -68,8 +70,10 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # 提示词对齐版本（正文锁）：zcode_system.json 的文本取自该版本客户端。
 # 活跃版本永远不得越过此值——头比正文新就是 405/3012，比"落后一点"更致命。
 # 自动同步 / 手动设置统一由 set_active_version 钳制；真正升级 ZCode 版本时，
-# 先移植 Magpie prompt.mjs 文本进 zcode_system.json，再同步抬高此常量。
-PROMPT_ALIGNED_VERSION = "3.17.2"
+# 先移植新版提示词文本进 zcode_system.json，再同步抬高此常量。
+# 3.18.0 变更：Desktop 段（# ZCode Desktop Context）移出 system 块2，改由环境
+# 公告走 meta_user；块2 只剩身份+Harness（identity.ts 文本与 3.17.2 逐行相同）。
+PROMPT_ALIGNED_VERSION = "3.18.0"
 DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装

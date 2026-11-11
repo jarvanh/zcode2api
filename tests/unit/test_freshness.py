@@ -35,7 +35,7 @@ def _isolated_sections(monkeypatch):
     yield holder
 
 
-def _meta(version="3.17.2", captured="2026-11-03"):
+def _meta(version="3.18.0", captured="2026-11-11"):
     return {"client_version": version, "captured_at": captured}
 
 
@@ -56,7 +56,7 @@ def test_prompt_aligned_mismatch_is_stale(_isolated_sections):
     _isolated_sections["meta"] = _meta()
     monkeypatch_obj = constants
     old = constants.PROMPT_ALIGNED_VERSION
-    constants.PROMPT_ALIGNED_VERSION = "3.18.0"
+    constants.PROMPT_ALIGNED_VERSION = "3.19.0"
     try:
         st = freshness.status()
         assert st["stale"]
