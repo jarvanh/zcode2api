@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 
 from .. import (
+    body_transform,
     business_error,
     constants,
     dedup,
@@ -31,6 +32,7 @@ from .. import (
     egress,
     freshness,
     logs,
+    plan_guard,
     quota_windows,
     reasoning,
     reqlog,
@@ -38,6 +40,7 @@ from .. import (
     session_ctx,
     settings,
 )
+from ..gate import gate
 from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
@@ -142,6 +145,8 @@ async def _busy_record_saturated() -> None:
     """
     if settings.BUSY_HOLD <= 0 or settings.BUSY_N <= 0:
         return
+    # 同一饱和信号同步给进程级闸门（上游 2.7.23 gate.note_busy）
+    gate.note_busy()
     if _busy_held():
         return  # 静默期内的饱和不再计数，防自我延长
     async with _busy_hold_lock:
@@ -579,6 +584,34 @@ def _is_model_concurrency_hit(text: str) -> bool:
     """
     code = business_error.business_code(_safe_json(text))
     return code == constants.CONCURRENCY_BUSINESS_CODE
+
+
+def _is_rate_limit_hit(text: str) -> bool:
+    """429/业务码是否为 1302/1303「真限流」（Z.ai 频控，非并发争用）。
+
+    与并发相反：继续原地重试只会加重，应账号休息并下沉下一渠道。只做业务码
+    精确比较，不做裸子串（logid 撞车教训）。
+    """
+    return business_error.business_code(_safe_json(text)) in constants.RATE_LIMIT_429_CODES
+
+
+def _is_edge_block(status_code: int, text: str) -> bool:
+    """边缘防火墙按 IP 封禁的 405（区别于账号级 3012 风控）。
+
+    3012 的 405 文案是 unusual activity（账号风控）；边缘封禁页指向
+    network's address was blocked，不带 code 3012。前者账号退避即可，后者
+    说明出口 IP 已被整体拒绝——继续换账号只会把全池送进去，必须全进程暂停。
+    """
+    if status_code not in constants.RISK_CONTROL_HTTP_STATUSES:
+        return False
+    if business_error.business_code(_safe_json(text)) == constants.RISK_BUSINESS_CODE:
+        return False
+    low = (text or "").lower()
+    if any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS):
+        return False
+    if any(m in low for m in constants.EDGE_BLOCK_MARKERS):
+        return True
+    return "<html" in low or "errors.aliyun.com" in low
 
 
 def _parse_retry_after(value: str | None) -> int | None:
@@ -1876,6 +1909,27 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
         # 关闭时降级链不进 bigmodel 池；显式 `bigmodel/` 前缀请求已在入口 403。
         providers = [providers[0]] + [p for p in providers[1:] if store.bigmodel_channel_enabled()]
 
+    # 套餐窗口闸门（pool_hold）入口快速失败：全池确认枯竭且**没有任何可用的
+    # Key 回退归宿**时直接 429，不再白走 5 轮账号×验证码检查（上游 2.7.30）。
+    if (
+        "zai" in providers
+        and gate.refusal_reason() == "pool_hold"
+        and not any(
+            a.has_apikey_fallback() and not _key_no_balance_cooling(a.id)
+            for a in store.list_accounts("zai")
+            if a.mode == "jwt"
+        )
+    ):
+        wait = gate.retry_after()
+        logs.req_err(req_id, f"套餐窗口闸门 pool_hold，入口快速失败（Retry-After {wait}s）")
+        reqlog.finish_error(req_id, "gate_pool_hold", status=429)
+        return JSONResponse(
+            {"error": {"message": f"套餐窗口真空期（全池额度耗尽），请 {wait}s 后重试",
+                       "type": "gate_pool_hold"}},
+            status_code=429,
+            headers={"Retry-After": str(wait)},
+        )
+
     for pi, provider in enumerate(providers):
         while attempts < MAX_ACCOUNT_ATTEMPTS:
             if deadline and time.time() - t0 > deadline:
@@ -1927,7 +1981,7 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                     {"error": {
                         "message": (f"上游并发槽持续饱和，全池静默 {wait}s 后恢复"
                                     "（防止出口 IP 被防火墙封禁；稍后自动重试即可）"),
-                        "type": "rate_limit_error", "code": "busy_hold",
+                        "type": "gate_busy_hold", "code": "busy_hold",
                         "next_available_at": round(time.time() + wait),
                     }},
                     status_code=429,
@@ -2093,6 +2147,21 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
             }},
             status_code=503,
         )
+    # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算/套餐窗口）兜底：所有 plan
+    # 账号都被本地拒绝到这里，必须带真实原因与 Retry-After（上游 2.7.23）。
+    _refuse = gate.refusal_reason()
+    if _refuse:
+        _wait = gate.retry_after()
+        _status = 429 if _refuse in ("rate_limit", "busy_hold", "pool_hold") else 503
+        logs.req_err(req_id, f"闸门 {_refuse}，拒绝本请求（Retry-After {_wait}s）")
+        reqlog.finish_error(req_id, f"gate_{_refuse}", status=_status)
+        return JSONResponse(
+            {"error": {"message": f"上游保护闸门触发（{_refuse}），请 {_wait}s 后重试",
+                       "type": f"gate_{_refuse}"}},
+            status_code=_status,
+            headers={"Retry-After": str(_wait)},
+        )
+
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     kind, wait = _recovery(req_provider, model_key)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
@@ -2145,6 +2214,9 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
             status_code=503,
             headers={"Retry-After": str(retry_after)},
         )
+    # 池里全是「已标 EXHAUSTED」的号时走不到 exhaust 分支（select 先滤掉），
+    # 套餐窗口闸门在这里补触发——重启后真空期首请求也能进入快速失败闭环。
+    _note_pool_exhausted(trigger=None)
     return JSONResponse(
         {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,
@@ -2467,6 +2539,66 @@ def _slot_view() -> dict:
 reqlog.register_slot_source(_slot_view)
 
 
+# Key 通道 1113「无资源包」（永久态）的选号冷却记忆：account_id → 解禁 epoch。
+# 不记的话每个请求都会重选该号去撞一次必然失败的 1113（2026-11-11 线上实证：
+# 151 个请求 = 151 次白烧上游调用）。进程内记忆：重启即忘，重探一次代价可接受；
+# 后台手动启用账号时清除（用户明确意图 = 立即重试）。
+_key_no_balance: dict[str, float] = {}
+
+
+def clear_key_no_balance(account_id: str) -> None:
+    """后台启用/凭证变更时清除该号的 Key 无余额冷却，允许立即重探。"""
+    _key_no_balance.pop(account_id, None)
+
+
+def _key_no_balance_cooling(account_id: str, now: float | None = None) -> bool:
+    until = _key_no_balance.get(account_id, 0)
+    if not until:
+        return False
+    if (now or time.time()) >= until:
+        _key_no_balance.pop(account_id, None)  # 到期自然重探
+        return False
+    return True
+
+
+def _note_pool_exhausted(trigger: Account | None = None) -> None:
+    """账号 Plan 通道判额度耗尽后，评估是否触发套餐窗口闸门（pool_hold）。
+
+    保守优先：只有当**全部** JWT 账号都返回「确认枯竭」（每个号都有过期后
+    实查证据，且无当前可用窗口）时才拦；任意一号可用（0.0）或不可判定
+    （None——快照空/陈旧/新号）都不拦。next_start 取全池最小未来
+    effective_at；无未来窗口给 -1，由 gate 用上限兜底。
+    """
+    accounts = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
+    if not accounts:
+        return
+    verdicts = []
+    for a in accounts:
+        verdict = a.next_window_start()
+        if verdict is None:
+            return  # 任一号不可判定 → 放行，让真实请求去定生死
+        verdicts.append(verdict)
+    if any(v == 0.0 for v in verdicts):
+        return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
+    future = [v for v in verdicts if v > 0]
+    next_start = min(future) if future else -1.0
+    now = time.time()
+    if gate.pool_hold_remaining(now) > 0:
+        return  # 已在 hold 中：刷新到更早的窗口点才有意义，否则不动
+    gate.note_pool_exhausted(next_start, now=now)
+    when = (
+        time.strftime("%m-%d %H:%M", time.localtime(next_start))
+        if next_start > 0
+        else f"未知（{settings.GATE_POOL_HOLD_MAX_SECONDS}s 后重探）"
+    )
+    trigger_note = f"（{trigger.name} 判额度耗尽）" if trigger else ""
+    logs.warn(
+        "gate",
+        f"套餐窗口闸门触发：全池 {len(accounts)} 号确认枯竭{trigger_note}，"
+        f"暂停 plan 渠道至 {when}",
+    )
+
+
 def _limit() -> int:
     """当前并发上限（0 = 不限）。控制台可改、meta 即时生效（v2.9.33 恢复）。"""
     return store.account_concurrency()
@@ -2541,11 +2673,12 @@ def _upstream_biz_error(text: str) -> tuple[int, str, str] | None:
 class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
-    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "model", "on_close", "_closed")
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode",
+                 "model", "on_close", "gate_release", "_closed")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient | None,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 model: str = "-", on_close=None) -> None:
+                 model: str = "-", on_close=None, gate_release=None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
@@ -2554,6 +2687,7 @@ class _Upstream:
         self.mode = mode
         self.model = model
         self.on_close = on_close
+        self.gate_release = gate_release
         self._closed = False
 
     async def close(self) -> None:
@@ -2569,10 +2703,12 @@ class _Upstream:
             await self.cm.__aexit__(None, None, None)
         if self.client is not None:
             await self.client.aclose()
-        if self.on_close is not None:
+        for callback in (self.on_close, self.gate_release):
+            if callback is None:
+                continue
             try:
-                self.on_close()
-            except Exception:  # noqa: BLE001 - 槽位释放失败不掩盖主流程
+                callback()
+            except Exception:  # noqa: BLE001 - 槽位/闸门释放失败不掩盖主流程
                 pass
 
     def to_streaming(self, req_id: str) -> StreamingResponse:
