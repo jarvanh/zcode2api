@@ -183,7 +183,9 @@ class TestRateLimit429:
 
         before = _count(mock, _JWT_1302H)
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503  # 唯一账号休息 → 不空转
+        # fork：200 承载 1302 → 映射 429 分支（账号 COOLING）；单号池冷却后
+        # dispatch 走通道冷却语义回 503（关键断言是 rest + last_error）
+        assert res.status_code == 503
         assert _count(mock, _JWT_1302H) - before == 1  # 不原地重试
         after = fresh_app.find("zai", acc.id)
         assert after.status == Status.COOLING
@@ -435,13 +437,14 @@ class TestNoBalance1113:
         assert len([x for x in _paths(mock, before)]) == 1  # 不原地重试
 
         after = fresh_app.find("zai", acc.id)
-        assert after.status == Status.EXHAUSTED  # 标态：选号不再重选重探
+        assert after.status != Status.EXHAUSTED  # fork：模型级冷却，不整号标死
+        assert after.is_model_cooling("GLM-5.3")
         assert "1113" in (after.last_error or "")
 
-        # 第二个请求不再打上游（EXHAUSTED 不可选）
+        # 第二个请求不再打上游（模型冷却不可选）
         before2 = len(mock.state.calls)
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res2.status_code == 503
+        assert res2.status_code == 429
         assert not _paths(mock, before2)  # 零重探（线上 151 次循环的根治点）
 
     async def test_key_1113_cools_selection_without_touching_status(
@@ -536,7 +539,8 @@ class TestKeyNoBalanceScope:
         mock.state.sequences[key[:16]] = ["no_balance_1113"]            # Key 通道
 
         res1 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res1.status_code == 503  # Plan 429 → Key 1113 → 换号（无其它账号）
+        # fork：Plan 429 → Key 1113（只记忆不标死）→ 池空、无恢复理由 → 503
+        assert res1.status_code == 503
         assert gw._key_no_balance.get(acc.id) is not None  # 记忆已记录
 
         # 第二个请求：不得被冷却跳过——Plan 通道仍被重试（有界浪费，非连坐）
@@ -919,7 +923,8 @@ class TestPlanModelExhaust:
         mock.state.sequences[self._JWT_ME1[:16]] = ["quota_exhausted_200"]
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503  # 单号池，耗尽后无号
+        # fork：单号池额度耗尽 → 402（OmniRoute quota_exhausted 语义）
+        assert res.status_code == 402
         assert plan_guard.cooling(acc.id, "GLM-5.3")  # 模型级记忆已打点
 
         # billing 刷新把号救回 ACTIVE（窗口恢复的号），但旗舰 1005 冷却仍在 TTL 内
@@ -955,7 +960,7 @@ class TestPlanModelExhaust:
         mock.state.sequences[self._JWT_ME3[:16]] = ["quota_exhausted_200", "ok"]
 
         res1 = await client.post("/v1/messages", json=_MSG_BODY)  # 旗舰撞 1005
-        assert res1.status_code == 503
+        assert res1.status_code == 402  # fork：单号池额度耗尽 → 402
         assert plan_guard.cooling(acc.id, "GLM-5.3")
 
         # billing 刷新救回 ACTIVE（Flash 窗口在账），旗舰冷却仍在
@@ -1022,7 +1027,8 @@ class TestPlanModelExhaust:
         mock.state.sequences[self._JWT_ME5[:16]] = ["no_balance_1113"]  # 429+1113
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503
+        # fork：Plan 1113 → 模型级冷却，单模型池空 → 429 model_no_quota
+        assert res.status_code == 429
         assert plan_guard.cooling(acc.id, "GLM-5.3")  # Plan 分支同步打点
 
         # 账号被救活（ACTIVE）后同模型请求不再撞 1113
@@ -1032,7 +1038,7 @@ class TestPlanModelExhaust:
         fresh_app.update_account(acc)
         before = len(mock.state.calls)
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res2.status_code == 503
+        assert res2.status_code == 429
         assert not _paths(mock, before)  # 冷却跳号，零上游流量
 
     async def test_key_1113_does_not_touch_plan_guard(self, gateway_client, fresh_app, monkeypatch):

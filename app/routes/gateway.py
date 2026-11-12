@@ -2252,6 +2252,8 @@ def _status_for_business_code(code: int) -> int:
         return constants.RISK_CONTROL_HTTP_STATUSES[0]
     if code in constants.EXHAUST_BUSINESS_CODES:
         return constants.EXHAUST_HTTP_STATUSES[0]
+    if code in constants.RATE_LIMIT_429_CODES:
+        return 429
     return 400
 
 
