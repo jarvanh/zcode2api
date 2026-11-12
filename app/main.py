@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import sys
 from contextlib import asynccontextmanager
 
@@ -49,6 +50,30 @@ def _display_host() -> str:
     # 0.0.0.0 / 空地址在浏览器中不可直接访问，展示为 127.0.0.1
     host = (settings.HOST or "").strip()
     return "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = (host or "").strip()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_security_defaults() -> None:
+    """安全默认：未配置网关 Key 时不允许监听非回环地址。"""
+    from .store import store
+
+    if store.gateway_key():
+        return
+    if not _is_loopback_host(settings.HOST):
+        raise RuntimeError(
+            "网关 API Key 未配置（ZCODE_GATEWAY_KEY / 后台设置），"
+            f"但 ZCODE_HOST={settings.HOST!r} 不是回环地址：拒绝启动。"
+            "请设置网关 Key，或将 ZCODE_HOST 改为 127.0.0.1。"
+        )
 
 
 def _backfill_fingerprints() -> list:
@@ -175,6 +200,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    _validate_security_defaults()
     app = FastAPI(title="zcode-hub", version=settings.APP_VERSION, lifespan=lifespan)
 
     # 进程级在途计数（看板「实时/并发」小卡真源）。

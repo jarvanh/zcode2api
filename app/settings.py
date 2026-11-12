@@ -53,11 +53,13 @@ FRONTEND_DIR = _resolve_path(
 
 # ── 服务 ─────────────────────────────────────────────────────────────────────
 PORT = _int("ZCODE_PORT", 3000)
-HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
+# 默认只监听回环：网关未配置 API Key 时，非回环监听会拒绝启动（见 main.create_app）。
+HOST = (os.getenv("ZCODE_HOST") or "").strip() or "127.0.0.1"
 
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
-# 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
-DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+# 后台管理密码初始值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
+# 不提供硬编码默认口令：未配置环境变量时由 Store 首启随机生成并落库。
+DEFAULT_ADMIN_KEY = (os.getenv("ZCODE_ADMIN_KEY") or "").strip()
 # 网关访问密钥默认值（README 的 ZCODE_GATEWAY_KEY）：数据库 meta 表未设置时生效。
 GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
 # bigmodel Key 回退通道（bigmodel/ 前缀 / x-provider: bigmodel 头）默认关闭：
@@ -361,7 +363,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.45"
+APP_VERSION = "2.9.46"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

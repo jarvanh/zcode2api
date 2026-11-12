@@ -54,7 +54,6 @@ def test_version_mismatch_with_gateway_is_stale(_isolated_sections):
 def test_prompt_aligned_mismatch_is_stale(_isolated_sections):
     """正文锁版本与 _meta 不同步（只抬 PROMPT_ALIGNED_VERSION 没移植文本）必须告警。"""
     _isolated_sections["meta"] = _meta()
-    monkeypatch_obj = constants
     old = constants.PROMPT_ALIGNED_VERSION
     constants.PROMPT_ALIGNED_VERSION = "3.19.0"
     try:

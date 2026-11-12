@@ -19,7 +19,7 @@ def test_record_and_aggregate(tmp_path, monkeypatch):
 
     day_files = list(tmp_path.glob("risk-*.jsonl"))
     assert len(day_files) == 1
-    lines = [json.loads(l) for l in day_files[0].read_text().splitlines()]
+    lines = [json.loads(line) for line in day_files[0].read_text().splitlines()]
     assert len(lines) == 5  # bogus 未落盘
     assert lines[0]["kind"] == "risk"
     assert lines[0]["signal"] == "HTTP 405"

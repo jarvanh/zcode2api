@@ -7,7 +7,6 @@ openai_compat 做双向格式转换，调度与错误处理策略完全一致。
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import os
 import random
@@ -2638,8 +2637,8 @@ def _parse_exhaust_reset(text: str) -> float | None:
         hh = int(m.group(4) or 0)
         mm = int(m.group(5) or 0)
         ss = int(m.group(6) or 0)
-        # 注意：本文件既有 `from datetime import datetime`（fork 历史导入），
-        # 上游原写法 datetime.datetime(...) 会因类名遮蔽模块名而 AttributeError。
+        # 注意：本文件使用 `from datetime import datetime`（类名），
+        # 上游原写法 datetime.datetime(...) 会因类名遮蔽模块名而失败。
         ts = datetime(y, mo, d, hh, mm, ss).timestamp()
     except (ValueError, OSError):
         return None

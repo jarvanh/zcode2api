@@ -504,7 +504,7 @@ class Account:
         N 条惩罚尾巴。
         """
         pref = f"{(channel or 'plan').strip().lower()}:"
-        for lane in [l for l in list(self.risk_lane_cooling or {}) if l.startswith(pref)]:
+        for lane in [name for name in list(self.risk_lane_cooling or {}) if name.startswith(pref)]:
             self.clear_lane_cooling(lane)
 
     def clear_all_risk_lanes(self) -> None:

@@ -57,10 +57,10 @@
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env            # 按需修改密钥、端口等
-.venv/bin/python cli.py serve   # 启动网关 + 后台 UI（默认 http://0.0.0.0:3000）
+.venv/bin/python cli.py serve   # 启动网关 + 后台 UI（默认 http://127.0.0.1:3000）
 ```
 
-- 后台管理：`http://127.0.0.1:3000/admin/login`（初始账号见 `.env` 的 `ZCODE_ADMIN_KEY`）
+- 后台管理：`http://127.0.0.1:3000/admin/login`（初始账号见 `.env` 的 `ZCODE_ADMIN_KEY`；未配置时首启随机生成并打印在启动日志）
 - 对话端点：
   - Anthropic 协议：`POST http://127.0.0.1:3000/v1/messages`（兼容 Claude Code、Cline）
   - OpenAI 协议：`POST http://127.0.0.1:3000/v1/chat/completions`（兼容 OpenAI 客户端）
@@ -182,9 +182,11 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `ZCODE_PORT` | 3000 | 服务端口 |
-| `ZCODE_HOST` | 0.0.0.0 | 监听地址 |
-| `ZCODE_ADMIN_KEY` | zcode | 后台密码初始值（之后写库，以库为准；部署后立即在后台改掉）|
-| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空不校验（生产务必设置）|
+| `ZCODE_HOST` | 127.0.0.1 | 监听地址（默认仅回环；空网关 Key 时非回环监听拒绝启动） |
+| `ZCODE_ADMIN_KEY` | 空 | 后台密码初始值（之后写库，以库为准）；留空 = 首启随机生成并打印，旧版默认 `zcode` 会被随机替换 |
+| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空仅允许回环访问（非回环监听会拒绝启动） |
+| `ZCODE_TRUST_PROXY_IP` | 0 | 仅显式 `1` 且来源为受信代理时信任 `cf-connecting-ip` / `x-real-ip`；直连忽略转发头 |
+| `ZCODE_TRUSTED_PROXIES` | 127.0.0.0/8,::1 | 受信反向代理来源（逗号分隔 IP/CIDR） |
 | `ZCODE_BIGMODEL_CHANNEL` | 0 | bigmodel Key 回退通道（`bigmodel/` 前缀 / `x-provider: bigmodel` 头）；默认关闭，`1` 开启（后台「设置」可改，以库为准）|
 | `ZCODE_DATA_DIR` | data | 数据目录（SQLite 存放处）|
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |

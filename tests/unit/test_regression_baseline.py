@@ -11,8 +11,8 @@ import time
 
 import pytest
 
-from app import identity as identity_module
-from app import constants, settings as app_settings
+from app import constants
+from app import settings as app_settings
 from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,

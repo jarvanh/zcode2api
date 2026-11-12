@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import time
 
@@ -17,10 +18,31 @@ ADMIN_LOCK_SECONDS = 300
 _MAX_FAIL_TRACKED = 4096
 
 # 是否信任反代注入的客户端 IP 头（cf-connecting-ip / x-real-ip）。
-# 部署在 CF/Nginx 反代之后时必须开启（否则所有请求共享代理 IP，一个 IP
-# 锁定全站）；无反代直连暴露时置 False —— 直连场景该头可被客户端伪造，
-# 每伪造一个 IP 即获得一个全新的失败计数桶，等效绕过登录锁定。
-TRUST_PROXY_IP = os.getenv("ZCODE_TRUST_PROXY_IP", "1").strip().lower() not in ("0", "false", "no")
+# 默认关闭：直连场景该头可被客户端伪造，每伪造一个 IP 即获得一个全新的
+# 失败计数桶，等效绕过登录锁定。仅显式设为 1 且 TCP 来源属于受信代理时
+# 才读取转发头；无反代直连部署必须保持 0。
+TRUST_PROXY_IP = (os.getenv("ZCODE_TRUST_PROXY_IP") or "0").strip() == "1"
+# 受信代理来源（逗号分隔 IP/CIDR）；默认只信任本机回环（cloudflared/nginx
+# 与网关同机）。反代在其它地址时用 ZCODE_TRUSTED_PROXIES 显式追加。
+DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1"
+
+
+def _parse_trusted_proxies(raw: str) -> tuple:
+    networks = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            continue
+    return tuple(networks)
+
+
+TRUSTED_PROXY_NETWORKS = _parse_trusted_proxies(
+    os.getenv("ZCODE_TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES)
+)
 
 # ip -> {count, locked_until, last}
 _failures: dict[str, dict] = {}
@@ -31,15 +53,30 @@ def reset_failures() -> None:
     _failures.clear()
 
 
+def _is_trusted_proxy(host: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in TRUSTED_PROXY_NETWORKS)
+
+
 def _client_ip(request: Request) -> str:
-    if TRUST_PROXY_IP:
+    peer = request.client.host if request.client and request.client.host else ""
+    if TRUST_PROXY_IP and peer and _is_trusted_proxy(peer):
         for header in ("cf-connecting-ip", "x-real-ip"):
             val = (request.headers.get(header) or "").strip()
-            if val:
-                return val.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
+            if not val:
+                continue
+            candidate = val.split(",")[0].strip()
+            try:
+                ipaddress.ip_address(candidate)
+            except ValueError:
+                continue  # 伪造/畸形头：忽略，退回真实来源
+            return candidate
+    return peer or "unknown"
 
 
 def _gc_failures(now: float) -> None:
@@ -137,14 +174,31 @@ async def verify_admin_key(
     _failures.pop(ip, None)
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 async def verify_gateway_key(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
-    """校验 /v1/messages 网关访问密钥（未配置则放行）。"""
+    """校验 /v1/messages 网关访问密钥。
+
+    未配置 key 时仅放行回环来源：非回环监听+空 key 在启动阶段已被拒绝，
+    这里再兜底一次（例如 uvicorn --host 覆盖了 ZCODE_HOST 的部署方式）。
+    """
     key = store.gateway_key()
     if not key:
-        return
+        peer = request.client.host if request.client and request.client.host else ""
+        if peer and _is_loopback(peer):
+            return
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "网关未配置 API Key，仅允许回环访问")
     token = _extract_bearer(authorization) or x_api_key
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少 API Key")

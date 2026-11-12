@@ -8,13 +8,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import constants
-from app.version_tracker import manifest_channels as vt_manifest_channels
 from app.constants import is_newer_version, parse_semver
 from app.version_tracker import (
     VersionInfo,
     VersionTracker,
     parse_manifest,
 )
+from app.version_tracker import manifest_channels as vt_manifest_channels
 
 
 def test_parse_semver():

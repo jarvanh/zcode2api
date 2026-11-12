@@ -18,7 +18,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-from . import logs, settings
+from . import logs
 
 _CACHE: dict = {"at": 0.0, "data": None}
 _TTL = 3600.0
@@ -95,10 +95,10 @@ def topology(force: bool = False) -> dict:
             targets.append((a.name, px))
         with ThreadPoolExecutor(max_workers=8) as ex:
             ips = dict(zip([n for n, _ in targets],
-                           ex.map(lambda t: _probe_ip(t[1]), targets)))
+                           ex.map(lambda t: _probe_ip(t[1]), targets), strict=True))
         uniq_ips = sorted({v for v in ips.values() if v})
         with ThreadPoolExecutor(max_workers=5) as ex:
-            geos = dict(zip(uniq_ips, ex.map(_geo, uniq_ips)))
+            geos = dict(zip(uniq_ips, ex.map(_geo, uniq_ips), strict=True))
         direct_ip = ips.get(direct_first, "") if direct_first else ""
         out = []
         for name, px in targets:

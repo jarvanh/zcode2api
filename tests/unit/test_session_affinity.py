@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app import settings, session_ctx
+from app import session_ctx, settings
 
 
 @pytest.fixture(autouse=True)

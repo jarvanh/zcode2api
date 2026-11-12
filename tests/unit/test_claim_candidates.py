@@ -13,7 +13,6 @@ from app.claim import _date_plan_candidates
 
 def _ts_for_wday(mon: int, day: int, year: int, hour: int = 12):
     """构造指定日期（本地时区）的 epoch，用于测 wday 分支。"""
-    import calendar
 
     return time.mktime((year, mon, day, hour, 0, 0, 0, 0, -1))
 

@@ -684,7 +684,6 @@ class ModelProbeMonitor:
         return 1 if await self._probe_one(acc, model) else 0
 
     async def _loop(self) -> None:
-        from .store import store
 
         try:
             await asyncio.wait_for(self._stop.wait(), timeout=30)

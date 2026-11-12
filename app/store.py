@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -21,6 +23,34 @@ from .models import PROVIDERS, Account, Status
 
 _TBL = "accounts"
 _META = "meta"
+
+
+def _harden_umask() -> None:
+    """收紧进程新建文件权限：凭证库及其 WAL/SHM 不受宿主 umask 影响。"""
+    try:
+        os.umask(0o077)
+    except OSError as err:  # 极少数平台不支持，权限收紧仍由显式 chmod 兜底
+        logs.warn("store", f"umask 加固失败: {err}")
+
+
+_harden_umask()
+
+
+def _chmod_private(path, mode: int) -> None:
+    """文件存在则收紧到指定权限；不存在（如 WAL 尚未创建）静默跳过。"""
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+    except OSError as err:
+        logs.warn("store", f"权限收紧失败 {path}: {err}")
+
+
+def _secure_db_files() -> None:
+    """accounts.db / -wal / -shm / -journal 一律 0600（含运行期新建文件）。"""
+    _chmod_private(settings.DB_PATH, 0o600)
+    for suffix in ("-wal", "-shm", "-journal"):
+        _chmod_private(settings.DB_PATH.with_name(settings.DB_PATH.name + suffix), 0o600)
 
 
 def _parse_hours(raw: str) -> list[int]:
@@ -67,10 +97,12 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        _secure_db_files()
         return conn
 
     def _init_db(self) -> None:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _chmod_private(settings.DATA_DIR, 0o700)
         with closing(self._connect()) as conn:
             conn.executescript(
                 f"""
@@ -92,10 +124,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_acc_status   ON {_TBL} (status);
                 """
             )
-            conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('admin_key', ?)",
-                (settings.DEFAULT_ADMIN_KEY,),
-            )
+            self._bootstrap_admin_key(conn)
             conn.execute(
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('gateway_key', '')"
             )
@@ -108,6 +137,28 @@ class Store:
                 (str(settings.CLAIM_ROUND_INTERVAL),),
             )
             conn.commit()
+            _secure_db_files()
+
+    def _bootstrap_admin_key(self, conn: sqlite3.Connection) -> None:
+        """首次启动写入后台密钥：优先环境变量，否则随机生成（不留默认口令）。"""
+        row = conn.execute(
+            f"SELECT value FROM {_META} WHERE key = 'admin_key'"
+        ).fetchone()
+        current = str(row["value"]).strip() if row is not None else ""
+        configured = (settings.DEFAULT_ADMIN_KEY or "").strip()
+        legacy_default = current == "zcode" and not configured
+        if current and not legacy_default:
+            return
+        key = configured or secrets.token_urlsafe(32)
+        conn.execute(
+            f"INSERT OR REPLACE INTO {_META} (key, value) VALUES ('admin_key', ?)",
+            (key,),
+        )
+        if legacy_default:
+            logs.warn("store", f"检测到旧版默认后台密钥 zcode，已随机替换为：{key}")
+        elif not configured:
+            # 首启仅此一次：用户需要该口令登录后台；请立即在后台改密。
+            logs.warn("store", f"未配置 ZCODE_ADMIN_KEY，已随机生成后台密钥：{key}")
 
     def _load(self) -> None:
         with closing(self._connect()) as conn:

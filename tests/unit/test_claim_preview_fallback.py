@@ -19,7 +19,6 @@ from app.claim import (
     ClaimError,
     _date_plan_candidates,
     _held_plan_ids,
-    _probe_state,
     _probe_unlisted_plans,
     known_plan_ids,
     preview_plans,

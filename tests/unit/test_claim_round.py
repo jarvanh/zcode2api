@@ -476,7 +476,6 @@ async def test_remember_new_plan_id_wakes_round(fresh_app, monkeypatch):
 @pytest.mark.asyncio
 async def test_loop_wake_triggers_immediate_round(monkeypatch):
     """唤醒事件把 interval 等待截断，醒来后立即跑一轮。"""
-    import app.claim as claim_mod
 
     rounds: list[float] = []
 
@@ -515,7 +514,6 @@ async def test_loop_wake_triggers_immediate_round(monkeypatch):
 @pytest.mark.asyncio
 async def test_loop_wake_respects_disabled_interval(monkeypatch):
     """interval=0（关闭）时唤醒只回看设置，不跑轮。"""
-    import app.claim as claim_mod
 
     rounds: list[float] = []
 

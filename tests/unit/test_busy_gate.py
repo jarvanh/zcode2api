@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 
 from app import settings
@@ -56,8 +55,10 @@ def test_gate_clear_on_success(monkeypatch):
 def test_gate_recovery_returns_busy_with_retry_after(monkeypatch):
     """闸门成立时 _recovery 给出确定的恢复时刻（→ 429+Retry-After）。"""
     list(_reset(monkeypatch))
+    import pathlib
+    import tempfile
+
     from app.store import Store
-    import pathlib, tempfile
 
     d = pathlib.Path(tempfile.mkdtemp())
     monkeypatch.setattr(settings, "DATA_DIR", d)

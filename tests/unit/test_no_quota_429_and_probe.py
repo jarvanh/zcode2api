@@ -13,7 +13,6 @@ import time
 
 import pytest
 
-from app import settings
 from app.quota import ModelProbeMonitor
 from app.store import Store
 
@@ -47,7 +46,7 @@ def test_next_model_uncooldown_at_picks_soonest(fresh_app):
 
 def test_next_model_uncooldown_at_ignores_expired(fresh_app):
     a = _bm(fresh_app, "a", "k1")
-    until = a.cool_model("glm-5.3-flash", 60, 3600)
+    a.cool_model("glm-5.3-flash", 60, 3600)
     a.model_cooling["glm-5.3-flash"] = time.time() - 1  # 已过期
     assert fresh_app.next_model_uncooldown_at("bigmodel", "glm-5.3-flash") is None
 

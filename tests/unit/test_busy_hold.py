@@ -68,8 +68,10 @@ def test_3008_not_rate_hold(monkeypatch):
 def test_recovery_rate_hold(monkeypatch):
     """_recovery 的 rate kind 指向扣号到期时刻（不污染全局 settings）。"""
     _setup(monkeypatch)
+    import pathlib
+    import tempfile
+
     from app.store import Store
-    import tempfile, pathlib
 
     d = pathlib.Path(tempfile.mkdtemp())
     monkeypatch.setattr(settings, "DATA_DIR", d)

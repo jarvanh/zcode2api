@@ -50,9 +50,9 @@ CREATE TABLE claim_history (
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `ZCODE_PORT` / `ZCODE_HOST` | 3000 / 0.0.0.0 | 服务监听 |
-| `ZCODE_ADMIN_KEY` | `zcode` | 后台密码初值（之后以 DB meta 为准） |
-| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key（空 = 不校验，仅限本机使用） |
+| `ZCODE_PORT` / `ZCODE_HOST` | 3000 / 127.0.0.1 | 服务监听（默认仅回环） |
+| `ZCODE_ADMIN_KEY` | 空（首启随机生成） | 后台密码初值（之后以 DB meta 为准；旧版默认 `zcode` 会被随机替换） |
+| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key（空 = 仅回环放行；非回环监听拒绝启动） |
 | `ZCODE_MASTER_SECRET` | 派生 | 账号凭证加密主密钥 |
 | `ZCODE_DATA_DIR` | `./data` | SQLite 与凭证目录 |
 | `POOL_MAX_ATTEMPTS` | 4 | 单请求内换号上限 |

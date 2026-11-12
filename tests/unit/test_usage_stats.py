@@ -18,8 +18,6 @@ def _write(tmp_path, day: date, rows: list[dict]):
 
 def test_summarize_periods_and_probe(tmp_path):
     today = date(2026, 10, 23)  # 周五
-    day7_start = today - timedelta(days=6)    # 近 7 天窗口起点（10/17）
-    day30_start = today - timedelta(days=29)  # 近 30 天窗口起点（9/24）
 
     files = [
         (today, _write(tmp_path, today, [

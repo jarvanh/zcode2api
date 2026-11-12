@@ -78,7 +78,7 @@ def test_tag_writes_reqlog_row(monkeypatch, tmp_path):
     reqlog.begin("r1", "chat", "glm-5.3-flash", False, "hi")
     session_ctx.tag("r1", _body(), False)
     reqlog.finish_ok("r1", status=200, cache_read=256)
-    rows = [json.loads(l) for l in (tmp_path / "reqlog-1970-01-01.jsonl").read_text().splitlines()] \
+    rows = [json.loads(line) for line in (tmp_path / "reqlog-1970-01-01.jsonl").read_text().splitlines()] \
         if False else json.loads(_last_row(tmp_path))
     assert rows["sess"] and rows["sess_repeat"] is False
     assert rows["sw"] == ""            # 首见无窗口归属

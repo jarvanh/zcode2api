@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from app import endpoint_routing as er, settings
+from app import endpoint_routing as er
+from app import settings
 
 
 @pytest.fixture(autouse=True)

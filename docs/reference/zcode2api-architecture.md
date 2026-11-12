@@ -332,7 +332,7 @@ meta(      key PK, value )      # admin_key / gateway_key / quota_refresh_interv
 | 范围 | 依赖 | 规则 |
 |------|------|------|
 | 后台 `/admin/api/*` | `verify_admin_key` | 必须 `Authorization: Bearer <后台密钥>`(或 `?app_key=` 供 EventSource);`hmac.compare_digest` 定时安全比较 |
-| 网关 `/v1/messages`·`/v1/models` | `verify_gateway_key` | 配置了网关 Key 才校验(`Bearer` 或 `x-api-key`);留空放行 |
+| 网关 `/v1/messages`·`/v1/models` | `verify_gateway_key` | 配置了网关 Key 才校验(`Bearer` 或 `x-api-key`)；未配置时仅放行回环来源 |
 
 密钥存于 `meta` 表,可在「设置」页或 `.env` 初始化。前端凭证加密存于浏览器 localStorage。
 

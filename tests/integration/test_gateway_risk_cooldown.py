@@ -70,7 +70,6 @@ class TestRiskWavePause:
 
     async def test_wave_pause_blocks_next_request_without_probe(self, gateway_client, fresh_app):
         client, mock = gateway_client
-        from app.routes import gateway as gw
         from tests.conftest import seed_account
 
         seed_account(fresh_app, _RISK_JWT, name="w-a")

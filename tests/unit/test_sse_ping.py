@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from app.routes.gateway import _sse_ping_chunk, _sse_error_chunk
+from app.routes.gateway import _sse_error_chunk, _sse_ping_chunk
 
 
 def test_anthropic_ping_is_real_event():
