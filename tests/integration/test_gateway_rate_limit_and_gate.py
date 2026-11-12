@@ -208,11 +208,11 @@ class TestEdgeBlockBreaker:
         mock.state.sequences[_JWT_EDGE[:16]] = ["edge_block_405"]
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        # 观测到边缘页 → 触发 hold 后换号：唯一账号无 Key 可下沉，最终由 dispatch
-        # 兜底统一回执（P2-1 修复后不再区分 upstream_edge_blocked/gate_edge_hold
-        # 两种客户端形态，边缘观测详情在服务端日志）
-        assert res.status_code == 503
-        assert res.json()["error"]["type"] == "gate_edge_hold"
+        # fork 契约：边缘页回 405 + edge_blocked_ip（OmniRoute 据此切 provider）；
+        # 同时进程级闸门被 trip，后续请求本地拦截
+        assert res.status_code == 405
+        assert res.json()["error"]["type"] == "permission_error"
+        assert res.json()["error"]["code"] == "edge_blocked_ip"
         assert "Retry-After" in res.headers
         # 被封的是出口 IP：账号本身不改状态、不计风控
         after = fresh_app.find("zai", acc.id)
@@ -225,8 +225,9 @@ class TestEdgeBlockBreaker:
         before = len(mock.state.calls)
         solves = stub_captcha.solve_count
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res2.status_code == 503
-        assert res2.json()["error"]["type"] == "gate_edge_hold"
+        assert res2.status_code == 405
+        assert res2.json()["error"]["type"] == "permission_error"
+        assert res2.json()["error"]["code"] == "edge_blocked_ip"
         assert not _paths(mock, before)
         assert stub_captcha.solve_count == solves  # 不先花一枚真浏览器 token 再被拒
 
@@ -646,8 +647,10 @@ class TestGateRefusalFailover:
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503
-        assert res.json()["error"]["type"] == "gate_edge_hold"
+        # fork 契约：纯 plan 池被边缘封 → 405 edge_blocked_ip（非 503）
+        assert res.status_code == 405
+        assert res.json()["error"]["type"] == "permission_error"
+        assert res.json()["error"]["code"] == "edge_blocked_ip"
         assert 1 <= int(res.headers["Retry-After"]) <= 30
         assert not _paths(mock, before)  # hold 期零上游流量
 

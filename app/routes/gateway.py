@@ -2874,7 +2874,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             if channel == "zai" and needs_captcha:
                 # 闸门会拒时不要先花一枚验证码再被拒（上游 2.7.23）
                 _refuse = gate.refusal_reason()
-                if _refuse:
+                # edge_hold 交给后面的 edge.held 分支回 405 契约（不在这里 503）
+                if _refuse and _refuse != "edge_hold":
                     if _jump_to_fallback():
                         logs.warn(req_id, f"账号 {account.name} 闸门 {_refuse}，直接切 API Key 回退")
                         needs_captcha = False
@@ -2934,8 +2935,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     continue
                 reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中",
                                     status=405, kind="edge")
-                # 交 dispatch 闸门兜底（503 + gate_edge_hold + Retry-After）
-                return _NEXT_ACCOUNT
+                # fork 契约：405 + edge_blocked_ip（OmniRoute/magpie 据此切 provider）
+                return _edge_response(account.provider)
 
             # 进程级闸门（上游 2.7.23）：只对 zcode-plan 渠道生效。被拒时优先
             # 下沉 API Key 渠道；无可下沉时换号，交给 dispatch 兜底。
@@ -3088,8 +3089,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     if _jump_to_fallback():
                         needs_captcha = False
                         continue
-                    # 交 dispatch 闸门兜底：503 + type=gate_edge_hold + Retry-After
-                    return _NEXT_ACCOUNT
+                    return _edge_response(account.provider)
 
                 # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
                 # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控

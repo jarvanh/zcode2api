@@ -466,7 +466,9 @@ def _candidate_plan_ids(account: Account) -> list[str]:
     id 直接剔除（必定 1003，白打一次）。
     """
     held = _held_plan_ids(account)
-    out = [pid for pid in _date_plan_candidates() + known_plan_ids()
+    # 收割到的事实优先于命名规律猜测：预算只有 4 个，日期候选（今日 3~4 个）
+    # 若排在前面会把真正的投放 id 挤出当日窗口（2026-11-12 实证）。
+    out = [pid for pid in known_plan_ids() + _date_plan_candidates()
            if pid and pid not in held]
     return list(dict.fromkeys(out))
 

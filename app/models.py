@@ -95,7 +95,10 @@ def _plan_bonus_active(plan: dict, now: float) -> bool:
     for e in (plan or {}).get("entitlements") or []:
         if e.get("period") != "one_time":
             continue
-        eff = expires_epoch(e.get("effective_at"))
+        # 上游实测键名是 starts_at（billing/balance plans[].entitlements[]），
+        # effective_at 是 zcode-switch 侧口径；只认后者会恒判「无赠送池」
+        # （2026-10-31 实证：日窗用完但 5 亿一次性池仍在的号被误标 exhausted）。
+        eff = expires_epoch(e.get("effective_at") or e.get("starts_at"))
         ends = expires_epoch(e.get("ends_at") or e.get("expires_at"))
         if eff and eff <= now and (ends is None or now <= ends):
             return True
