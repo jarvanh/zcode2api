@@ -32,8 +32,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
 
-from app.store import Store  # noqa: E402
 from app.models import Account  # noqa: E402
+from app.store import Store  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LISTENERS = [7891, 7892, 7893, 7894]  # mihomo pinned listeners（gen-config.py ACCT_SPEC）

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from . import body_transform, constants, settings
+from . import body_transform, constants, endpoint_routing, settings
 from .identity import build_identity_headers, build_trace_headers
 from .models import Account
 
@@ -136,6 +136,10 @@ def build_request(
             device_mid=profile.device_mid,
             session_id=session_id,
         )
+        # 端点映射跟随（fail-open，fork 移植）：按上游 agent/configs 快照改写
+        # URL；标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）。
+        extra_headers: dict[str, str] = {}
+        target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
         # Start Plan 请求头部对齐 Magpie packages/zcode/index.mjs startHeaders：
         # 不带 anthropic-beta（工具搜索 beta 仅 coding-plan 用）、不带 x-api-key
         # （仅 Authorization: Bearer JWT）。旧「vlelyanin 实证」下发的这两项

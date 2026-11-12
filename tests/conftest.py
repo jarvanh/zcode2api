@@ -28,6 +28,8 @@ from httpx import ASGITransport, AsyncClient
 # 故此处先占位成测试基线值：后台 key 用代码默认 zcode，网关 key 置空。
 os.environ["ZCODE_ADMIN_KEY"] = "zcode"
 os.environ["ZCODE_GATEWAY_KEY"] = ""
+# 网关安全默认（v2.9.46）：无网关 Key 时拒绝非回环监听，测试基线钉回回环
+os.environ["ZCODE_HOST"] = "127.0.0.1"
 # 领取窗口默认值：生产 .env 通常配 ZCODE_CLAIM_ROUND_HOURS=19,20,21,22,23,0，
 # load_dotenv() 会把 test_claim_window 的「默认 = [19]」基线顶掉（2026-11-10
 # 实证两例稳定失败）。与 admin/gateway key 同样钉回代码默认，测试要覆盖
@@ -200,6 +202,21 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     # 否则 auto_claim 后台任务用真实单例起 solver 子进程/打真网，同样挂死 teardown。
     from app import claim as claim_module
     monkeypatch.setattr(claim_module, "captcha_manager", stub_captcha)
+
+    # 进程级闸门/断路器是模块单例，跨用例残留 hold 会把后续用例全本地拒绝；
+    # 每用例起点归零（与生产「进程重启」同语义）。
+    from app.gate import gate as _gate
+    _gate._window_start = 0.0
+    _gate._window_count = 0
+    _gate._inflight = 0
+    _gate._edge_until = 0.0
+    _gate.edge_hits = 0
+    _gate._busy_hits = []
+    _gate._busy_until = 0.0
+    _gate._pool_hold_until = 0.0
+    gateway_module._busy_hold["until"] = 0.0
+    gateway_module._busy_hold["hits"] = []
+    gateway_module._busy_gate_until.clear()
 
     from app.main import create_app
     gateway = create_app()

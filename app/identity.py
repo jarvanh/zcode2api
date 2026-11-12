@@ -133,11 +133,10 @@ def build_trace_headers(session_id: str | None = None,
     与官方的已知残留差异：官方 session-id/query-id 在会话/查询内稳定，
     hub 无会话态、每请求全新——形状一致、生命周期更短，属可接受漂移。
     """
-    return {
+    headers = {
         "x-request-id": str(uuid.uuid4()),
         "x-zcode-session-type": "main",
         "x-zcode-trace-id": str(uuid.uuid4()),
-        "x-query-id": str(uuid.uuid4()),
         "x-zcode-query-source": "main_turn",
         "x-session-id": session_id or _session_affinity_id() or str(uuid.uuid4()),
     }
