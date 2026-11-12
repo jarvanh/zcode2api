@@ -207,6 +207,9 @@ class TestCaptchaEgressSeparation:
             # 进程观测）；桩缺这个属性会掩盖接线错误。
             pid = 424242
 
+            def kill(self) -> None:
+                pass  # Windows 退化路径（无 killpg）：杀 node 本体
+
             async def communicate(self):
                 return b"VERIFY_PARAM=mock\n", b""
 

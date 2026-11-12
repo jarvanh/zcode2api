@@ -9,8 +9,7 @@ from __future__ import annotations
 import json
 import uuid
 
-from . import body_transform, constants, endpoint_routing, settings
-from .captcha import captcha_manager
+from . import body_transform, constants, settings
 from .identity import build_identity_headers, build_trace_headers
 from .models import Account
 
@@ -18,7 +17,6 @@ from .models import Account
 _DROP_HEADERS = {
     "host",
     "content-length",
-    "content-type",
     "x-api-key",
     "authorization",
     "user-agent",
@@ -32,10 +30,6 @@ _DROP_HEADERS = {
     "connection",
     "true-client-ip",
     "x-original-forwarded-for",
-    # 协议头固定由本服务生成（application/json / anthropic-version），
-    # 客户端自定义值（如 multipart boundary、异常版本号）会破坏上游请求形状
-    "anthropic-version",
-    "anthropic-beta",
     # 身份/追踪头由本服务仿真生成，禁止客户端透传覆盖（指纹一致性）
     "x-device-mid",
     "x-request-id",
@@ -81,17 +75,7 @@ def build_request(
 
     upstream_key：显式指定上游通道键（gateway 渠道优先梯驱动）；None 时按
     账号能力自动选：JWT → `zai`（zcode-plan 代理）→ `zai_fallback`
-    （API Key）。plan_std 通道已随上游 df42a2d 移除（OAuth token 打不了
-    标准 Anthropic 端点）。
-
-    fork 增强保留（v2.9.41 合并，随上游 df42a2d 拆除 plan_std 后重挂）：
-    - 自动路由先过 plan_lane_available（通道级风控门禁）：plan 腿正在冷却
-      且有回退 Key 时直接路由 zai_fallback，不把封锁拆开重踩；无回退时
-      仍维持 zai，交给上游定成败。
-    - 端点映射跟随（endpoint_routing.apply，fail-open）作用于 zai 通道。
-    - CAPTCHA_ATTACH_PLAN（C 档，默认关）：zai 通道每请求附一枚池内验证码。
-    plan_std 通道随上游 df42a2d 移除；fork per-account 环境注入随之退役
-    （上游按 Magpie dress() 固定环境段，与版本锁校验配套）。
+    （API Key）。
     """
     provider = account.provider
 
@@ -99,15 +83,7 @@ def build_request(
         if upstream_key:
             key = upstream_key
         elif account.uses_plan_channel() and not force_fallback:
-            # 通道级风控门禁（fork，挂回上游 zai/apikey 二元框架）：plan 腿
-            # 正在通道级冷却且有回退 Key 时直接走 Key 通道，不把封锁拆开重踩
-            # （plan_lane_available 语义：无回退时仍维持 zai，交给上游定成败）。
-            if account.api_key and not account.plan_lane_available(
-                body.get("model") if isinstance(body.get("model"), str) else ""
-            ):
-                key = "zai_fallback"
-            else:
-                key = "zai"
+            key = "zai"
         elif account.api_key:
             key = "zai_fallback"
         else:
@@ -143,15 +119,16 @@ def build_request(
         raise RuntimeError(f"未知上游通道: {key}")
 
     if plan_style:
-        # Plan 系通道：LLM 身份头（g6n：无 Device-Mid、UA 带 SDK 后缀）+ 追踪头。
-        # 会话粘性（2.7.x 并入）：同首轮文本 → 同 session_id，官方会话内稳定，
-        # 上游 prompt cache 依赖它。必须在 transform_body 之前算——日期轮会插到
-        # messages[0] 改变首轮内容。device_mid/session_id 同时喂 attribution blob，
-        # 与 x-session-id 同值（不一致会构成指纹矛盾）。
+        # Plan 系通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
         from .fingerprint import profile_for
 
         profile = profile_for(account)
+        # 会话粘性：同首轮文本 → 同 session_id（官方会话内稳定，cache 依赖它）。
+        # 必须在 transform_body 之前算——日期轮会被插到 messages[0]。
         session_id = body_transform.conversation_session_id(body, account.id) or str(uuid.uuid4())
+        # 轮次粘性：同一次提问（含其工具循环）→ 同 query-id（官方 3.17.2
+        # attribution 语义，Magpie queryOf 同构）。同样必须在日期轮注入前算。
+        query_id = body_transform.conversation_query_id(body, session_id)
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
         body = body_transform.transform_body(
@@ -159,11 +136,6 @@ def build_request(
             device_mid=profile.device_mid,
             session_id=session_id,
         )
-        # 端点映射跟随（fail-open，fork 移植）：按上游 agent/configs 快照
-        # 改写 URL；标记条目带 X-ZCode-Authorization（本侧有 JWT 才附）。
-        # plan_style 现仅剩 zai（zcode-plan JWT）通道，端点代理语义不变。
-        extra_headers: dict[str, str] = {}
-        target_url, extra_headers = endpoint_routing.apply(target_url, account.jwt_token)
         # Start Plan 请求头部对齐 Magpie packages/zcode/index.mjs startHeaders：
         # 不带 anthropic-beta（工具搜索 beta 仅 coding-plan 用）、不带 x-api-key
         # （仅 Authorization: Bearer JWT）。旧「vlelyanin 实证」下发的这两项
@@ -173,7 +145,7 @@ def build_request(
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
             **build_identity_headers(account),
-            **build_trace_headers(session_id),
+            **build_trace_headers(session_id, query_id),
             **extra_headers,
         }
     else:
@@ -189,18 +161,12 @@ def build_request(
         }
     if verify_param:
         headers[constants.CAPTCHA_HEADER] = verify_param
-    if settings.CAPTCHA_ATTACH_PLAN and not verify_param and key == "zai":
-        # C 档（默认关，fork 保留）：plan 通道每请求附一枚池内验证码 token
-        # （zcode-api 实弹：验证码头是 start-plane 承重结构，裸发会被 ESA
-        # 边缘间歇拒绝）。仅在池内直取（try_take_now 绝不现解），池空
-        # fail-open 按无码形态发出。
-        token = captcha_manager.try_take_now()
-        if token:
-            headers[constants.CAPTCHA_HEADER] = token[0]
-            if token[1]:
-                headers[constants.CAPTCHA_REGION_HEADER] = token[1]
     if verify_region:
         headers[constants.CAPTCHA_REGION_HEADER] = verify_region
+
+    # ToolSearch 别名全通道生效（api.z.ai 同症，Magpie searchless 同款）；
+    # Plan 通道 transform_body 已做过，此处幂等
+    body_transform.apply_tool_search_alias(body)
 
     for hdr, value in (incoming_headers or {}).items():
         lower = hdr.lower()

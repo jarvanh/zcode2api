@@ -318,3 +318,12 @@ RISK_CONTROL_MARKERS = (
 # 判别只看响应体：正常响应都是 JSON/SSE，拦截页则是 HTML 错误页。
 EDGE_PAGE_MARKERS = ("errors.aliyun.com",)
 EDGE_PAGE_HTML_HINTS = ("<!doctype", "<html")
+# ── 边缘封禁（IP 级，与账号级 3012 区分）─────────────────────────────────────
+# 405 + HTML/「address blocked」= 出口 IP 被边缘整体封禁：换账号无用，必须
+# 全进程暂停 plan 渠道（app/gate.py）。裸 405 / JSON 3012 才归账号风控。
+EDGE_BLOCK_MARKERS = (
+    "address was blocked",
+    "network's address",
+    "blocked by the edge",
+)
+

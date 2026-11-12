@@ -82,6 +82,10 @@ Body：标准 Anthropic Messages（`model/max_tokens/stream/system/messages`）�
 
 LLM 请求头实况（g6n 构造器，与控制面 TV 头集的差异）：**无 X-Device-Mid**（LLM 请求从不带）；UA 附 anthropic SDK 后缀；附语言/时区/Os-Category；另带 attribution 追踪头六件（`x-request-id` / `x-zcode-session-type: main` / `x-zcode-trace-id` / `x-query-id` / `x-zcode-query-source: main_turn` / `x-session-id`，逐请求全新 UUID；会话亲和 enforce 档下 `x-session-id` 同会话稳定，见 v2.9.1）。思考预算契约（v2.9.0）：GLM-5.3 家族 OpenAI 入站注入 `thinking` + `output_config`，`max_tokens += 预算` 再按模型上限截顶。
 
+**Body 形状（网关统一变换，`app/body_transform.py`）**：system 严格三块（cliPrefix / stableSections / dynamic，3.17.2 逐字节，见 `zcode_system.json`）；首条 user 轮前插 `<system-reminder>Today's date is …</system-reminder>`；末条消息最后一块打 `cache_control: ephemeral`；`metadata.user_id` = `{"device_id": mid, "account_uuid": "", "session_id": sid}`。**ToolSearch 别名**：客户端的 Claude Code 会带 ToolSearch 工具（defer_loading 延迟加载），上游见到**原名**会把其余工具全部藏起——网关改名 `ToolSearchTool`、剥 `defer_loading`、丢 `DeferredToolPlaceholder`，响应侧在流式透传中还原回原名（Magpie searchless/searchNamed 同款，api.z.ai 同症全通道生效）。
+
+**attribution 生命周期（会话/轮内稳定，非每请求全新）**：`x-session-id` 与 metadata blob 的 `session_id` 同值，会话内稳定（hub 用「会话首轮文本」派生）；`x-query-id` 由「会话 + 用户轮计数」确定性派生（`conversation_query_id`），一次提问带出的全部请求（含工具循环）同值——工具循环里 N 个请求 N 个 query-id 是可被上游统计的行为指纹。
+
 API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证码头。
 
 **验证码 verifyParam**：Bun+happy-dom 运行阿里云官方无痕 SDK（vendored 上游 captcha-happy.ts，回退 node 移植版）（`AliyunCaptcha.js`，o.alicdn.com），`startTracelessVerification()` 成功回调给出 `verifyParam = base64(JSON{certifyId, sceneId, isSign, securityToken})`；sceneId/region/prefix 从 `client/configs` 动态取（默认 `11xygtvd/sgp/no8xfe`）。挑战形态：403 + captcha 头；或 400 + body `{"code":3007}`。

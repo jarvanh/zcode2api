@@ -334,10 +334,13 @@ async def add_accounts(payload: dict = Body(...)):
 # ── 删除账号 ─────────────────────────────────────────────────────────────────
 @router.delete("/accounts")
 async def delete_accounts(ids: list[str] = Body(...)):
+    from .gateway import clear_key_no_balance
+
     deleted = 0
     for aid in ids:
         acc = store.find_any(aid)
         if acc and store.remove_account(acc.provider, aid):
+            clear_key_no_balance(aid)  # 删除即无残留（Key-1113 冷却记忆）
             deleted += 1
     return {"deleted": deleted}
 
@@ -364,6 +367,10 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             acc.jwt_token = None
         acc.status = Status.ACTIVE
         acc.last_error = None
+        # 凭证变更 = 明确重试意图：清掉 Key 无资源包（1113）的选号冷却
+        from .gateway import clear_key_no_balance
+
+        clear_key_no_balance(account_id)
     if "proxy_url" in payload:
         # 账号级出口代理（空串 = 清除恢复直连）；非法协议在写入口拒绝，不落库
         try:
@@ -382,6 +389,14 @@ async def set_enabled(account_id: str, payload: dict = Body(...)):
         raise HTTPException(404, "账号不存在")
     enabled = bool(payload.get("enabled", True))
     store.set_enabled(acc.provider, account_id, enabled)
+    if enabled:
+        # 人工启用 = 明确要求立即重试：清掉 Key 无资源包（1113）与
+        # 模型级额度耗尽（1005）的选号冷却
+        from ..plan_guard import clear_account as _pg_clear_account
+        from .gateway import clear_key_no_balance
+
+        clear_key_no_balance(account_id)
+        _pg_clear_account(account_id)
     return {"ok": True}
 
 

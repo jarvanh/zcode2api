@@ -194,6 +194,38 @@ def _parse_certify_id(param: str) -> str | None:
     return cid if isinstance(cid, str) and cid else None
 
 
+def _kill_orphan_chromium() -> int:
+    """清扫孤儿 Chromium 进程（PPID==1），返回击杀数。
+
+    Chromium 启动后会 setsid 脱离 node 的进程组；node 被 SIGKILL（求解超时）
+    或同步卡死时，killpg(node 组) 打不到逃逸的 Chromium，必须按孤儿特征兜底：
+    父进程已死的 Chromium 必为泄漏残留（并发求解中活跃 Chromium 的父进程是
+    活着的 node，PPID≠1，不会误杀）。判据用 puppeteer 的临时 profile 目录，
+    避免误杀同机其它 Chromium。非 Linux（无 /proc）直接跳过。
+    """
+    killed = 0
+    try:
+        entries = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as f:
+                raw = f.read().decode("utf-8", "ignore")
+            ppid = int(raw.rsplit(")", 1)[1].split()[1])
+            if ppid != 1:
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", "ignore")
+            if "puppeteer_dev_chrome_profile" not in cmdline:
+                continue
+            os.kill(int(entry), signal.SIGKILL)
+            killed += 1
+        except (OSError, ValueError, IndexError):
+            continue
+    return killed
+
+
 class _Token:
     __slots__ = ("param", "region", "born_at", "certify_id", "egress")
 

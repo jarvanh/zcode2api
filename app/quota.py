@@ -14,6 +14,7 @@ import httpx
 
 from . import business_error, constants, logs, settings
 from .models import Account, Status, expires_epoch, window_expired, window_usable
+from .models import _plan_bonus_active as _bonus_active
 from .quota_windows import pending_plan_start
 from .store import store
 
@@ -76,33 +77,6 @@ def _auth_headers(account: Account) -> dict:
     elif account.api_key:
         headers["x-api-key"] = account.api_key
     return headers
-
-
-def _bonus_active(plan: dict, now: float) -> bool:
-    """plan 是否带有已生效的一次性赠送授权（balance 不含这类额度）。
-
-    用于额度耗尽判定：日窗口用完但赠送池有效时，账号仍有真实可用额度。
-    """
-    for e in (plan or {}).get("entitlements") or []:
-        if e.get("period") != "one_time":
-            continue
-        # 上游实测键名是 starts_at（billing/balance plans[].entitlements[]），
-        # effective_at 是 zcode-switch 侧口径；只认后者会恒判「无赠送池」，
-        # 日窗用完但 5 亿一次性池仍在的账号被误标 exhausted（2026-10-31 实证）
-        eff = e.get("effective_at") or e.get("starts_at") or 0
-        ends = e.get("ends_at") or e.get("expires_at") or 0
-        # 与 quota_windows.pending_plan_start 同口径：上游秒/毫秒都可能下发，
-        # 不归一则毫秒 effective_at 永远判「未生效」（2026-11-04 补）。
-        try:
-            eff = float(eff)
-            ends = float(ends)
-        except (TypeError, ValueError):
-            continue
-        eff = eff / 1000 if eff > 1e12 else eff
-        ends = ends / 1000 if ends > 1e12 else ends
-        if eff and eff <= now and (not ends or now <= ends):
-            return True
-    return False
 
 
 def quota_recoverable(account: Account, quota_map: dict, now: float) -> tuple[bool, bool]:

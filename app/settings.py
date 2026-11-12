@@ -283,6 +283,21 @@ RISK_FAIL_FAST = _bool("ZCODE_RISK_FAIL_FAST", True)       # 防放大器总开�
 # 上限与 lane 冷却 10min 封顶对齐——任何机制都不把池子压住超过 10 分钟。
 RISK_WAVE_PAUSE = _int("ZCODE_RISK_WAVE_PAUSE", 90)        # 波次暂停基础秒数（0 = 关闭）
 RISK_WAVE_PAUSE_MAX = _int("ZCODE_RISK_WAVE_PAUSE_MAX", 600)  # 暂停指数延长上限
+
+# ── 进程级上游闸门（只作用于 zcode-plan 渠道，见 app/gate.py）────────────────
+GATE_RATE_PER_MIN = _int("ZCODE_GATE_RATE_PER_MIN", 0)
+GATE_MAX_INFLIGHT = _int("ZCODE_GATE_MAX_INFLIGHT", 0)
+GATE_EDGE_HOLD_SECONDS = _int("ZCODE_GATE_EDGE_HOLD_SECONDS", 180)
+GATE_BUSY_THRESHOLD = _int("ZCODE_GATE_BUSY_THRESHOLD", 5)
+GATE_BUSY_WINDOW_SECONDS = _int("ZCODE_GATE_BUSY_WINDOW_SECONDS", 60)
+GATE_BUSY_HOLD_SECONDS = _int("ZCODE_GATE_BUSY_HOLD_SECONDS", 180)
+GATE_POOL_HOLD_MAX_SECONDS = _int("ZCODE_GATE_POOL_HOLD_MAX", 3600)
+# 429/code 1302/1303「真限流」：账号休息该时长（秒），请求下沉下一渠道/换号
+RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
+# Key 通道 1113「无资源包」后的选号冷却（秒）
+KEY_NO_BALANCE_COOLDOWN = _int("ZCODE_KEY_NO_BALANCE_COOLDOWN", 3600)
+# Plan 通道模型级额度耗尽（1005 exceed quota limit）后的选号冷却（秒）
+PLAN_MODEL_EXHAUST_COOLDOWN = _int("ZCODE_PLAN_MODEL_EXHAUST_COOLDOWN", 1800)
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
@@ -363,7 +378,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.46"
+APP_VERSION = "2.9.47"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

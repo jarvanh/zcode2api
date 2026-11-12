@@ -109,7 +109,8 @@ def build_identity_headers(account=None) -> dict[str, str]:
 
 
 
-def build_trace_headers(session_id: str | None = None) -> dict[str, str]:
+def build_trace_headers(session_id: str | None = None,
+                        query_id: str | None = None) -> dict[str, str]:
     """追踪头：每请求全新 UUID（对齐官方 3.16.3 attribution 构造器）。
 
     session_id 传入时复用为 x-session-id —— 官方同一会话内 x-session-id 与
@@ -140,6 +141,9 @@ def build_trace_headers(session_id: str | None = None) -> dict[str, str]:
         "x-zcode-query-source": "main_turn",
         "x-session-id": session_id or _session_affinity_id() or str(uuid.uuid4()),
     }
+    if query_id:
+        headers["x-query-id"] = query_id
+    return headers
 
 
 def _session_affinity_id() -> str | None:

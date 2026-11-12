@@ -30,6 +30,26 @@ if (!scene) {
 const DEBUG = /^(1|true|yes)$/i.test(process.env.CAPTCHA_DEBUG || "");
 const dbg = (m) => { if (DEBUG) process.stderr.write(`[pw] ${m}\n`); };
 
+// ── Chromium 进程清理 ─────────────────────────────────────────────────────────
+// 实测（Linux 容器）：Chromium 启动后会 setsid 脱离 node 的进程组（PGID=SESS=自身），
+// 调用方对 node 进程组 killpg 打不到它，必须在 node 侧主动清理：
+//   · process.on("exit")：正常退出 / exit(code) / 未捕获异常时同步补杀；
+//   · 硬超时：早于调用方（captcha.py）超时 20s 自我了断，防止 NAS 小内存盒上的
+//     挂死（实测可挂 25 分钟+）迫使调用方 SIGKILL，留下清不掉的逃逸 Chromium。
+let chromePid = null;
+function killChrome() {
+  if (!chromePid) return;
+  try { process.kill(-chromePid, "SIGKILL"); } catch { /* 未成组长，按单进程杀 */ }
+  try { process.kill(chromePid, "SIGKILL"); } catch { /* 已退出 */ }
+}
+process.on("exit", killChrome);
+const HARD_DEADLINE_MS = Number(process.env.ZCODE_SOLVE_DEADLINE_MS) || 210_000;
+setTimeout(() => {
+  process.stderr.write("[pw] 硬超时，清场退出\n");
+  killChrome();
+  process.exit(2);
+}, HARD_DEADLINE_MS);
+
 // ── 内存门：可用内存不足时不启 Chromium（每个实例数百 MB），快速退出等下轮 ──
 function memAvailableMB() {
   try {
@@ -163,13 +183,13 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     // 关闭，Chrome 检测到管道断裂即自行退出，从根上杜绝孤儿。
     pipe: true,
   });
+  chromePid = browser.process() ? browser.process().pid : null;
   const stopWatchdog = oomWatchdog(browser.process() ? browser.process().pid : process.pid);
   try {
-    const page = await browser.newPage();
-    await page.setUserAgent(UA, {
-      architecture: "x86", bitness: "64", mobile: false, model: "",
-      platform: "Windows", platformVersion: "10.0.0", wow64: false,
-    });
+    // 复用 launch 自带的 about:blank 目标：Target.createTarget 在小内存 LXC
+    // + CDP 下实测 ~50% 概率 Target closed，复用缺省页规避该操作（2026-11-11 排查）
+    const page = (await browser.pages())[0];
+    await page.setUserAgent(UA);
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
       Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en"] });
@@ -181,7 +201,12 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     dbg("SDK ready");
 
     return await page.evaluate(async (scene, region, prefix) => {
-      window.AliyunCaptchaConfig = { region, prefix };
+      // region=cn/空 不设 AliyunCaptchaConfig：SDK 缺省即 CN 端点；且实测显式
+      // 配置会走完整 UI 验证流，被风控拒（F001）后 SDK 弹 popup 兜底，触发
+      // --single-process 下 Chrome 的 FATAL:check.cc NOTREACHED 崩溃（整个
+      // 浏览器死，2026-11-11 dumpio 实证）。不设配置走降级无痕路径稳定出参。
+      // sgp（代理出口）需显式配置切新加坡端点。
+      if (region && region !== "cn") window.AliyunCaptchaConfig = { region, prefix };
       return await new Promise((resolve) => {
         let done = false;
         const finish = (v) => { if (!done) { done = true; resolve(v || null); } };
@@ -210,6 +235,9 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     }, scene, region, prefix);
   } finally {
     stopWatchdog();
-    try { await browser.close(); } catch { /* 退出码不受影响 */ }
+    let closed = false;
+    try { await browser.close(); closed = true; } catch { /* 退出码不受影响 */ }
+    // close 成功才清空；失败时保留 pid 让 exit 钩子补杀（防逃逸残留）
+    if (closed) chromePid = null;
   }
 }
