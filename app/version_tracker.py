@@ -24,12 +24,35 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import yaml
 
-from . import constants, logs, settings
+from . import constants, hostinfo, logs, settings
 from .constants import is_newer_version
+
+
+def manifest_url(channel: str, base_url: str | None = None) -> str:
+    """把清单 URL 的 channel 参数换成指定值（保留其他查询参数）。
+
+    测试会把 settings.ZCODE_MANIFEST_URL 整体指向 Mock，所以这里只改
+    channel 一项，不拼新地址；解析失败时返回原 URL（宁可不查，不构造错地址）。
+    """
+    url = base_url or settings.ZCODE_MANIFEST_URL
+    try:
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query["channel"] = str(channel)
+        return urlunsplit(parts._replace(query=urlencode(query)))
+    except ValueError:
+        return url
+
+
+def manifest_channels() -> list[str]:
+    raw = str(getattr(settings, "ZCODE_MANIFEST_CHANNELS", "1") or "")
+    channels = [c.strip() for c in raw.split(",") if c.strip()]
+    return channels or ["1"]
 
 
 @dataclass
@@ -39,6 +62,8 @@ class VersionInfo:
     release_name: str = ""
     release_notes: str = ""
     checked_at: float = 0.0
+    # 该版本的来源通道（"1"/"3"/"local"）；只用于展示与择源，不参与版本比较
+    channel: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,6 +76,7 @@ class VersionInfo:
             release_name=str(data.get("release_name") or ""),
             release_notes=str(data.get("release_notes") or ""),
             checked_at=float(data.get("checked_at") or 0.0),
+            channel=str(data.get("channel") or ""),
         )
 
 
@@ -150,15 +176,15 @@ class VersionTracker:
                 constants.set_active_version(stored_ver)
                 logs.info("version", f"恢复已同步的 ZCode 官方版本: v{stored_ver}")
 
-    async def fetch_remote_manifest(self) -> VersionInfo | None:
-        """向上游请求最新 manifest。
+    async def fetch_remote_manifest(self, channel: str = "1") -> VersionInfo | None:
+        """向指定发布通道请求最新 manifest。
 
         trust_env=False 直连 + 官方同形 UA（2.7.16 review 修复）：自定义 UA
         （原 ZCode-Hub-Tracker）等于向上游 WAF 自报非官方代理身份；且 hub 进程
         env 代理（127.0.0.1:10822）2026-11-04 实测完全超时（15s HTTP 000），
         直连才是可用出口——与 claim/billing 链路同出口策略。
         """
-        url = settings.ZCODE_MANIFEST_URL
+        url = manifest_url(channel)
         try:
             async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
                 res = await client.request(
@@ -170,12 +196,47 @@ class VersionTracker:
                     },
                 )
                 if res.status_code != 200:
-                    logs.warn("version", f"查询官方版本 manifest 失败: HTTP {res.status_code}")
+                    logs.warn("version", f"查询官方版本 manifest 失败（channel={channel}）: HTTP {res.status_code}")
                     return None
-                return parse_manifest(res.text)
+                info = parse_manifest(res.text)
+                if info:
+                    info.channel = str(channel)
+                return info
         except Exception as err:
-            logs.warn("version", f"查询官方版本 manifest 异常: {err}")
+            logs.warn("version", f"查询官方版本 manifest 异常（channel={channel}）: {err}")
             return None
+
+    async def fetch_latest_across_channels(self) -> VersionInfo | None:
+        """各发布通道 + 本机官方运行时取最高版本。
+
+        三个信息源语义不同：桌面稳定通道（1）是保守口径，预览通道（3）可能
+        先拿到新版，本机 server/CLI 运行时（~/.zcode/server/current.json）又
+        是另一条轨道。只看稳定通道会把「官方最新」永远钉在旧版（2026-11-11
+        3.17.2 vs 3.18.1 事件）。能否真的顶版仍由正文锁把关，这里只负责
+        「看得见最新的」。
+        """
+        infos: list[VersionInfo] = []
+        for channel in manifest_channels():
+            info = await self.fetch_remote_manifest(channel)
+            if info:
+                infos.append(info)
+        local_ver = hostinfo.local_client_version()
+        if local_ver:
+            infos.append(
+                VersionInfo(
+                    version=local_ver,
+                    release_name="本机官方运行时",
+                    checked_at=time.time(),
+                    channel="local",
+                )
+            )
+        if not infos:
+            return None
+        best = infos[0]
+        for info in infos[1:]:
+            if is_newer_version(info.version, best.version):
+                best = info
+        return best
 
     def _fresh_result(self) -> dict | None:
         """新鲜窗口内的缓存结果；过期/从未核验返回 None。"""
@@ -208,7 +269,7 @@ class VersionTracker:
         """真正的探测与同步（调用方须持锁）。"""
         from .store import store
 
-        info = await self.fetch_remote_manifest()
+        info = await self.fetch_latest_across_channels()
         if not info:
             current_ver = constants.CLIENT_APP_VERSION
             latest_ver = self.latest_info.version if self.latest_info else current_ver
@@ -226,6 +287,7 @@ class VersionTracker:
                 "release_name": self.latest_info.release_name if self.latest_info else "",
                 "release_notes": self.latest_info.release_notes if self.latest_info else "",
                 "checked_at": self.latest_info.checked_at if self.latest_info else 0.0,
+                "latest_channel": self.latest_info.channel if self.latest_info else "",
             }
 
         self.latest_info = info
@@ -276,6 +338,7 @@ class VersionTracker:
             "release_name": info.release_name,
             "release_notes": info.release_notes,
             "checked_at": info.checked_at,
+            "latest_channel": info.channel,
         }
 
     async def _loop(self) -> None:

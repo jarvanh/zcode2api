@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import constants
+from app.version_tracker import manifest_channels as vt_manifest_channels
 from app.constants import is_newer_version, parse_semver
 from app.version_tracker import (
     VersionInfo,
@@ -99,13 +100,14 @@ async def test_tracker_freshness_cache(fresh_app, monkeypatch):
     fetch = AsyncMock(return_value=mock_info)
     monkeypatch.setattr(tracker, "fetch_remote_manifest", fetch)
 
+    per_round = len(vt_manifest_channels())
     res1 = await tracker.check_and_sync()
     res2 = await tracker.check_and_sync()
-    assert fetch.await_count == 1
+    assert fetch.await_count == per_round
     assert res2 is res1
 
     res3 = await tracker.check_and_sync(force=True)
-    assert fetch.await_count == 2
+    assert fetch.await_count == per_round * 2
     assert res3 is not res1
 
 
@@ -122,7 +124,7 @@ async def test_tracker_concurrent_checks_dedup(fresh_app, monkeypatch):
     monkeypatch.setattr(tracker, "fetch_remote_manifest", fetch)
 
     r1, r2 = await asyncio.gather(tracker.check_and_sync(), tracker.check_and_sync())
-    assert fetch.await_count == 1
+    assert fetch.await_count == len(vt_manifest_channels())
     assert r1["ok"] is True
     assert r2 is r1
 
@@ -244,3 +246,57 @@ def test_tracker_init_from_store_applies_aligned_version(fresh_app):
         assert constants.CLIENT_APP_VERSION == "3.17.1"
     finally:
         constants.set_active_version(orig)
+
+
+def test_manifest_url_rewrites_only_channel():
+    from app.version_tracker import manifest_url
+
+    url = manifest_url(
+        "3",
+        "https://example.com/api/v1/releases/electron/manifest?platform=darwin-aarch64&channel=1",
+    )
+    assert "channel=3" in url
+    assert "platform=darwin-aarch64" in url
+    assert "channel=1" not in url
+
+
+@pytest.mark.asyncio
+async def test_latest_across_channels_picks_highest(monkeypatch):
+    """稳定通道 3.17.2 / 预览通道 3.18.1 / 本机运行时 3.18.0 → 取 3.18.1。
+
+    2026-11-11 事故：只看 channel=1 会把「官方最新」永远钉在 3.17.2，面板
+    因此显示「已是最新版」而本机官方运行时已经是 3.18.0。
+    """
+    from app import version_tracker as vt
+
+    tracker = vt.VersionTracker()
+
+    async def fake_fetch(channel: str):
+        table = {"1": "3.17.2", "3": "3.18.1"}
+        ver = table.get(channel)
+        return vt.VersionInfo(version=ver, channel=channel) if ver else None
+
+    monkeypatch.setattr(tracker, "fetch_remote_manifest", fake_fetch)
+    monkeypatch.setattr(vt.hostinfo, "local_client_version", lambda: "3.18.0")
+
+    info = await tracker.fetch_latest_across_channels()
+    assert info is not None
+    assert info.version == "3.18.1"
+    assert info.channel == "3"
+
+
+@pytest.mark.asyncio
+async def test_latest_across_channels_falls_back_to_local(monkeypatch):
+    """清单全部失败时，本机官方运行时版本仍是可用信息（不再显示未知）。"""
+    from app import version_tracker as vt
+
+    tracker = vt.VersionTracker()
+
+    async def fake_fetch(channel: str):
+        return None
+
+    monkeypatch.setattr(tracker, "fetch_remote_manifest", fake_fetch)
+    monkeypatch.setattr(vt.hostinfo, "local_client_version", lambda: "3.18.0")
+
+    info = await tracker.fetch_latest_across_channels()
+    assert info is not None and info.version == "3.18.0" and info.channel == "local"

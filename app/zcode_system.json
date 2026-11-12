@@ -1,10 +1,10 @@
 {
   "_meta": {
-    "client_version": "3.18.0",
+    "client_version": "3.18.1",
     "captured_at": "2026-11-11",
-    "source": "ZCode 3.18.0 源码 apps/zcode-cli/packages/core/src/context/sections/identity.ts（zai-org/ZCode@b95ebaffea，commit \"chore: sync ZCode source v3.18.0\"）",
-    "verified_by": "identity.ts 与 3.17.2 版逐行比对无差异（buildIdentityPrompt/Harness 文本未变）；块2 只锁身份+Harness",
-    "note": "3.18.0 起 Desktop 段移出 system 块2（改由环境公告 meta_user 下发），块2 = 身份+Harness 单段；升级须同步抬 PROMPT_ALIGNED_VERSION 与 CLIENT_APP_VERSION"
+    "source": "ZCode 3.18.1 官方 AppImage（electron 预览清单 channel=3）内 resources/glm/zcode.cjs；与 3.18.0 源码（zai-org/ZCode@b95ebaffea）identity.ts 逐段一致",
+    "verified_by": "3.18.1 bundle 逐段比对：cliPrefix/身份+Harness/dynamicBehavior/sessionGuidance/contextManagement 与 3.18.0 同文；块2 仍只有身份+Harness",
+    "note": "3.18.0 起 Desktop 段移出 system 块2（改由环境公告 meta_user 下发）；3.18.0→3.18.1 无正文变化。升级须同步抬 PROMPT_ALIGNED_VERSION 与 CLIENT_APP_VERSION"
   },
   "cliPrefix": "You are ZCode, an interactive agent",
   "stableSections": [

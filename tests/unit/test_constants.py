@@ -61,7 +61,7 @@ def test_set_active_version_clamped_to_prompt_alignment():
 
 
 def test_prompt_aligned_version_is_single_source():
-    assert constants.PROMPT_ALIGNED_VERSION == "3.18.0"
+    assert constants.PROMPT_ALIGNED_VERSION == "3.18.1"
     assert constants.DEFAULT_CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
 
 
@@ -69,13 +69,13 @@ def test_prompt_aligned_version_is_single_source():
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.18.0"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.18.1"
 
 
 def test_client_version_single_source():
-    # 官方客户端 3.18.0（ZCode 源码 package.json 同源；前值 3.17.2 / 3.17.1）
+    # 官方客户端 3.18.1（官方 AppImage 实证；文本与 3.18.0 同源；前值 3.17.2 / 3.17.1）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.18.0"
+    assert constants.CLIENT_APP_VERSION == "3.18.1"
     # 版本头初始值必须等于提示词正文所属版本（否则一启动就错版）
     assert constants.CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
@@ -84,9 +84,9 @@ def test_client_version_single_source():
 
 
 def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.18.0）；zcode-switch 的
+    # billing 族与 messages 指纹版本同源（官方现行版 3.18.1）；zcode-switch 的
     # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.18.0"
+    assert constants.BILLING_APP_VERSION == "3.18.1"
     assert constants.BILLING_TITLE == "Z Code@electron"
     assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"

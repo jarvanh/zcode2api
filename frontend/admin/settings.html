@@ -177,8 +177,10 @@ function renderVersionInfo(d){
   const latestKnown = _latestKnown(d) || d.zcode_client_version || '';
   document.getElementById('cur-zcode-ver').textContent = 'v' + (d.zcode_client_version || '-');
   document.getElementById('latest-zcode-ver').textContent = 'v' + (latestKnown || '-');
+  const _chLabel = {'1': '稳定通道', '3': '预览通道', 'local': '本机运行时'};
   document.getElementById('latest-zcode-ver').title =
-    '桌面端稳定清单 v' + (d.zcode_latest_version || '-') +
+    '最新来源: ' + (_chLabel[d.zcode_latest_channel] || d.zcode_latest_channel || '-') +
+    ' · 桌面端稳定清单 v' + (d.zcode_latest_version || '-') +
     ' · 本机官方运行时 v' + (d.zcode_local_official_version || '-');
   document.getElementById('auto-sync-version').checked = d.auto_sync_client_version !== false;
   const badge = document.getElementById('ver-status-badge');

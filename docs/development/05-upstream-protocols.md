@@ -125,17 +125,22 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.18.0"`（官方
-现行版实证：本机 `~/.zcode/server/current.json` appVersion=3.18.0（2026-11-11 实测；
-前值 3.17.2 为 2026-11-09 实测、3.17.1 为 2026-10-31、3.16.3 为 2026-10-23；
-3.18.0 提示词取自官方源码 identity.ts，正文与 3.17.2 同文，但 **Desktop 段
-（# ZCode Desktop Context）随官方移出 system 块2**，改由环境公告/meta_user
-下发，块2 只剩身份+Harness，见 zcode_system.json _meta）；桌面端 electron
-稳定清单（channel=1）2026-11-11 仍报 3.17.2——server/CLI 轨道与桌面稳定清单
-是两个发布轨道，升版以 server current.json / 官方源码为准，清单滞后不回退；
-zcode-switch Windows 路径读注册表本机真实版同源。
-**升版先改此常量**；网关启动时比对本机 current.json 并在落伍时告警
-（app/main.py `_warn_version_drift`）。
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.18.1"`（官方
+现行版实证：electron 预览清单 channel=3 报 3.18.1（2026-11-11 实测），其 AppImage
+内 `resources/glm/zcode.cjs` 与 3.18.0 源码逐段比对**正文完全同文**，仅版本号差异；
+前值 3.18.0 为 2026-11-12、3.17.2 为 2026-11-09、3.17.1 为 2026-10-31。
+3.18.0 的关键变更：**Desktop 段（# ZCode Desktop Context）随官方移出 system 块2**，
+改由环境公告/meta_user 下发，块2 只剩身份+Harness（由 zcode_system.json _meta 记录）。
+
+版本探测（`app/version_tracker.py`）取三个源的最高版：桌面稳定清单 channel=1、
+预览清单 channel=3（`ZCODE_MANIFEST_CHANNELS`，默认 `1,3`）与本机 server/CLI
+运行时 current.json。只看稳定清单会把「官方最新」永远钉在旧版（2026-11-11：
+channel=1 → 3.17.2，channel=3 → 3.18.1，本机运行时 3.18.0），面板因此误报
+「已是最新版」。能否真的顶版仍由 `PROMPT_ALIGNED_VERSION` 正文锁把关。
+
+**升版流程**：先用 `scripts/verify_prompt_text.py <官方构建 zcode.cjs>` 对拍正文
+（0 = 同文）→ 抬 `PROMPT_ALIGNED_VERSION` → 实弹一次 `/v1/messages` 确认 200。
+网关启动时比对本机 current.json 并在落伍时告警（app/main.py `_warn_version_drift`）。
 订正 2026-10-31：同一号分别用 3.16.3 / 3.17.1 打 preview 结果一致（都无 data），
 且用 3.16.3 带 plan_id 能领取成功——版本门槛**不是**本次「领不到」的根因）；
 无账号路径的 `CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`）。
