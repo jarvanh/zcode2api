@@ -40,11 +40,11 @@ from .. import (
     session_ctx,
     settings,
 )
-from ..gate import gate
 from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
+from ..gate import gate
 from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota, refresh_accounts
@@ -2921,7 +2921,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     continue
                 reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中",
                                     status=405, kind="edge")
-                return _edge_response(account.provider)
+                # 交 dispatch 闸门兜底（503 + gate_edge_hold + Retry-After）
+                return _NEXT_ACCOUNT
 
             # 进程级闸门（上游 2.7.23）：只对 zcode-plan 渠道生效。被拒时优先
             # 下沉 API Key 渠道；无可下沉时换号，交给 dispatch 兜底。
@@ -3050,7 +3051,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # app/edge.py）。2026-11-05 对齐 magpie 0.1.43（plugins#649）：
                 # 进程级静默、**不给账号记 strike** —— 封的是地址，罚账号只会
                 # 把健康号打进冷却（11-03 那 12 次拦截页就是这么烧掉的）。
-                if status_code == 405 and edge.is_page(text):
+                # 上游宽口径（405 + 边缘页文案/HTML，排除 3012）与 fork edge.py
+                # 载体判定合并；命中即记进程级闸门（gate_edge_hold）。
+                if status_code == 405 and (_is_edge_block(status_code, text) or edge.is_page(text)):
+                    gate.trip_edge()
                     until = edge.arm(account.provider)
                     snippet = " ".join(text.split())[:120]
                     reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
@@ -3071,7 +3075,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     if _jump_to_fallback():
                         needs_captcha = False
                         continue
-                    return _edge_response(account.provider)
+                    # 交 dispatch 闸门兜底：503 + type=gate_edge_hold + Retry-After
+                    return _NEXT_ACCOUNT
 
                 # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
                 # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控
@@ -3128,6 +3133,20 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     return _NEXT_ACCOUNT
 
                 if _is_exhausted(status_code, text):
+                    # 1113 通道感知（覆盖 402/200 承载形态）：Key 通道的 1113 只记
+                    # 选号冷却，不得把账号标 EXHAUSTED（Plan 可能仍在）。
+                    _ex_code = business_error.business_code(_safe_json(text))
+                    if _ex_code == constants.NO_BALANCE_BUSINESS_CODE and channel != "zai":
+                        _key_no_balance[account.id] = time.time() + settings.KEY_NO_BALANCE_COOLDOWN
+                        reqlog.mark_attempt(req_id, account.name, account.mode,
+                                            channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
+                                            status=status_code, ms=(time.time() - attempt_t0) * 1000,
+                                            error="1113 无余额（Key 无资源包），选号冷却", code=1113)
+                        account.record_result(False, "1113 无余额（Key 无资源包），跳过")
+                        store.update_account(account)
+                        logs.warn(req_id, f"账号 {account.name} 1113 无余额（Key），"
+                                  f"选号冷却 {settings.KEY_NO_BALANCE_COOLDOWN}s，账号状态不动")
+                        return _NEXT_ACCOUNT
                     reqlog.mark_attempt(req_id, account.name, account.mode,
                                         channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
                                         status=status_code, ms=(time.time() - attempt_t0) * 1000,
@@ -3176,28 +3195,71 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     # 1113「无余额/无资源包」是 Key 的永久状态（api.z.ai 实测秒回），
                     # 原地等待重试毫无意义，只会把客户端吊死在 RETRY_429_TIMES×WAIT 里
                     # ——快速换号/失败。
-                    if "1113" in text or "insufficient balance" in text.lower():
-                        # fork：1113 无余额做模型级冷却（到期自动回轮询）；上游只跳回退。
+                    _bis_code = business_error.business_code(_safe_json(text))
+                    if _bis_code == constants.NO_BALANCE_BUSINESS_CODE \
+                            or "insufficient balance" in text.lower():
+                        # 通道感知：Plan 1113 = 套餐额度耗尽 → 模型级冷却（fork 语义：
+                        # 同号其它模型额度独立，不整号标死）；Key 1113 = 该 Key 无资源包
+                        # → 只做选号冷却，账号状态/风控计数一律不动。
                         model_key = str(body.get("model") or "")
-                        until = account.cool_model(
-                            model_key,
-                            settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
-                            settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
-                        )
+                        if channel == "zai":
+                            until = account.cool_model(
+                                model_key,
+                                settings.MODEL_NO_QUOTA_COOLDOWN_BASE,
+                                settings.MODEL_NO_QUOTA_COOLDOWN_MAX,
+                            )
+                            reqlog.mark_attempt(req_id, account.name, account.mode,
+                                                channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
+                                                status=429, ms=(time.time() - attempt_t0) * 1000,
+                                                error=f"429 1113 无余额，{model_key} 冷却", code=1113)
+                            account.record_result(
+                                False,
+                                f"429 1113 无余额（{model_key or '-'} 冷却至 "
+                                f"{time.strftime('%H:%M', time.localtime(until))}）",
+                            )
+                            account.last_error = (
+                                f"429 1113 无余额（{model_key or '-'} 冷却至 "
+                                f"{time.strftime('%H:%M', time.localtime(until))}）")
+                            store.update_account(account)
+                            _note_pool_exhausted(account)
+                            if channel == "zai" and model_key and model_key != "-":
+                                plan_guard.note(account.id, model_key,
+                                                until or (time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN))
+                            logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额（Plan），"
+                                      f"{model_key} 冷却，跳过等待重试")
+                        else:
+                            _key_no_balance[account.id] = time.time() + settings.KEY_NO_BALANCE_COOLDOWN
+                            reqlog.mark_attempt(req_id, account.name, account.mode,
+                                                channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
+                                                status=429, ms=(time.time() - attempt_t0) * 1000,
+                                                error="429 1113 无余额（Key 无资源包），选号冷却", code=1113)
+                            account.record_result(False, "429 1113 无余额（Key 无资源包），跳过")
+                            store.update_account(account)
+                            logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额（Key），"
+                                      f"选号冷却 {settings.KEY_NO_BALANCE_COOLDOWN}s，账号状态不动")
+                        if _jump_to_fallback():
+                            reqlog.note_retry(req_id, "fb")
+                            needs_captcha = False
+                            retries_429 = 0
+                            continue
+                        return _NEXT_ACCOUNT
+                    if _is_rate_limit_hit(text):
+                        # 1302/1303「真限流」：与并发相反，原地重试只会加重——
+                        # 账号休息 RATE_LIMIT_COOLDOWN 秒（同 3012 语义）。
+                        cooldown = settings.RATE_LIMIT_COOLDOWN
+                        if account.status not in (Status.INVALID, Status.DISABLED) \
+                                and not account.is_cooling():
+                            account.status = Status.COOLING
+                            account.cooling_until = time.time() + cooldown
+                            account.last_error = f"429 真限流（1302/1303），休息 {cooldown}s"
+                        account.record_result(False, f"429 code 1302/1303 真限流，休息 {cooldown}s")
+                        store.update_account(account)
                         reqlog.mark_attempt(req_id, account.name, account.mode,
                                             channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
                                             status=429, ms=(time.time() - attempt_t0) * 1000,
-                                            error=f"429 1113 无余额，{model_key} 冷却", code=1113)
-                        account.record_result(
-                            False,
-                            f"429 1113 无余额（{model_key or '-'} 冷却至 "
-                            f"{time.strftime('%H:%M', time.localtime(until))}）",
-                        )
-                        store.update_account(account)
-                        logs.warn(
-                            req_id,
-                            f"账号 {account.name} 429 为 1113 无余额，{model_key} 冷却，跳过等待重试",
-                        )
+                                            error=f"429 真限流（1302/1303），休息 {cooldown}s", code=1302)
+                        logs.warn(req_id, f"账号 {account.name} 429 真限流（1302/1303），"
+                                  f"休息 {cooldown}s，不原地重试")
                         if _jump_to_fallback():
                             reqlog.note_retry(req_id, "fb")
                             needs_captcha = False
@@ -3251,9 +3313,18 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             return _NEXT_ACCOUNT
                         continue
                     if busy_hit and retries_busy >= len(settings.BUSY_WAITS):
-                        # 用尽官方节奏仍饱和：不扣号不计失败。给该账号立本地
-                        # 排队闸门（v2.9.32 startGate 语义）：闸门内新请求排队
-                        # 等槽释放，不再把第二遍重问敲到上游；然后换号。
+                        # 用尽官方节奏仍饱和：先下沉 API Key（上游 2.7.23），无回退
+                        # 才立本地排队闸门（v2.9.32 startGate 语义）。
+                        if _jump_to_fallback():
+                            reqlog.note_retry(req_id, "fb")
+                            reqlog.mark_attempt(req_id, account.name, account.mode, channel="plan",
+                                                status=429, ms=(time.time() - attempt_t0) * 1000,
+                                                error="Plan 并发槽饱和用尽，切 API Key 回退")
+                            account.record_result(False, "429 并发槽饱和，切 API Key 回退")
+                            logs.warn(req_id, f"账号 {account.name} 429 并发槽饱和，切 API Key 回退")
+                            needs_captcha = False
+                            retries_busy = 0
+                            continue
                         gate_until = _busy_gate_arm(account.id)
                         gate_note = (f"，闸门至 {time.strftime('%H:%M:%S', time.localtime(gate_until))}"
                                      if gate_until else "")
