@@ -809,6 +809,7 @@ def _recovery(provider: str, model_key: str) -> tuple[str | None, float | None]:
         return "model", model_wait
     if quota_wait and (not lane_wait or quota_wait <= lane_wait):
         _note_pool_starved(provider, model_key)
+        _note_pool_exhausted(trigger=None)  # 402 出口也让池闸评估/武装
         return "quota", quota_wait
     if lane_wait:
         return "lane", lane_wait
@@ -2020,6 +2021,16 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
             tried.add(account.id)
             pinned_id = None
 
+            # Key 通道 1113 冷却中的账号跳过（Plan 已死、仅 Key 可用时不该反复重探）
+            if _key_no_balance_cooling(account.id) and not account.uses_plan_channel():
+                logs.warn(req_id, f"账号 {account.name} Key 无资源包冷却中，跳过")
+                continue
+
+            # 模型级额度耗尽冷却跳号（2.7.29）：该号在本模型已确认 1005/1113。
+            if plan_guard.cooling(account.id, str(body.get("model") or "")):
+                logs.warn(req_id, f"账号 {account.name} 模型 {body.get('model')} 额度耗尽冷却中，跳过")
+                continue
+
             slot_box: list[str | None] = [None]
             if limit > 0:
                 if _inflight.get(account.id, 0) >= limit:
@@ -3167,6 +3178,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         else:
                             _mark(account, Status.EXHAUSTED, "额度已用完")
                         _spawn_bg(_safe_refresh(account))
+                        _note_pool_exhausted(account)
+                        # 模型级冷却（上游 2.7.29）：Plan 通道确认耗尽的（账号，模型）
+                        if channel == "zai" and model_name and model_name != "-":
+                            plan_guard.note(
+                                account.id, model_name,
+                                reset_ts or (time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN),
+                            )
                     logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                     return _NEXT_ACCOUNT
 
@@ -3557,6 +3575,11 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             else:
                                 _mark(account, Status.EXHAUSTED, "额度已用完")
                                 _spawn_bg(_safe_refresh(account))
+                                _note_pool_exhausted(account)
+                                # 模型级冷却：200 承载的 1005 同样打点
+                                if channel == "zai" and model_name and model_name != "-":
+                                    plan_guard.note(account.id, model_name,
+                                                    time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN)
                             logs.warn(req_id, f"账号 {account.name} 额度用完（业务码 {code_hit}），切换下一个")
                             return _NEXT_ACCOUNT
                         # 其余业务码：不动账号状态，直接回客户端（避免持续施压）

@@ -223,6 +223,16 @@ def build_app() -> FastAPI:
             return 402, _error_body("insufficient balance"), {}
         if scenario == "quota_exhausted_400":
             return 400, {"code": 1002, "message": "额度已用完"}, {}
+        if scenario == "tool_search_ok":
+            # 模型对 ToolSearch 别名的调用：网关必须把它还原成客户端原名
+            return 200, {
+                "id": mid, "type": "message", "role": "assistant", "model": model,
+                "content": [{"type": "tool_use", "id": "tu_mock_1",
+                             "name": "ToolSearchTool",
+                             "input": {"query": "bash"}}],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }, {}
         if scenario == "rate_limited":
             return 429, _error_body("rate limited"), {"retry-after": "30"}
         if scenario in ("concurrency_3008", "concurrency_3008_then_ok"):

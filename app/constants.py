@@ -282,7 +282,11 @@ EXHAUST_HTTP_STATUSES = (402,)
 # 文案（含风控/验证码页）都会被判成「额度用完」而把号踢成 EXHAUSTED——比漏判更糟。
 # 改为 ① 业务码（Plan 通道 {"code":1005,"msg":"exceed quota limit"} 实测形态）
 #      ② 定量短语（完整词 + 明确的无额度语义），不再用裸词。
-EXHAUST_BUSINESS_CODES = (1005, 1113, 1310)   # 1005 exceed quota limit / 1113 无余额 / 1310 周/月使用上限
+EXHAUST_BUSINESS_CODES = (1005, 1113, 1310)
+# 1113「无余额/无资源包」单列：通道感知处置要用（Plan=套餐耗尽、Key=该 Key 无资源包）
+NO_BALANCE_BUSINESS_CODE = 1113
+# 429 承载的「真限流」业务码（Z.ai 频控）：与并发争用相反，原地重试只会加重
+RATE_LIMIT_429_CODES = frozenset({1302, 1303})   # 1005 exceed quota limit / 1113 无余额 / 1310 周/月使用上限
 EXHAUST_KEYWORDS = (
     "exceed quota", "quota limit", "quota exceeded", "quota exhausted",
     "insufficient balance", "insufficient quota", "no balance",

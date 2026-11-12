@@ -13,6 +13,7 @@ import uuid
 import httpx
 
 from . import business_error, constants, logs, settings
+from .gate import gate
 from .models import Account, Status, expires_epoch, window_expired, window_usable
 from .models import _plan_bonus_active as _bonus_active
 from .quota_windows import pending_plan_start
@@ -314,6 +315,19 @@ async def fetch_quota(account: Account) -> dict:
         # 这里只留痕，让一次真实请求去定生死——否则新号会被永久挡在门外。
         detail = "，".join(f"{k}=code{v}" for k, v in errors.items())
         logs.warn("quota", f"账号 {account.name} billing 业务错误但保留可选（{detail}）")
+
+    # 套餐窗口闸门解除：任一号实查到可用窗口，全池「确认枯竭」的前提即被推翻。
+    # 放在状态机之外——闸门是进程级状态，不与单账号状态耦合（上游 2.7.30）。
+    if has_daily or has_bonus:
+        gate.clear_pool_hold()
+        # 模型级额度耗尽冷却**定向**清除：billing 拿到了该号账本，就知道哪些
+        # 窗口可用——只清「可用窗口对应的模型」，整号清除会把旗舰冷却反复抹掉
+        # （同号 Flash 有余量时 has_daily 恒真，1005 重探退化到 1 次/60s）。
+        from .plan_guard import clear_model as _pg_clear
+
+        for w_name, w in quota_map.items():
+            if window_usable(w, now):
+                _pg_clear(account.id, w_name)
 
     # 新号体验额度：上游对新注册账号可能 **billing 全空/全拒**，但 messages 仍能
     # 正常服务（2026-09-06 实测：空 billing 的 oauth-login 100% 成功服务请求；

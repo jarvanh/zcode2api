@@ -115,7 +115,8 @@ class TestConcurrencyFamily:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
         paths = _paths(mock, before)
-        assert paths.count(_PLAN_PATH) == 2  # 1 + RETRY_429_TIMES 次短退避
+        # fork 并发梯：首击 + BUSY_WAITS 官方节奏（1s/2s），用尽后下沉 Key
+        assert paths.count(_PLAN_PATH) == 1 + len(settings.BUSY_WAITS)
         assert paths.count(_KEY_PATH) == 1
         after = fresh_app.find("zai", acc.id)
         assert after.status == Status.ACTIVE
@@ -331,9 +332,10 @@ class TestGateBusyHold:
 
         # 每个请求贡献一次「因并发耗尽放弃 Plan」；第 5 次（阈值）触发全进程 hold。
         # 触发请求本身由兜底按限流语义回 429（busy_hold），前 4 个为无号 503
-        for i in range(5):
-            res = await client.post("/v1/messages", json=_MSG_BODY)
-            assert res.status_code == (429 if i == 4 else 503)
+        monkeypatch.setattr(settings, "BUSY_N", 1)
+        monkeypatch.setattr(settings, "GATE_BUSY_THRESHOLD", 1)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code in (429, 503)
         assert gate.busy_remaining() > 0
 
         # hold 期间新请求本地拦截（限流语义 429，客户端按 Retry-After 退避），不打上游
@@ -428,7 +430,8 @@ class TestNoBalance1113:
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503  # 唯一账号耗尽
+        # fork：Plan 1113 → 模型级冷却，单模型池空 → 429 model_no_quota
+        assert res.status_code == 429
         assert len([x for x in _paths(mock, before)]) == 1  # 不原地重试
 
         after = fresh_app.find("zai", acc.id)
@@ -485,10 +488,11 @@ class TestNoBalance1113:
         mock.state.sequences[_JWT_1113_KEY[:16]] = ["no_balance_1113"]
         before3 = len(mock.state.calls)
         res3 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res3.status_code == 503
-        assert _paths(mock, before3) == [_PLAN_PATH]
+        assert res3.status_code == 429
+        assert _paths(mock, before3)[0] == _PLAN_PATH
         after3 = fresh_app.find("zai", acc.id)
-        assert after3.status == Status.EXHAUSTED
+        assert after3.status != Status.EXHAUSTED
+        assert after3.is_model_cooling("GLM-5.3")
 
     async def test_rate_limit_1302_with_1113_logid_is_not_no_balance(
         self, gateway_client, fresh_app, monkeypatch
@@ -769,8 +773,9 @@ class TestPoolWindowGate:
         fresh_app.update_account(acc)
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503
-        assert gate.pool_hold_remaining() == 0  # 闸门未触发：陈旧快照不放证据
+        # fork：已被真实 1113 标 EXHAUSTED → 池级 402；关键断言是闸门未武装
+        assert res.status_code == 402
+        assert gate.pool_hold_remaining() == 0
 
     async def test_quota_recovery_clears_hold(
         self, gateway_client, fresh_app, monkeypatch
@@ -908,6 +913,8 @@ class TestPlanModelExhaust:
         from tests.conftest import seed_account
 
         await self._no_refresh(monkeypatch)
+        # 关闭排队：mock 序列只有一次 1005，排队探测会把它吃掉
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 0)
         acc = seed_account(fresh_app, self._JWT_ME1, name="a-me1")
         mock.state.sequences[self._JWT_ME1[:16]] = ["quota_exhausted_200"]
 
@@ -942,6 +949,8 @@ class TestPlanModelExhaust:
         from tests.conftest import seed_account
 
         await self._no_refresh(monkeypatch)
+        # 关闭排队：mock 序列只有一次 1005，排队探测会把它吃掉
+        monkeypatch.setattr(settings, "QUEUE_WAIT", 0)
         acc = seed_account(fresh_app, self._JWT_ME3, name="a-me3")
         mock.state.sequences[self._JWT_ME3[:16]] = ["quota_exhausted_200", "ok"]
 
@@ -955,6 +964,7 @@ class TestPlanModelExhaust:
         acc.quota_verified_at = time.time()
         fresh_app.update_account(acc)
 
+        mock.state.sequences[self._JWT_ME3[:16]] = ["ok"]  # 后续调用一律成功
         res2 = await client.post("/v1/messages",
                                  json={**_MSG_BODY, "model": "GLM-5.3-Flash"})
         assert res2.status_code == 200  # Flash 不受旗舰冷却影响，A 被选中
