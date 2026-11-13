@@ -251,13 +251,13 @@ def test_cli_add_account_schedules_install(fresh_app, monkeypatch):
 
 # ── 并发设置 ─────────────────────────────────────────────────────────────────
 class TestConcurrencySetting:
-    """v2.9.32 后恢复可改（2026-11-08）：meta / PUT 生效，默认 2，
-    非法 meta 值回落 env 默认。2026-11-04 的写死是当时「并发满 → 敲上游
-    → 扣号」放大 3008 风暴的止血；startGate 排队闸（v2.9.32）吃掉放大链
-    后交还运营调节。"""
+    """fork 保留可改（v2.9.32 起）：meta / PUT 生效，默认 3（2.9.48 采纳上游
+    2.7.31 口径：上游 ZCode 单账号并发写死 3），非法 meta 值回落 env 默认。
+    2026-11-04 的写死是当时「并发满 → 敲上游 → 扣号」放大 3008 风暴的止血；
+    startGate 排队闸（v2.9.32）吃掉放大链后交还运营调节。"""
 
-    def test_default_2(self, fresh_app):
-        assert fresh_app.account_concurrency() == 2
+    def test_default_3(self, fresh_app):
+        assert fresh_app.account_concurrency() == 3
 
     def test_meta_value_wins(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "8")
@@ -269,7 +269,7 @@ class TestConcurrencySetting:
 
     def test_bad_meta_value_falls_back(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "abc")
-        assert fresh_app.account_concurrency() == 2
+        assert fresh_app.account_concurrency() == 3
 
     def test_negative_meta_clamped(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "-3")

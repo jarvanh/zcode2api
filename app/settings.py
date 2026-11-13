@@ -295,6 +295,14 @@ GATE_BUSY_THRESHOLD = _int("ZCODE_GATE_BUSY_THRESHOLD", 5)
 GATE_BUSY_WINDOW_SECONDS = _int("ZCODE_GATE_BUSY_WINDOW_SECONDS", 60)
 GATE_BUSY_HOLD_SECONDS = _int("ZCODE_GATE_BUSY_HOLD_SECONDS", 180)
 GATE_POOL_HOLD_MAX_SECONDS = _int("ZCODE_GATE_POOL_HOLD_MAX", 3600)
+# 证据链补查的进程级节流（2.7.31 review 整改）：真空期上游 balances 为空时
+# （2026-11-12 线上实锤：22:49 refresh 跑了但 verified_at 没动——quota_map
+# 空 → 证据点不打 → 账号永远 stale），若无节流每条请求都会对全池 stale 号
+# spawn billing 实查，60s 去抖挡不住「每分钟一轮 × 整个真空期」的持续轰炸
+# （fetch_quota 一次 = 3 条 GET，是 monitor 1800s 节奏的 60 倍，vault 明载
+# billing 连续查询易触发拦截，403 还会把号标 INVALID）。首探立即、后续每
+# 号最多按此间隔重探；balances 一旦列出窗口，一轮实查即闭合证据链
+GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 # 429/code 1302/1303「真限流」：账号休息该时长（秒），请求下沉下一渠道/换号
 RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
 # Key 通道 1113「无资源包」后的选号冷却（秒）
@@ -318,7 +326,9 @@ MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
 # MAX_ACTIVE_ACCOUNTS 同模式）。2026-11-04 曾按线上实测写死 2；2026-11-08
 # 恢复可改 —— v2.9.32 的 startGate 排队闸已把「并发满 → 敲上游 → 503」
 # 的放大链吃掉，上调并发不再有 3008 风暴放大风险，交还运营调节。
-ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 2.9.48 采纳上游 2.7.31 口径：上游 ZCode 单账号并发写死 3，默认值随之上调；
+# fork 仍保留 env / meta 覆盖（运营可调，见 store.account_concurrency）。
+ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 3)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -381,7 +391,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.47"
+APP_VERSION = "2.9.48"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

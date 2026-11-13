@@ -1,7 +1,8 @@
-"""账号并发限制集成测试（2026-09-13；2026-11-04 写死）：单账号恒为 2。
+"""账号并发限制集成测试：单账号上限默认 3（env / meta 可调，0 = 不限）。
 
 依赖 mock 上游 slow 场景（0.3s 延迟）制造重叠；用 conc_max 仪表（按凭证）
-断言单账号同时刻在飞请求数不超过限制。后台 meta / env 覆盖一律无效；
+断言单账号同时刻在飞请求数不超过限制。fork 保留 v2.9.32 的限界排队语义：
+满号不秒回 503，而是等在途流释放槽位（bounded by QUEUE_WAIT_SYNC）。
 需要 limit=1 等特殊场景的用例直接 monkeypatch settings.ACCOUNT_CONCURRENCY。
 """
 
@@ -42,21 +43,22 @@ class TestAccountConcurrency:
         mock.state.conc_in = {}
         mock.state.conc_max = {}
 
-    async def test_single_account_limits_to_two(self, gateway_client, fresh_app):
-        """单账号 4 并发：全部成功（超限者排队等槽释放）；单号 max_concurrent ≤ 2。
+    async def test_single_account_limits_to_cap(self, gateway_client, fresh_app):
+        """单账号 cap+4 并发：全部成功（超限者排队等槽释放）；单号峰值 ≤ cap。
 
-        2026-10-30 起满号不再秒回 503：排队轮询只做本地选号，等在途流
-        释放槽位（bounded by QUEUE_WAIT_SYNC）。
+        fork 保留 v2.9.32 的限界排队：满号不秒回 503，排队轮询只做本地选号，
+        等在途流释放槽位（bounded by QUEUE_WAIT_SYNC）。2.9.48 起 cap 默认 3。
         """
         client, mock = gateway_client
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc")
 
+        cap = settings.ACCOUNT_CONCURRENCY
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
-                     for _ in range(4)]
+                     for _ in range(cap + 4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 200, 200, 200]
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
+        assert statuses == [200] * (cap + 4), statuses
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= cap
 
     async def test_two_accounts_all_succeed(self, gateway_client, fresh_app):
         """双账号 4 并发：每号 ≤2，全部成功。"""
@@ -92,12 +94,12 @@ class TestAccountConcurrency:
 
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
-                     for _ in range(4)]
+                     for _ in range(settings.ACCOUNT_CONCURRENCY + 4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 200, 200, 200], statuses
-        # 4 个请求非严格同刻到达，0.3s slow 窗口下观测峰值 3~4；关键断言是
-        # 「不被旧写死的 2 封顶」（>=3 即证），不钉具体峰值（时序竞态）。
-        assert _per_key_max(mock, acc.jwt_token[:16]) >= 3
+        assert statuses == [200] * (settings.ACCOUNT_CONCURRENCY + 4), statuses
+        # 不限流时请求全落在同一凭证；关键断言是「不低于默认 cap」而非具体峰值
+        # （请求非严格同刻到达，0.3s slow 窗口下峰值有 1~2 的时序抖动）。
+        assert _per_key_max(mock, acc.jwt_token[:16]) >= settings.ACCOUNT_CONCURRENCY
 
     async def test_meta_one_enforced(self, gateway_client, fresh_app):
         """v2.9.32 后 meta=1 生效：二号被切走或排队，单凭证峰值 ≤1。"""
@@ -112,8 +114,8 @@ class TestAccountConcurrency:
         assert statuses == [200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
 
-    def test_env_default_is_two(self):
-        assert settings.ACCOUNT_CONCURRENCY == 2
+    def test_env_default_is_three(self):
+        assert settings.ACCOUNT_CONCURRENCY == 3
 
     async def test_429_wait_does_not_hold_concurrency_slot(
         self, gateway_client, fresh_app, monkeypatch

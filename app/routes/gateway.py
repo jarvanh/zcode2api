@@ -2558,6 +2558,11 @@ reqlog.register_slot_source(_slot_view)
 # 后台手动启用账号时清除（用户明确意图 = 立即重试）。
 _key_no_balance: dict[str, float] = {}
 
+# pool_hold 证据链补查的进程级节流记忆：account_id → 上次探查发起时刻
+# （epoch）。真空期 balances 为空时证据点永不闭合，无此闸则每条请求都对
+# 全池 stale 号 spawn billing（review P1 整改，2026-11-12）。重启即忘
+_pool_probe_last: dict[str, float] = {}
+
 
 def clear_key_no_balance(account_id: str) -> None:
     """后台启用/凭证变更时清除该号的 Key 无余额冷却，允许立即重探。"""
@@ -2577,20 +2582,48 @@ def _key_no_balance_cooling(account_id: str, now: float | None = None) -> bool:
 def _note_pool_exhausted(trigger: Account | None = None) -> None:
     """账号 Plan 通道判额度耗尽后，评估是否触发套餐窗口闸门（pool_hold）。
 
-    保守优先：只有当**全部** JWT 账号都返回「确认枯竭」（每个号都有过期后
-    实查证据，且无当前可用窗口）时才拦；任意一号可用（0.0）或不可判定
-    （None——快照空/陈旧/新号）都不拦。next_start 取全池最小未来
+    调用时机：① _try_account 的 exhaust 分支（本请求真实撞到 1113/额度
+    耗尽，trigger=该账号）；② _dispatch 的「无可用账号」兜底（全池已被标
+    EXHAUSTED、select 直接滤光，见下）；③ fork 的 402 出口（trigger=None，
+    让池闸评估/武装）。判定口径（保守优先，绝不误拦——2026-11-12 线上
+    247 次真空期白撞教训）：只有当**全部** JWT 账号都返回「确认枯竭」（每个
+    号都有过期后实查证据 quota_verified_at > 最新 expires_at，且无当前可用
+    窗口）时才拦；任意一号是可用（0.0）或不可判定（None——快照空/陈旧/新号）
+    都不拦，但会补 _safe_refresh 后台实查把证据链续上（见下方 stale 分支注释）。
+    next_start 取全池最小未来
     effective_at；无未来窗口给 -1，由 gate 用上限兜底。
     """
     accounts = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
     if not accounts:
         return
     verdicts = []
+    stale: list[Account] = []
     for a in accounts:
         verdict = a.next_window_start()
         if verdict is None:
-            return  # 任一号不可判定 → 放行，让真实请求去定生死
+            stale.append(a)
+            continue
         verdicts.append(verdict)
+    if stale:
+        # 证据链未闭合（快照空/陈旧）→ 不拦（保守优先），但**补后台实查**把
+        # 证据链续上。没有这一步是死锁：EXHAUSTED 号被 select 滤掉后不会有任何
+        # 请求真实撞到它们（exhaust 分支的刷新也就永不执行），quota_verified_at
+        # 永远停在上一个日窗之前 → 全池 None → 闸门永不触发（2026-11-12 线上
+        # 实证：真空期 34/34 请求全裸 503，0 次 pool_hold 拦截）。_safe_refresh
+        # 自带 60s 去抖，一轮 billing 后 verified_at 越过 max_ends，下一请求
+        # 即进入快速失败闭环——裸 503 时代从「整个真空期」缩到「一轮实查」。
+        # 探查另有**进程级节流**（review P1 整改）：60s 去抖挡不住「balances
+        # 为空 → 证据点不打 → 账号永远 stale → 每请求都 spawn」的持续形态
+        # （线上实锤 22:49 刷新跑了但 verified_at 未动），首探立即、后续按
+        # GATE_POOL_PROBE_MIN_SECONDS 每号限频，把 billing 轰炸压回 monitor 量级
+        now = time.time()
+        for a in stale:
+            last_probe = _pool_probe_last.get(a.id, 0.0)
+            if now - last_probe < settings.GATE_POOL_PROBE_MIN_SECONDS:
+                continue
+            _pool_probe_last[a.id] = now
+            _spawn_bg(_safe_refresh(a))
+        return  # 不可判定 → 放行，让真实请求去定生死
     if any(v == 0.0 for v in verdicts):
         return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
     future = [v for v in verdicts if v > 0]

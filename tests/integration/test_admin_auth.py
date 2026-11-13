@@ -86,5 +86,5 @@ class TestSettingsSecretMask:
         )
         assert res.status_code == 200
         assert fresh_app.admin_key() == "keep-this-admin-key"
-        # v2.9.32 后 account_concurrency 恢复可改：PUT 生效
+        # fork 保留 v2.9.32 起 account_concurrency 可改：PUT 生效
         assert fresh_app.account_concurrency() == 3

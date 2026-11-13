@@ -890,6 +890,94 @@ class TestPoolWindowGate:
         v = acc.next_window_start()
         assert v is not None and abs(v - (now + 9000)) < 1, v  # 跳过死窗口取健康的
 
+    async def test_stale_snapshot_refresh_bridges_evidence_chain(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """证据链死锁根因修复（2026-11-12 线上实证）钉子：快照陈旧 → 不拦但
+        补后台实查 → verified_at 越过 max_ends → 下一请求进入 pool_hold 快速
+        失败。修复前 EXHAUSTED 号被 select 滤光后永不刷新，整个真空期 34/34
+        裸 503、0 次拦截。"""
+        import asyncio
+
+        client, mock = gateway_client
+        from app.gate import gate
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        refreshed: list[str] = []
+
+        async def _fake_refresh(account):
+            refreshed.append(account.id)
+            # 模拟 fetch_quota 的证据点：实查时刻必然晚于窗口过期点
+            account.quota_verified_at = time.time()
+            fresh_app.update_account(account)
+
+        monkeypatch.setattr(gw, "_safe_refresh", _fake_refresh)
+        acc = seed_account(fresh_app, self._JWT_PW3, name="a-pw-bridge")
+        now = time.time()
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 5,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now - 7200  # 陈旧：早于过期点，不可判定
+        acc.status = Status.EXHAUSTED
+        fresh_app.update_account(acc)
+
+        gate.clear_pool_hold()
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        # fork 出口：池全耗竭走 402 no_quota_for_model（下游精确回退），非上游 503
+        assert res1.status_code == 402
+        assert res1.json()["error"]["code"] == "no_quota_for_model"
+        assert gate.pool_hold_remaining() == 0  # 陈旧证据不放行拦截（保守不变）
+        await asyncio.sleep(0)  # 让 bg 刷新跑完
+        assert refreshed == [acc.id]  # 死锁修复核心：补了实查
+        assert fresh_app.find("zai", acc.id).quota_verified_at > now - 3600
+
+        # 证据链闭合 → 第二请求由兜底触发 hold（本请求仍是 402：闸门在响应
+        # 返回前才置位），第三请求起进入快速失败
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 402
+        assert gate.pool_hold_remaining() > 0
+        res3 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res3.status_code == 429
+        assert res3.json()["error"]["type"] == "gate_pool_hold"
+
+    async def test_stale_probe_throttled_when_evidence_never_closes(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """review P1 钉子：真空期上游 balances 为空 → fetch_quota 拿不到窗口
+        → 证据点永不闭合 → 账号永远 stale。无节流时每条请求都 spawn billing
+        实查（每分钟一轮 × 14h 真空期 = 风控拦截源）；进程级节流下首探立即、
+        GATE_POOL_PROBE_MIN_SECONDS 内不再重发。"""
+        import asyncio
+
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        refreshed: list[str] = []
+
+        async def _fake_refresh(account):
+            # 模拟「balances 空」形态：刷新跑了但证据点不闭合
+            refreshed.append(account.id)
+
+        monkeypatch.setattr(gw, "_safe_refresh", _fake_refresh)
+        acc = seed_account(fresh_app, self._JWT_PW2, name="a-pw-throttle")
+        now = time.time()
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 5,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now - 7200  # 陈旧
+        acc.status = Status.EXHAUSTED
+        fresh_app.update_account(acc)
+
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 402  # fork 池耗尽出口
+        await asyncio.sleep(0)
+        assert refreshed == [acc.id]  # 首探立即
+
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 402
+        await asyncio.sleep(0)
+        assert refreshed == [acc.id]  # 节流生效：窗口内不重发
+
 
 @pytest.mark.integration
 class TestPlanModelExhaust:
