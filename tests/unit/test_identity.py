@@ -49,12 +49,14 @@ def test_trace_headers_attribution_full_set():
     每请求全新。旧「start-plan 只发三件」系 3.10.2 时代 zapi 静态分析，其
     3012 依据已被 2026-09-05 真因修正推翻。"""
     a, b = build_trace_headers(), build_trace_headers()
+    # fork 契约：六件头形状固定，未传 query_id 时也发一枚随机值（test_session_
+    # affinity 同口径）；传入时原样透传，保证同轮稳定。
     expected = {
         "x-request-id", "x-zcode-session-type", "x-zcode-trace-id",
-        "x-zcode-query-source", "x-session-id",
+        "x-query-id", "x-zcode-query-source", "x-session-id",
     }
-    assert set(a) == expected  # 无 query_id 不发 x-query-id（官方同款）
-    assert "x-query-id" not in a
+    assert set(a) == expected
+    assert a["x-query-id"] != b["x-query-id"]  # 未传时逐请求全新
     assert a["x-zcode-session-type"] == "main"
     assert a["x-zcode-query-source"] == "main_turn"
     # request/trace/session 未传时逐请求全新
@@ -63,7 +65,7 @@ def test_trace_headers_attribution_full_set():
 
     # 传入 query_id：六件全发，query_id 原样透传（同轮稳定由派生函数保证）
     c = build_trace_headers(session_id="sid-1", query_id="q-turn-1")
-    assert set(c) == expected | {"x-query-id"}
+    assert set(c) == expected
     assert c["x-query-id"] == "q-turn-1"
     assert c["x-session-id"] == "sid-1"
 
