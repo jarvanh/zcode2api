@@ -2870,6 +2870,16 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             attempt_t0 = time.time()
             reqlog.mark_account(req_id, account.name, account.mode)
             verify_param = verify_region = None
+            # 出口 IP 静默期内不要解验证码：直接按 fork 契约回 405（不再花码）
+            if channel == "zai" and edge.held(account.provider):
+                if _jump_to_fallback():
+                    logs.warn(req_id, f"出口 IP 封锁静默中（剩 ~{edge.remaining(account.provider)}s），"
+                                      f"账号 {account.name} 改走 API Key 回退")
+                    needs_captcha = False
+                    continue
+                reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中", status=405, kind="edge")
+                return _edge_response(account.provider)
+
             # 仅 zcode-plan（`zai`）渠道用验证码；apikey 免码
             if channel == "zai" and needs_captcha:
                 # 闸门会拒时不要先花一枚验证码再被拒（上游 2.7.23）

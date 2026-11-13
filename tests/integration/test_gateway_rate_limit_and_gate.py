@@ -621,6 +621,7 @@ class TestGateRefusalFailover:
         from tests.conftest import seed_account
 
         monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 30)
+        monkeypatch.setattr(settings, "EDGE_HOLD_SECONDS", 30)
         seed_account(fresh_app, _JWT_MIX_PLAN, name="a-planonly")
         keyed = seed_account(fresh_app, _JWT_MIX_KEY, name="b-keyed")
         keyed.api_key = "sk-mixed-pool-key"
@@ -642,8 +643,11 @@ class TestGateRefusalFailover:
         from tests.conftest import seed_account
 
         monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 30)
+        monkeypatch.setattr(settings, "EDGE_HOLD_SECONDS", 30)
         seed_account(fresh_app, _JWT_MIX_PLAN, name="a-planonly")
+        from app import edge as edge_mod
         gate.trip_edge()
+        edge_mod.arm("zai")  # fork 的本地拦截由 edge.held 驱动（gate 只管计数/拒绝）
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)
