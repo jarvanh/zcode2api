@@ -132,6 +132,7 @@ def test_trust_proxy_ip_defaults_off(tmp_path):
     env.pop("ZCODE_TRUST_PROXY_IP", None)
     env["ZCODE_DATA_DIR"] = str(tmp_path / "subprocess-data")
     env["ZCODE_ADMIN_KEY"] = "subprocess-test-admin"
+    env["ZCODE_ENV_FILE"] = "0"  # 不读仓库 .env（生产 .env 里有 ZCODE_HOST=0.0.0.0）
     code = "from app import auth_admin; print(auth_admin.TRUST_PROXY_IP)"
     out = subprocess.check_output(
         [sys.executable, "-c", code],
@@ -150,6 +151,7 @@ def test_host_defaults_to_loopback(tmp_path):
     env.pop("ZCODE_HOST", None)
     env["ZCODE_DATA_DIR"] = str(tmp_path / "subprocess-data")
     env["ZCODE_ADMIN_KEY"] = "subprocess-test-admin"
+    env["ZCODE_ENV_FILE"] = "0"  # 不读仓库 .env（生产 .env 里 ZCODE_HOST=0.0.0.0）
     code = "from app import settings; print(settings.HOST)"
     out = subprocess.check_output(
         [sys.executable, "-c", code],

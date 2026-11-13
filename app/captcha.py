@@ -131,7 +131,7 @@ def _kill_solver_tree(proc: asyncio.subprocess.Process) -> None:
 
     # 2) 进程组收割（覆盖同组但未出现在 ppid 树里的进程）
     try:
-        os.killpg(os.getpgid(root), signal.SIGKILL)
+        os.killpg(root, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
 
@@ -766,7 +766,12 @@ class CaptchaManager:
         # 出口必须与取用该 token 的请求一致（见 app/egress.py）：
         #   direct → 剥掉代理变量，chrome 不带 --proxy-server
         #   proxy  → 注入代理变量，solver 用它作 --proxy-server
-        solver_env = {**os.environ, "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH)}
+        solver_env = {
+            **os.environ,
+            "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH),
+            # solver 侧硬超时：早于本侧 SIGKILL 20s 自我了断并清场
+            "ZCODE_SOLVE_DEADLINE_MS": str(max(30, settings.CAPTCHA_SOLVE_TIMEOUT - 20) * 1000),
+        }
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)

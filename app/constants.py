@@ -286,7 +286,9 @@ EXHAUST_BUSINESS_CODES = (1005, 1113, 1310)
 # 1113「无余额/无资源包」单列：通道感知处置要用（Plan=套餐耗尽、Key=该 Key 无资源包）
 NO_BALANCE_BUSINESS_CODE = 1113
 # 429 承载的「真限流」业务码（Z.ai 频控）：与并发争用相反，原地重试只会加重
-RATE_LIMIT_429_CODES = frozenset({1302, 1303})   # 1005 exceed quota limit / 1113 无余额 / 1310 周/月使用上限
+RATE_LIMIT_429_CODES = frozenset({1302, 1303})
+# 429 并发族全集（3008 账号/3009 模型/3010 轮次）
+CONCURRENCY_BUSINESS_CODES = frozenset({3008, 3009, 3010})   # 1005 exceed quota limit / 1113 无余额 / 1310 周/月使用上限
 EXHAUST_KEYWORDS = (
     "exceed quota", "quota limit", "quota exceeded", "quota exhausted",
     "insufficient balance", "insufficient quota", "no balance",

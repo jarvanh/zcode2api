@@ -138,10 +138,11 @@ def build_trace_headers(session_id: str | None = None,
         "x-zcode-session-type": "main",
         "x-zcode-trace-id": str(uuid.uuid4()),
         "x-zcode-query-source": "main_turn",
+        # 六件头形状固定：未提供 query_id 时也发一枚（fork 契约；官方对
+        # 无可归因请求不发，但 fork 的下游断言/指纹稳定性依赖六件齐备）
+        "x-query-id": query_id or str(uuid.uuid4()),
         "x-session-id": session_id or _session_affinity_id() or str(uuid.uuid4()),
     }
-    if query_id:
-        headers["x-query-id"] = query_id
     return headers
 
 

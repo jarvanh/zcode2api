@@ -12,7 +12,10 @@ from dotenv import load_dotenv
 
 from . import constants
 
-load_dotenv()
+# ZCODE_ENV_FILE=0 时跳过 .env（测试子进程隔离用；默认行为不变）
+_env_file = os.getenv("ZCODE_ENV_FILE")
+if _env_file != "0":
+    load_dotenv(_env_file or None)
 
 # 项目根目录
 ROOT_DIR = Path(__file__).resolve().parents[1]
