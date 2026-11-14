@@ -21,6 +21,8 @@ _MSG_BODY = {"model": "GLM-5.2", "messages": [{"role": "user", "content": "hi"}]
 _EDGE_JWT = "hE.eyJzdWIiOiJlIn0.sig"
 _OTHER_JWT = "hO.eyJzdWIiOiJvIn0.sig"
 _RISK_JWT = "hR2.eyJzdWIiOiJyIn0.sig"
+_ROT_JWT = "hT.eyJzdWIiOiJ0In0.sig"
+_TOK_JWT = "hK.eyJzdWIiOiJrIn0.sig"
 
 
 def _messages_calls(mock) -> int:
@@ -85,3 +87,68 @@ class TestEdgeBlockPage:
         acc = fresh_app.list_accounts("zai")[0]
         assert acc.risk_strikes >= 1
         assert not edge.held(edge.egress_key(None, "zai"))
+
+    async def test_edge_405_rotates_node_and_retries_same_account(
+        self, gateway_client, fresh_app, monkeypatch, stub_captcha
+    ):
+        """未出 captcha token：405 后切节点，同账号原地重试成功。"""
+        client, mock = gateway_client
+        from app import proxy_rotate, settings
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "PROXY_ROTATE_ENABLED", True)
+        # 生产 skip_model_request=true ⇒ 模型请求不带 token；此处模拟该形态
+        stub_captcha.needs_captcha = False
+        seed_account(fresh_app, _ROT_JWT, name="e-rot")
+        mock.state.sequences[_ROT_JWT[:16]] = ["edge_block_405", "success"]
+
+        puts: list[tuple[str, dict]] = []
+
+        async def fake_get(path):
+            return {"now": "N1", "all": ["N1", "N2"]}
+
+        async def fake_put(path, body):
+            puts.append((path, body))
+            return True
+
+        monkeypatch.setattr(proxy_rotate, "_api_get", fake_get)
+        monkeypatch.setattr(proxy_rotate, "_api_put", fake_put)
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+
+        assert res.status_code == 200
+        assert puts == [("/proxies/eg-e-rot", {"name": "N2"})]
+        # 切节点后旧出口静默解除
+        assert not edge.held(edge.egress_key(None, "zai"))
+
+    async def test_edge_405_with_captcha_token_does_not_rotate(
+        self, gateway_client, fresh_app, monkeypatch, stub_captcha
+    ):
+        """已出 captcha token：不切节点（token 绑定旧出口 IP），直接换号。"""
+        client, mock = gateway_client
+        from app import proxy_rotate, settings
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "PROXY_ROTATE_ENABLED", True)
+        seed_account(fresh_app, _TOK_JWT, name="e-tok")
+        # 第一次 403 验证码挑战 → 解 token 后重试 → 405
+        mock.state.sequences[_TOK_JWT[:16]] = ["captcha_challenge", "edge_block_405"]
+
+        puts: list[tuple[str, dict]] = []
+
+        async def fake_get(path):
+            return {"now": "N1", "all": ["N1", "N2"]}
+
+        async def fake_put(path, body):
+            puts.append((path, body))
+            return True
+
+        monkeypatch.setattr(proxy_rotate, "_api_get", fake_get)
+        monkeypatch.setattr(proxy_rotate, "_api_put", fake_put)
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+
+        assert res.status_code == 405
+        assert res.json()["error"]["code"] == "edge_blocked_ip"
+        assert stub_captcha.solve_count >= 1
+        assert puts == []  # 已出 token，绝不切节点

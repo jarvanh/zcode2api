@@ -32,6 +32,7 @@ from .. import (
     freshness,
     logs,
     plan_guard,
+    proxy_rotate,
     quota_windows,
     reasoning,
     reqlog,
@@ -2423,6 +2424,7 @@ def _risk_wave_reset_for_tests() -> None:
     _risk_wave_hit.clear()
     _risk_wave_level.clear()
     edge.reset()
+    proxy_rotate.reset_state()
 
 
 def _edge_key(account: Account) -> str:
@@ -2477,6 +2479,27 @@ def _provider_edge_held(provider: str) -> tuple[int, str] | None:
         if best is None or remaining > best[0]:
             best = (remaining, key)
     return best
+
+
+async def _edge_rotate_or_failover(req_id: str, account: Account,
+                                   verify_param: str | None) -> bool:
+    """出口静默时的处置：无 captcha token 在身则切节点并解除静默；否则换号。
+
+    captcha token 绑定签发出口 IP：切换后复用会被上游判 3012
+    （unusual activity），比 405 更糟 —— 已出 token 一律不切、不重解，
+    直接换号，由下一个请求在新出口重新解 captcha。
+    """
+    if verify_param:
+        logs.warn(
+            req_id,
+            f"账号 {account.name} 已携带 captcha token（绑定出口 IP），不切节点，换号",
+        )
+        return False
+    node = await proxy_rotate.rotate(req_id, account)
+    if not node:
+        return False
+    edge.reset(_edge_key(account))
+    return True
 
 
 def _reacquire_slot(account: Account, slot_box: list[str | None] | None) -> bool:
@@ -3010,6 +3033,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                       f"账号 {account.name} 改走 API Key 回退")
                     needs_captcha = False
                     continue
+                if await _edge_rotate_or_failover(req_id, account, verify_param):
+                    continue
                 logs.warn(req_id, f"账号 {account.name} 出口 {_edge_key(account)} 静默中，切换下一个")
                 return _NEXT_ACCOUNT
 
@@ -3075,6 +3100,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         f"账号 {account.name} 改走 API Key 回退",
                     )
                     needs_captcha = False
+                    continue
+                if await _edge_rotate_or_failover(req_id, account, verify_param):
                     continue
                 logs.warn(req_id, f"账号 {account.name} 出口 {_edge_key(account)} 静默中，切换下一个")
                 return _NEXT_ACCOUNT
@@ -3230,6 +3257,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     )
                     if _jump_to_fallback():
                         needs_captcha = False
+                        continue
+                    # 未携带 captcha token 时切节点原地重试；已出 token
+                    # （绑定旧出口 IP）直接换号，避免 3012。
+                    if await _edge_rotate_or_failover(req_id, account, verify_param):
                         continue
                     # 只静默该出口，交给 dispatch 换其他出口的账号；全部出口
                     # 都被封时由 dispatch 统一回 405。

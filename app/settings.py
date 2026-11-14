@@ -321,10 +321,20 @@ PLAN_MODEL_EXHAUST_COOLDOWN = _int("ZCODE_PLAN_MODEL_EXHAUST_COOLDOWN", 1800)
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # ── IP 级封锁静默（2026-11-05，对齐 magpie zcode 0.1.43 / plugins#649）──────
 # 405 + HTML 拦截页（errors.aliyun.com / <html>）= 本机出口 IP 被阿里云
-# ESA/WAF 拦，不是账号风控。命中后整个 plan 通道静默这么久：不发上游、
-# 不记 strike、不改账号状态；静默期内本地回同款 405，让下游切 provider。
+# ESA/WAF 拦，不是账号风控。命中后**该出口**静默这么久：不发上游、
+# 不记 strike、不改账号状态；该出口的请求本地回同款 405 让下游切 provider。
 # 3 分钟与 magpie 一致（短到换网络/代理的用户等得起，长到防火墙计数降下来）。
 EDGE_HOLD_SECONDS = _int("ZCODE_EDGE_HOLD_SECONDS", 180)
+# ── mihomo 节点自动轮换（出口 405 → 换组内节点，见 app/proxy_rotate.py）────
+# 每个账号出口是本地 mihomo listener（端口 1:1），组内 Fallback 只对连接
+# 失败切换，HTTP 405 不触发。网关在 405 且**未携带 captcha token** 时主动
+# 调 controller 换节点（token 绑定出口 IP，切换后复用会被判 3012）。
+PROXY_ROTATE_ENABLED = _bool("ZCODE_PROXY_ROTATE_ENABLED", True)
+PROXY_CONTROLLER_URL = (os.getenv("ZCODE_PROXY_CONTROLLER_URL", "http://127.0.0.1:9090").strip().rstrip("/")
+                        or "http://127.0.0.1:9090")
+PROXY_ROTATE_COOLDOWN = _int("ZCODE_PROXY_ROTATE_COOLDOWN", 90)      # 每账号两次轮换最小间隔（秒）
+PROXY_ROTATE_TIMEOUT = _int("ZCODE_PROXY_ROTATE_TIMEOUT", 3)          # controller API 超时（秒）
+PROXY_ROTATE_BLOCK_TTL = _int("ZCODE_PROXY_ROTATE_BLOCK_TTL", 3600)   # 节点黑名单记忆（秒）
 # 同时投入的账号数上限（0 = 不限）。magpie 实测：同一出口 3 个号并发会被
 # 405 拒，2 个不会（plugins#649 引用 01huadalang 的 Discord 反馈）。
 # 控制台可改（meta 表即时生效）；超出的号留作备用，在用的号冷却/耗尽时顶上。
@@ -417,7 +427,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.51"
+APP_VERSION = "2.9.52"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
