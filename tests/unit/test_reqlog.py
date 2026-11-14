@@ -542,6 +542,8 @@ class TestAccountHealth:
         assert s["http_503_by_kind"]["channel_cooling"] == 1
         assert s["http_503_by_kind"]["no_available_account"] == 1
         assert s["fail_by_kind"]["channel_cooling"] == 1
+        assert s["first_success"] == 1
+        assert s["first_success_rate"] == 33.33
 
     def test_reset_clears_recent(self):
         reqlog.begin("z1", "m", "m", False, "")

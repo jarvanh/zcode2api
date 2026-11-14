@@ -670,7 +670,8 @@ def finish_ok(req_id: str, t_first: float | None = None,
         entry["t_up"] = _net_up(entry)
         _recent.append({"ts": entry["ts"], "acc": entry.get("account") or "",
                         "ok": True, "status": entry.get("status"),
-                        "tf": entry.get("t_first"), "kind": ""})
+                        "tf": entry.get("t_first"), "kind": "",
+                        "attempts": max(1, len(entry.get("att") or []))})
         row = dict(entry)
     _persist(row)
 
@@ -696,7 +697,8 @@ def finish_error(req_id: str, error: str, status: int | None = None,
         _recent.append({"ts": entry["ts"], "acc": entry.get("account") or "",
                         "ok": False, "status": entry.get("status"),
                         "tf": entry.get("t_first"),
-                        "kind": entry.get("err_kind") or ""})
+                        "kind": entry.get("err_kind") or "",
+                        "attempts": max(1, len(entry.get("att") or []))})
         row = dict(entry)
     _persist(row)
 
@@ -793,6 +795,9 @@ def outcome_stats(minutes: float = 60.0) -> dict:
     with _lock:
         rows = [dict(r) for r in _recent if r["ts"] >= cutoff]
     ok = sum(1 for r in rows if r.get("ok"))
+    # 首试成功 = 终态 ok 且只发生过 1 次账号尝试；重试后成功不算首试
+    first_ok = sum(1 for r in rows
+                   if r.get("ok") and (r.get("attempts") or 1) == 1)
     fails = [r for r in rows if not r.get("ok")]
     kinds = Counter((r.get("kind") or "") for r in fails)
     kinds.pop("", None)
@@ -804,6 +809,9 @@ def outcome_stats(minutes: float = 60.0) -> dict:
         "ok": ok,
         "fail": len(fails),
         "success_rate": round(100.0 * ok / len(rows), 2) if rows else None,
+        "final_success_rate": round(100.0 * ok / len(rows), 2) if rows else None,
+        "first_success": first_ok,
+        "first_success_rate": round(100.0 * first_ok / len(rows), 2) if rows else None,
         "fail_by_kind": dict(kinds.most_common()),
         "http_503": len(s503),
         "http_503_by_kind": dict(s503_kinds.most_common()),
