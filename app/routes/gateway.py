@@ -3055,7 +3055,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                     # 换出口使用会被上游判 unusual activity（3012）。
                     verify_param, verify_region = await captcha_manager.get_verify_param(
-                        egress_tag=_messages_egress()
+                        egress_tag=_messages_egress(),
+                        proxy_url=account.proxy_url,
                     )
                 except Exception as err:  # noqa: BLE001
                     logs.req_err(req_id, f"人机校验失败: {err}")
@@ -3210,7 +3211,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 渠道上即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
                 challenge = _detect_captcha_challenge(resp, text) if channel == "zai" else None
                 if challenge:
-                    captcha_manager.invalidate(_messages_egress())
+                    captcha_manager.invalidate(_messages_egress(), proxy_url=account.proxy_url)
                     captcha_retries += 1
                     reqlog.note_retry(req_id, "cap")
                     reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))

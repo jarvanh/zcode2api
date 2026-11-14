@@ -68,7 +68,7 @@ class TestWakeOnTake:
         monkeypatch.setattr(settings, "CAPTCHA_IDLE_AFTER", 600)
         assert mgr._idle() is True
 
-        async def raced(config, tag):
+        async def raced(config, tag, proxy_url=None):
             mgr._put(_token(), tag)
             return mgr._pop_fresh(tag)
 
@@ -105,12 +105,12 @@ class TestRaceLateArrival:
 
         release = asyncio.Event()
 
-        async def slow_solve(config, tag):
+        async def slow_solve(config, tag, proxy_url=None):
             await asyncio.wait_for(release.wait(), timeout=5)
             return _token()
 
-        async def solve_one(config, tag):
-            return await slow_solve(config, tag)
+        async def solve_one(config, tag, proxy_url=None):
+            return await slow_solve(config, tag, proxy_url)
 
         monkeypatch.setattr(mgr, "_solve_one", solve_one)
         got = await mgr._solve_raced({})
@@ -130,7 +130,7 @@ class TestRaceLateArrival:
         胜者此时尚未消费故不拦），T3 被池内查重拦截 → 池=1（对齐上游）。"""
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
 
-        async def fast_solve(config, tag):
+        async def fast_solve(config, tag, proxy_url=None):
             return _token()
 
         monkeypatch.setattr(mgr, "_solve_one", fast_solve)
@@ -143,7 +143,7 @@ class TestRaceLateArrival:
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
         counter = {"n": 0}
 
-        async def fast_solve(config, tag):
+        async def fast_solve(config, tag, proxy_url=None):
             counter["n"] += 1
             import base64
             import json as _json

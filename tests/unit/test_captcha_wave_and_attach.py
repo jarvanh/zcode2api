@@ -60,7 +60,8 @@ def _plan_account(name="c-att") -> Account:
 
 def _build(acc, monkeypatch, token):
     if token is not None:
-        monkeypatch.setattr(captcha_manager, "try_take_now", lambda egress_tag=None: ("tok-123", "sgp"))
+        monkeypatch.setattr(captcha_manager, "try_take_now",
+                            lambda egress_tag=None, proxy_url=None: ("tok-123", "sgp"))
     url, headers, payload = agent.build_request(acc, {
         "model": "glm-5.3-flash", "max_tokens": 30, "stream": False,
         "messages": [{"role": "user", "content": "hi"}],
@@ -86,7 +87,8 @@ def test_attach_on_emits_pool_token(monkeypatch):
 def test_attach_pool_empty_fails_open(monkeypatch):
     acc = _plan_account()
     monkeypatch.setattr(settings, "CAPTCHA_ATTACH_PLAN", True)
-    monkeypatch.setattr(captcha_manager, "try_take_now", lambda egress_tag=None: None)
+    monkeypatch.setattr(captcha_manager, "try_take_now",
+                        lambda egress_tag=None, proxy_url=None: None)
     headers = _build(acc, monkeypatch, None)
     assert "X-Aliyun-Captcha-Verify-Param" not in headers
 

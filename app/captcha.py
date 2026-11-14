@@ -28,6 +28,7 @@ import json
 import os
 import signal
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -324,6 +325,25 @@ class CaptchaManager:
 
     def _size(self, tag: str) -> int:
         return self._pool_sizes.get(tag, 0)
+
+    @staticmethod
+    def _egress_key(tag: str, proxy_url: str | None) -> str:
+        """token 池键：显式账号代理按 host:port 归一化，否则沿用出口 tag。
+
+        账号各自走不同代理时，token 必须按真实出口分池；只用 proxy/direct
+        会把 A 出口解出的 token 发给 B 出口，上游判 3012。
+        """
+        text = (proxy_url or "").strip()
+        if not text:
+            return tag
+        try:
+            parts = urlsplit(text)
+            host = (parts.hostname or "").lower()
+            if host:
+                return f"proxy:{host}:{parts.port}" if parts.port else f"proxy:{host}"
+        except ValueError:
+            pass
+        return f"proxy:{text}"
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self, egress_tag: str | None = None) -> dict:
@@ -652,34 +672,38 @@ class CaptchaManager:
             for token in kept:
                 self._put(token, one)
 
-    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None,
+                               proxy_url: str | None = None) -> tuple[str, str | None]:
         """取一枚可用 token：池内直取 → 池空竞速现解 → 宽限窗口等补货。
 
         `egress_tag` 必须是本次请求真实使用的出口（`proxy` / `direct`），
         否则拿到的 token 与请求 IP 不一致，上游会判 unusual activity。
-        只有热路径出口有池；其它出口现解。
+        `proxy_url` 是账号自己的出口代理（账号级 proxy_url）；传入后 token
+        按该代理的 host:port 单独分池，并与求解器子进程出口一致。
 
         返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
         取用即打点 _last_take_at——闲置停解由任意请求唤醒（对齐 zapi wake）。
         """
         self._last_take_at = time.monotonic()
         tag = egress_tag or self.hot_egress()
-        pooled = tag == self.hot_egress()
+        key = self._egress_key(tag, proxy_url)
+        hot_key = self._egress_key(self.hot_egress(), None)
 
-        # 1) 池内直取（仅热路径出口有池；亚毫秒，取出即触发后台补货）
-        if pooled:
-            token = self._pop_fresh(tag)
-            if token is not None:
-                self._trigger_refill(1, tag)
-                return token.param, token.region
+        # 1) 池内直取（账号代理池按出口键隔离；热路径池继续后台补货）
+        token = self._pop_fresh(key)
+        if token is not None:
+            if key == hot_key:
+                self._trigger_refill(1, key)
+            return token.param, token.region
 
         # 2) 池空/全过期/非热路径出口：竞速现解（对齐 zapi takeToken：
         #    空池到达本身即扩容信号）
         config = await self.fetch_config(tag)
-        token = await self._solve_raced(config, tag)
+        token = await self._solve_raced(config, key, proxy_url=proxy_url)
         if token is not None:
             self._mark_issued(token)
-            self._trigger_refill(1, tag)
+            if key == hot_key:
+                self._trigger_refill(1, key)
             return token.param, token.region
 
         # 3) 竞速无果：宽限窗口内等后台落库（竞速败者/超时者的迟到成功也会入库；
@@ -688,13 +712,15 @@ class CaptchaManager:
             grace_deadline = time.monotonic() + settings.CAPTCHA_TAKE_GRACE
             while time.monotonic() < grace_deadline:
                 await asyncio.sleep(0.4)
-                token = self._pop_fresh(tag)
+                token = self._pop_fresh(key)
                 if token is not None:
-                    self._trigger_refill(1, tag)
+                    if key == hot_key:
+                        self._trigger_refill(1, key)
                     return token.param, token.region
         raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
 
-    def try_take_now(self, egress_tag: str | None = None) -> tuple[str, str | None] | None:
+    def try_take_now(self, egress_tag: str | None = None,
+                     proxy_url: str | None = None) -> tuple[str, str | None] | None:
         """热路径同步取码（C 档 CAPTCHA_ATTACH_PLAN 用）：仅池内直取，绝不现解。
 
         与 get_verify_param 的差别：池空返回 None（请求按无验证码形态发出，
@@ -702,14 +728,18 @@ class CaptchaManager:
         （C 档开启时每请求都是流量信号，池水位由后台循环维持）。
         """
         self._last_take_at = time.monotonic()
-        token = self._pop_fresh(egress_tag or self.hot_egress())
+        tag = egress_tag or self.hot_egress()
+        key = self._egress_key(tag, proxy_url)
+        token = self._pop_fresh(key)
         if token is None:
             return None
-        self._trigger_refill(1, token.egress)
+        if key == self._egress_key(self.hot_egress(), None):
+            self._trigger_refill(1, key)
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
-    async def _solve_raced(self, config: dict, tag: str | None = None) -> _Token | None:
+    async def _solve_raced(self, config: dict, tag: str | None = None,
+                           proxy_url: str | None = None) -> _Token | None:
         """空池竞速：并行 EMPTY_TAKE_RACE 路求解，首个成功即回、其余入库。
 
         全部失败或总死线 RACE_DEADLINE 内无胜者 → None（错误已记 _last_error）。
@@ -727,7 +757,7 @@ class CaptchaManager:
         async def racer() -> None:
             nonlocal served, failed
             try:
-                token = await self._solve_one(config, tag)
+                token = await self._solve_one(config, tag, proxy_url=proxy_url)
             except Exception as err:  # noqa: BLE001 - 单路失败不拖垮竞速
                 self._last_error = str(err)
                 token = None
@@ -757,7 +787,8 @@ class CaptchaManager:
             )
             return None
 
-    async def _solve_one(self, config: dict, tag: str = egress.DIRECT) -> _Token | None:
+    async def _solve_one(self, config: dict, tag: str = egress.DIRECT,
+                         proxy_url: str | None = None) -> _Token | None:
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
@@ -767,7 +798,7 @@ class CaptchaManager:
             try:
                 # 进程级并发上限：超出排队等前一个浏览器退出，避免内存被打满
                 async with self._solve_sem:
-                    param = await self._run_solver(scene, region, prefix, tag)
+                    param = await self._run_solver(scene, region, prefix, tag, proxy_url)
             except Exception as err:  # noqa: BLE001
                 last_err = str(err)
                 param = None
@@ -794,7 +825,8 @@ class CaptchaManager:
         return None
 
     async def _run_solver(
-        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT
+        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
+        proxy_url: str | None = None,
     ) -> str | None:
         solver = settings.CAPTCHA_SOLVER_JS
         runtime = os.path.basename(str(settings.NODE_PATH))
@@ -817,10 +849,17 @@ class CaptchaManager:
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)
         t0 = time.monotonic()
-        if tag == egress.PROXY:
+        # 显式账号代理优先（钉到账号出口）；未给时沿用环境出口语义。
+        explicit = (proxy_url or "").strip()
+        if explicit:
+            proxy = explicit
+        elif tag == egress.PROXY:
             proxy = egress.proxy_url()
             if not proxy:
                 raise RuntimeError("请求走代理但 env 未配置代理地址，无法对齐验证码出口")
+        else:
+            proxy = None
+        if proxy:
             solver_env["HTTP_PROXY"] = proxy
             solver_env["HTTPS_PROXY"] = proxy
         proc = await asyncio.create_subprocess_exec(
@@ -902,13 +941,13 @@ class CaptchaManager:
         return param
 
     # ── 失效 ─────────────────────────────────────────────────────────────────
-    def invalidate(self, tag: str | None = None) -> None:
+    def invalidate(self, tag: str | None = None, proxy_url: str | None = None) -> None:
         """上游返回验证码挑战时清空该出口的池（该批 token/指纹已不可信）。
 
         默认只清热路径出口：只按出口清，避免把另一条通道（如 claim 的直连池）
         一起废掉。传 `tag=None` 且需要全清时用 `invalidate_all()`。
         """
-        self._drain(tag or self.hot_egress())
+        self._drain(self._egress_key(tag or self.hot_egress(), proxy_url))
 
     def invalidate_all(self) -> None:
         for tag in list(self._pools):

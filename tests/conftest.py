@@ -143,6 +143,7 @@ class _StubCaptcha:
         self.taken_now: int = 0
         self.solve_count = 0
         self.last_egress: str | None = None
+        self.last_proxy: str | None = None
         # 线上配置默认「模型请求也要验证码」；测试可置 False 覆盖
         self.needs_captcha = True
         self.config = dict(constants.CAPTCHA_DEFAULTS)
@@ -150,8 +151,9 @@ class _StubCaptcha:
     def notify_wave_pause(self, seconds: float) -> None:
         self.wave_pauses.append(seconds)
 
-    def try_take_now(self, egress_tag: str | None = None):
+    def try_take_now(self, egress_tag: str | None = None, proxy_url: str | None = None):
         self.taken_now += 1
+        self.last_proxy = proxy_url
         return None
 
     async def fetch_config(self, egress_tag: str | None = None) -> dict:
@@ -160,13 +162,16 @@ class _StubCaptcha:
     async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
         return self.needs_captcha
 
-    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None,
+                               proxy_url: str | None = None) -> tuple[str, str | None]:
         self.solve_count += 1
         self.last_egress = egress_tag
+        self.last_proxy = proxy_url
         return "mock-verify-param", None
 
-    def invalidate(self, tag: str | None = None) -> None:
+    def invalidate(self, tag: str | None = None, proxy_url: str | None = None) -> None:
         self.invalidated += 1
+        self.last_proxy = proxy_url
 
 
 @pytest.fixture

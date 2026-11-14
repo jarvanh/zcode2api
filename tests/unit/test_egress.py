@@ -145,7 +145,7 @@ class TestCaptchaEgressSeparation:
         async def _config(tag=None):
             return {"sceneId": "s", "region": "cn", "prefix": "p"}
 
-        async def _solve(config, tag=egress.DIRECT):
+        async def _solve(config, tag=egress.DIRECT, proxy_url=None):
             solved.append(tag)
             return _Token(f"tok-{tag}", "cn", tag)
 
@@ -195,6 +195,30 @@ class TestCaptchaEgressSeparation:
         assert mgr._size(egress.PROXY) == 0
         assert mgr._size(egress.DIRECT) == 1
 
+    def test_account_proxy_key_is_normalized(self):
+        assert CaptchaManager._egress_key(egress.PROXY, None) == egress.PROXY
+        assert CaptchaManager._egress_key(egress.DIRECT, None) == egress.DIRECT
+        assert (CaptchaManager._egress_key(egress.PROXY, "http://127.0.0.1:7891")
+                == "proxy:127.0.0.1:7891")
+        # 同一代理的不同凭证写法归一到同一池键
+        assert (CaptchaManager._egress_key(egress.PROXY, "http://u:p@127.0.0.1:7891")
+                == "proxy:127.0.0.1:7891")
+
+    async def test_account_proxy_pools_are_isolated(self, monkeypatch):
+        """A 代理解出的 token 不得发给 B 代理（出口 IP 不同 → 3012）。"""
+        solved: list[str] = []
+        mgr = self._manager(monkeypatch, hot=egress.PROXY, solved=solved)
+        proxy_a = "http://127.0.0.1:7891"
+        proxy_b = "http://127.0.0.1:7892"
+        mgr._put(_Token("tok-a", "cn", mgr._egress_key(egress.PROXY, proxy_a)))
+        mgr._put(_Token("tok-b", "cn", mgr._egress_key(egress.PROXY, proxy_b)))
+
+        pa, _ = await mgr.get_verify_param(egress_tag=egress.PROXY, proxy_url=proxy_a)
+        pb, _ = await mgr.get_verify_param(egress_tag=egress.PROXY, proxy_url=proxy_b)
+
+        assert (pa, pb) == ("tok-a", "tok-b")
+        assert solved == []
+
     async def test_solver_env_follows_egress(self, monkeypatch):
         """求解器子进程的代理变量：direct 剥掉、proxy 注入。"""
         _env(monkeypatch, https="http://127.0.0.1:10822")
@@ -226,6 +250,11 @@ class TestCaptchaEgressSeparation:
         await mgr._run_solver("s", "cn", "p", egress.PROXY)
         assert captured["env"].get("HTTP_PROXY") == "http://127.0.0.1:10822"
         assert captured["env"].get("HTTPS_PROXY") == "http://127.0.0.1:10822"
+
+        # 账号级代理优先于环境代理：求解器必须走账号自己的出口
+        await mgr._run_solver("s", "cn", "p", egress.PROXY, "http://127.0.0.1:7891")
+        assert captured["env"].get("HTTP_PROXY") == "http://127.0.0.1:7891"
+        assert captured["env"].get("HTTPS_PROXY") == "http://127.0.0.1:7891"
 
     async def test_proxy_egress_without_proxy_env_raises(self, monkeypatch):
         mgr = CaptchaManager()

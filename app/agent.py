@@ -170,7 +170,7 @@ def build_request(
         # C 档（默认关，fork 保留）：plan 通道每请求附一枚池内验证码 token
         # （验证码头是 start-plane 承重结构，裸发会被 ESA 边缘间歇拒绝）。
         # 仅在池内直取（try_take_now 绝不现解），池空 fail-open 按无码发出。
-        token = captcha_manager.try_take_now()
+        token = captcha_manager.try_take_now(proxy_url=account.proxy_url)
         if token:
             headers[constants.CAPTCHA_HEADER] = token[0]
             if token[1]:
