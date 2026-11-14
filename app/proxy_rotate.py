@@ -41,6 +41,8 @@ _cooldown: dict[str, float] = {}
 _blocked: dict[str, dict[str, float]] = {}
 # 组 -> 轮换锁（并发请求只做一次真实切换）
 _locks: dict[str, asyncio.Lock] = {}
+# 进程级计数（/meta 观测）：成功轮换 / controller 拒绝 / 无候选
+_stats = {"rotations": 0, "failures": 0, "no_candidates": 0}
 
 
 def group_for(account_name: str) -> str:
@@ -49,10 +51,22 @@ def group_for(account_name: str) -> str:
 
 
 def reset_state() -> None:
-    """测试隔离钩子：清空冷却、黑名单与锁。"""
+    """测试隔离钩子：清空冷却、黑名单、锁与计数。"""
     _cooldown.clear()
     _blocked.clear()
     _locks.clear()
+    _stats.update(rotations=0, failures=0, no_candidates=0)
+
+
+def snapshot() -> dict:
+    """当前轮换观测值（/meta 用）。"""
+    return {
+        "rotations": _stats["rotations"],
+        "failures": _stats["failures"],
+        "no_candidates": _stats["no_candidates"],
+        "blocked_nodes": sum(len(v) for v in _blocked.values()),
+        "cooldown_accounts": len(_cooldown),
+    }
 
 
 def _prune_blocked(group: str, now: float) -> None:
@@ -121,15 +135,18 @@ async def rotate(req_id: str, account: Account) -> str | None:
             if n != current and n != "AUTO" and n not in entries
         ]
         if not candidates:
+            _stats["no_candidates"] += 1
             logs.warn(req_id, f"出口组 {group} 无可用候选节点（全封/组空），保持静默换号")
             return None
 
         target = candidates[0]
         if not await _api_put(f"/proxies/{group}", {"name": target}):
+            _stats["failures"] += 1
             logs.warn(req_id, f"出口组 {group} 切节点 {target} 失败（controller 拒绝），保持静默换号")
             return None
 
         _cooldown[account.id] = time.monotonic()
+        _stats["rotations"] += 1
         logs.warn(
             req_id,
             f"账号 {account.name} 出口节点已轮换：{current or '?'} → {target}（组 {group}）",

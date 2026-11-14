@@ -68,6 +68,7 @@ async def test_rotates_to_first_unblocked_node(monkeypatch):
     assert puts == [(f"/proxies/{group}", {"name": "node-b"})]
     # 当前节点进黑名单
     assert "node-a" in proxy_rotate._blocked[group]
+    assert proxy_rotate.snapshot()["rotations"] == 1
 
 
 async def test_second_rotation_skips_blocked_and_respects_cooldown(monkeypatch):

@@ -2481,6 +2481,21 @@ def _provider_edge_held(provider: str) -> tuple[int, str] | None:
     return best
 
 
+async def _net_fail_rotate(req_id: str, account: Account) -> bool:
+    """连续连接失败时的节点轮换：出口抖动换节点比等冷却更快恢复产能。
+
+    达到 PROXY_ROTATE_NET_STRIKES_MIN 次才切（一次瞬态失败不值得动）；
+    成功即解除该账号冷却，让下一个请求立即用新出口；失败保持冷却不变。
+    """
+    if account.net_strikes < max(1, settings.PROXY_ROTATE_NET_STRIKES_MIN):
+        return False
+    node = await proxy_rotate.rotate(req_id, account)
+    if not node:
+        return False
+    logs.warn(req_id, f"账号 {account.name} 连接失败触发节点轮换 → {node}，解除冷却")
+    return True
+
+
 async def _edge_rotate_or_failover(req_id: str, account: Account,
                                    verify_param: str | None) -> bool:
     """出口静默时的处置：无 captcha token 在身则切节点并解除静默；否则换号。
@@ -3161,9 +3176,17 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         settings.RISK_STRIKE_DECAY_SECONDS)
                     account.status = Status.COOLING
                     account.cooling_until = until
-                    account.last_error = (
-                        f"连接失败（第 {account.net_strikes:.0f} 次，冷却至 "
-                        f"{time.strftime('%H:%M', time.localtime(until))}）: {err}")
+                    rotated = await _net_fail_rotate(req_id, account)
+                    if rotated:
+                        # 换到新节点：冷却不再有意义，立即放回池
+                        account.status = Status.ACTIVE
+                        account.cooling_until = None
+                        account.last_error = (
+                            f"连接失败（第 {account.net_strikes:.0f} 次）后已轮换节点: {err}")
+                    else:
+                        account.last_error = (
+                            f"连接失败（第 {account.net_strikes:.0f} 次，冷却至 "
+                            f"{time.strftime('%H:%M', time.localtime(until))}）: {err}")
                     store.update_account(account)
                 logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
                 return _NEXT_ACCOUNT

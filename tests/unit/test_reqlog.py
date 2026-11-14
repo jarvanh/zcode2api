@@ -529,6 +529,20 @@ class TestAccountHealth:
         assert c["risk"] == 1 and c["c5xx"] == 1 and c["c429"] == 1
         assert c["total"] == 3 and c["window_min"] == 10
 
+    def test_outcome_stats_breaks_down_503(self):
+        reqlog.begin("o1", "m", "m", False, "")
+        reqlog.finish_ok("o1")
+        reqlog.begin("o2", "m", "m", False, "")
+        reqlog.finish_error("o2", "冷却", status=503, kind="channel_cooling")
+        reqlog.begin("o3", "m", "m", False, "")
+        reqlog.finish_error("o3", "无号", status=503, kind="no_available_account")
+        s = reqlog.outcome_stats(minutes=10)
+        assert s["total"] == 3 and s["ok"] == 1 and s["fail"] == 2
+        assert s["http_503"] == 2
+        assert s["http_503_by_kind"]["channel_cooling"] == 1
+        assert s["http_503_by_kind"]["no_available_account"] == 1
+        assert s["fail_by_kind"]["channel_cooling"] == 1
+
     def test_reset_clears_recent(self):
         reqlog.begin("z1", "m", "m", False, "")
         reqlog.finish_ok("z1")

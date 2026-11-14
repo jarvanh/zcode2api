@@ -335,6 +335,9 @@ PROXY_CONTROLLER_URL = (os.getenv("ZCODE_PROXY_CONTROLLER_URL", "http://127.0.0.
 PROXY_ROTATE_COOLDOWN = _int("ZCODE_PROXY_ROTATE_COOLDOWN", 90)      # 每账号两次轮换最小间隔（秒）
 PROXY_ROTATE_TIMEOUT = _int("ZCODE_PROXY_ROTATE_TIMEOUT", 3)          # controller API 超时（秒）
 PROXY_ROTATE_BLOCK_TTL = _int("ZCODE_PROXY_ROTATE_BLOCK_TTL", 3600)   # 节点黑名单记忆（秒）
+# 连续连接失败达到该次数时也触发一次节点轮换（不只 405；连接失败常是
+# 出口节点抖动，换节点比等冷却更快恢复产能）
+PROXY_ROTATE_NET_STRIKES_MIN = _int("ZCODE_PROXY_ROTATE_NET_STRIKES_MIN", 2)
 # 同时投入的账号数上限（0 = 不限）。magpie 实测：同一出口 3 个号并发会被
 # 405 拒，2 个不会（plugins#649 引用 01huadalang 的 Discord 反馈）。
 # 控制台可改（meta 表即时生效）；超出的号留作备用，在用的号冷却/耗尽时顶上。
@@ -347,9 +350,11 @@ MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
 # 单账号并发抬高只会放大 3008/WAF；env / meta 仍可覆盖（见 store.account_concurrency）。
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
 # 单账号最小请求间隔（毫秒）：上游按账号限制突发并发，account_concurrency=1
-# 时两个请求只要同拍到达仍可能撞 3008。给每个账号加 150ms 的最小间隔，
-# 让突发在本地自然排队，而不是同时压上游。0 = 关闭。
-ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 150)
+# 时两个请求只要同拍到达仍可能撞 3008。给每个账号加最小间隔，让突发在
+# 本地自然排队，而不是同时压上游。0 = 关闭。
+# 2026-11-14 调参 150→100：C8/C12 压测零 3008/WAF，释放一点吞吐；出现
+# 3008/WAF 计数抬升时回调。
+ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 100)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -427,7 +432,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.54"
+APP_VERSION = "2.9.55"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

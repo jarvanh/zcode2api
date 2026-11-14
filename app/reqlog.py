@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -780,6 +780,36 @@ def recent_counts(minutes: float = 10.0) -> dict:
     c429 = sum(1 for r in rows if (r.get("status") or 0) == 429)
     return {"window_min": minutes, "risk": risk, "c5xx": c5xx, "c429": c429,
             "total": len(rows)}
+
+
+def outcome_stats(minutes: float = 60.0) -> dict:
+    """近 minutes 的结局统计：首试 vs 最终成功率、按 kind 的失败分布。
+
+    数据源 _recent 只记终态行（含在途收口），且同一请求只产生一行，所以
+    「首试成功率」无法从 _recent 区分 —— 这里以 err_kind/status 分布为主，
+    成功率按终态行 ok 占比计算（等同最终成功率）；503 再按响应 kind 细分。
+    """
+    cutoff = time.time() - minutes * 60
+    with _lock:
+        rows = [dict(r) for r in _recent if r["ts"] >= cutoff]
+    ok = sum(1 for r in rows if r.get("ok"))
+    fails = [r for r in rows if not r.get("ok")]
+    kinds = Counter((r.get("kind") or "") for r in fails)
+    kinds.pop("", None)
+    s503 = [r for r in fails if r.get("status") == 503]
+    s503_kinds = Counter((r.get("kind") or "no_available_account") for r in s503)
+    return {
+        "window_min": minutes,
+        "total": len(rows),
+        "ok": ok,
+        "fail": len(fails),
+        "success_rate": round(100.0 * ok / len(rows), 2) if rows else None,
+        "fail_by_kind": dict(kinds.most_common()),
+        "http_503": len(s503),
+        "http_503_by_kind": dict(s503_kinds.most_common()),
+        "http_429": sum(1 for r in fails if r.get("status") == 429),
+        "http_5xx": sum(1 for r in fails if (r.get("status") or 0) >= 500),
+    }
 
 
 def snapshot() -> list[dict]:

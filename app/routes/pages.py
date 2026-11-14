@@ -76,4 +76,12 @@ async def admin_settings_html():
 @router.get("/meta", include_in_schema=False)
 async def meta():
     from app import inflight_metrics
-    return {"version": settings.APP_VERSION, **inflight_metrics.snapshot()}
+
+    from .. import proxy_rotate, reqlog
+
+    return {
+        "version": settings.APP_VERSION,
+        **inflight_metrics.snapshot(),
+        "outcomes": reqlog.outcome_stats(60),
+        "proxy_rotate": proxy_rotate.snapshot(),
+    }
