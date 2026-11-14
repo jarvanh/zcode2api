@@ -1187,7 +1187,7 @@ class TestEdgeBlockPerAccountIsolation:
         # 剥掉 proxy kwarg（mock 经 ASGI 直达，无需真实代理网络）
         acc_a.egress = "mock://egress-a"
         acc_b.egress = "mock://egress-b"
-        tag_a, tag_b = "mock://egress-a", "mock://egress-b"
+        tag_b = "mock://egress-b"
 
         real_cls = httpx.AsyncClient
 

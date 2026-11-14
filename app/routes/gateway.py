@@ -2269,10 +2269,23 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
 
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     kind, wait = _recovery(req_provider, model_key)
+    if wait and wait > time.time():
+        if kind == "model":
+            final_kind = "quota"
+        elif kind == "quota":
+            final_kind = "quota"
+        elif kind in ("rate", "busy"):
+            final_kind = "rate"
+        else:
+            final_kind = "channel_cooling"
+    elif queued > 0:
+        final_kind = "queue_timeout"
+    else:
+        final_kind = _no_account_kind(provider, model_key, limit)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满",
                         status=429 if (kind in ("model", "rate", "busy") and wait) else (
                             402 if kind == "quota" else 503),
-                        kind="quota" if kind == "quota" else ("rate" if kind in ("model", "rate", "busy") else "no_account"))
+                        kind=final_kind)
     if wait and wait > time.time():
         retry_after = max(1, int(wait - time.time() + 0.999))
         if kind == "model":
@@ -2314,6 +2327,7 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                             f"预计 {time.strftime('%H:%M', time.localtime(wait))} 恢复"
                             "（封锁按通道，换模型无济于事）"),
                 "type": "no_available_account", "code": "channel_cooling",
+                "kind": "channel_cooling",
                 "next_available_at": round(wait),
             }, "retry_after": retry_after},
             status_code=503,
@@ -2324,7 +2338,7 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
     _note_pool_exhausted(trigger=None)
     return JSONResponse(
         {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态",
-                   "type": "no_available_account", "kind": "no_available_account"}},
+                   "type": "no_available_account", "kind": final_kind}},
         status_code=503,
         headers={"Retry-After": str(max(1, settings.RETRY_503_AFTER))},
     )
@@ -2511,6 +2525,23 @@ def _provider_edge_held(provider: str) -> tuple[int, str] | None:
         if best is None or remaining > best[0]:
             best = (remaining, key)
     return best
+
+
+def _no_account_kind(provider: str, model_key: str, limit: int) -> str:
+    """最终 503 的细分原因：并发全满 / 无可用账号。
+
+    排队耗尽由调用方按 queued 标记 queue_timeout；请求死线分支已单独返回
+    deadline。这里只区分「有可选账号但都到单账号上限」与「根本没有可用号」。
+    """
+    selectable = [
+        a for a in store.list_accounts(provider)
+        if a.is_selectable(time.time(), model=model_key)
+    ]
+    if not selectable:
+        return "no_available_account"
+    if limit > 0 and all(_inflight.get(a.id, 0) >= limit for a in selectable):
+        return "concurrency_full"
+    return "no_available_account"
 
 
 async def _net_fail_rotate(req_id: str, account: Account) -> bool:
