@@ -198,6 +198,9 @@ EARLY_FLUSH_BEAT = _int("ZCODE_EARLY_FLUSH_BEAT", 15)
 # 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
 # Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
 RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
+# 纯无号/排队超时类 503 的 Retry-After（秒）：给客户端一个短退避提示，
+# 避免上游网关把 503 当「节点坏了」立刻重试造成二次风暴。0/负值按 1s 处理。
+RETRY_503_AFTER = _int("ZCODE_RETRY_503_AFTER", 5)
 # ── BUSY_HOLD（magpie plugins#503 同款全池刹车）─────────────────────────
 # 429 body 3008/3009/3010 = 并发槽「没轮到」（官方客户端读作「系统繁忙」：
 # 1s/2s 重问两次后放弃）。同一请求 1s 重问仍被拒 = 持续饱和；60s 窗口内
@@ -333,6 +336,10 @@ MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
 # 2.9.48 采纳上游 2.7.31 口径：上游 ZCode 单账号并发写死 3，默认值随之上调；
 # fork 仍保留 env / meta 覆盖（运营可调，见 store.account_concurrency）。
 ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 3)
+# 单账号最小请求间隔（毫秒）：上游按账号限制突发并发，account_concurrency=1
+# 时两个请求只要同拍到达仍可能撞 3008。给每个账号加 150ms 的最小间隔，
+# 让突发在本地自然排队，而不是同时压上游。0 = 关闭。
+ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 150)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -410,7 +417,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.49"
+APP_VERSION = "2.9.50"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
@@ -465,6 +472,9 @@ THINKING_COMPAT = _bool("ZCODE_THINKING_COMPAT", True)
 # 档（thinking 32K + output_config.effort=max，预算加在 max_tokens 之外）。
 # 1 = 开启（默认，GLM-5.3-Flash 默认 max 思考）；0 = 原生透传。
 THINKING_NATIVE_DEFAULT = _bool("ZCODE_THINKING_NATIVE_DEFAULT", True)
+# 未显式传思考档时的默认档位（low/high/max）。默认 max 保持不变；
+# 需要按部署权衡质量与吞吐时可改 low/high，非法值回退 max。
+THINKING_DEFAULT_EFFORT = os.getenv("ZCODE_THINKING_DEFAULT_EFFORT", "max").strip().lower() or "max"
 
 # ── 端点映射跟随（app/endpoint_routing.py）────────────────────────────
 # 周期拉 agent/configs 的 proxyEndpoint.mapping 表，按上游指令改写推理端点

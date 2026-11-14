@@ -69,7 +69,13 @@ def normalize_effort(effort: object) -> str:
         return "high"
     if effort in ("none", "minimal", "light", "low"):
         return "low"
-    return GLM53_DEFAULT_EFFORT
+    return _default_effort()
+
+
+def _default_effort() -> str:
+    """未显式给档时的默认值：允许部署级 low/high/max，非法值回退 max。"""
+    raw = str(getattr(settings, "THINKING_DEFAULT_EFFORT", GLM53_DEFAULT_EFFORT) or "").strip().lower()
+    return raw if raw in ("low", "high", "max") else GLM53_DEFAULT_EFFORT
 
 
 def _clamp_budget_to_model(budget: int, model: str) -> int:

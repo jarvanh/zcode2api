@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import re
 import secrets
 import threading
@@ -36,6 +35,7 @@ from .. import (
     quota_windows,
     reasoning,
     reqlog,
+    retry_policy,
     riskmetrics,
     session_ctx,
     settings,
@@ -627,17 +627,35 @@ def _is_edge_block(status_code: int, text: str) -> bool:
 
 
 def _parse_retry_after(value: str | None) -> int | None:
-    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即用默认重试等待）。
+    """解析 Retry-After（秒数 / HTTP-date），超长值按配置封顶。"""
+    return retry_policy.parse_retry_after(value, cap=settings.RETRY_429_WAIT_MAX)
 
-    非正数不采信；超长值封顶采信 —— 尊重上游意图的同时防止把客户端吊死。
+
+_pace_locks: dict[str, asyncio.Lock] = {}
+_pace_last: dict[str, float] = {}
+
+
+async def _pace_account(account: Account) -> None:
+    """单账号最小请求间隔：同一账号的请求在本地串行排 150ms。
+
+    上游按账号限制突发并发；account_concurrency=1 只能保证「同时在飞 1 个」，
+    两个请求前后脚释放/占用时仍可能同拍打到上游。这里用账号级锁 + 单调时钟
+    保证相邻两次真正发上游至少间隔 ACCOUNT_MIN_INTERVAL_MS，把突发削平。
+    0 = 关闭（不加锁、不等待）。
     """
-    if not value:
-        return None
-    try:
-        secs = int(float(value.strip()))
-    except (ValueError, AttributeError):
-        return None
-    return min(secs, settings.RETRY_429_WAIT_MAX) if secs > 0 else None
+    interval = max(0, int(settings.ACCOUNT_MIN_INTERVAL_MS)) / 1000.0
+    if interval <= 0:
+        return
+    lock = _pace_locks.get(account.id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _pace_locks[account.id] = lock
+    async with lock:
+        now = time.monotonic()
+        wait = interval - (now - _pace_last.get(account.id, 0.0))
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _pace_last[account.id] = time.monotonic()
 
 
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
@@ -1367,8 +1385,10 @@ def _no_quota_response(req_id: str, model: str, message: str, wait: float | None
             headers={"Retry-After": str(retry_after)},
         )
     return JSONResponse(
-        {"error": {"message": message, "type": "no_available_account"}},
+        {"error": {"message": message, "type": "no_available_account",
+                   "kind": "no_available_account"}},
         status_code=503,
+        headers={"Retry-After": str(max(1, settings.RETRY_503_AFTER))},
     )
 
 
@@ -1967,8 +1987,10 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                                     kind="deadline")
                 return JSONResponse(
                     {"error": {"message": f"所有账号重试均未成功（请求级死线 {deadline}s）",
-                               "type": "no_available_account", "tried": sorted(tried)}},
+                               "type": "no_available_account", "kind": "deadline",
+                               "tried": sorted(tried)}},
                     status_code=503,
+                    headers={"Retry-After": "1"},
                 )
             # 2026-10-25 防风控放大器（两账号确认制）：波次暂停期直接快速 503
             # （不选号不试探；波次首请求最多烧 2 次 strike）。流式请求改 503 会丢
@@ -2068,6 +2090,8 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                 _inflight[account.id] = _inflight.get(account.id, 0) + 1
                 slot_box[0] = account.id
 
+            # 单账号最小间隔：削平同拍突发，比让上游回 3008 再 BUSY_HOLD 便宜。
+            await _pace_account(account)
             attempts += 1
             # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
             # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须
@@ -2257,8 +2281,10 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
     # 套餐窗口闸门在这里补触发——重启后真空期首请求也能进入快速失败闭环。
     _note_pool_exhausted(trigger=None)
     return JSONResponse(
-        {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
+        {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态",
+                   "type": "no_available_account", "kind": "no_available_account"}},
         status_code=503,
+        headers={"Retry-After": str(max(1, settings.RETRY_503_AFTER))},
     )
 
 
@@ -3474,16 +3500,20 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                   + (f"（429 扣号 {hold_secs}s 至 "
                                      f"{time.strftime('%H:%M', time.localtime(until))}）" if hold_secs else ""))
                         return _NEXT_ACCOUNT
-                    if retries_429 < settings.RETRY_429_TIMES:
+                    if retry_policy.decide_retry(
+                            status_code=429, attempt=retries_429,
+                            max_attempts=settings.RETRY_429_TIMES):
                         retries_429 += 1
                         reqlog.note_retry(req_id, "429")
                         concurrency_hit = busy_hit
-                        wait = _parse_retry_after(resp.headers.get("retry-after"))
-                        if wait is None:
-                            if concurrency_hit:
-                                wait = settings.RETRY_429_CONCURRENCY_WAIT + random.randint(0, 2)
-                            else:
-                                wait = settings.RETRY_429_WAIT
+                        wait = retry_policy.retry_delay(
+                            retries_429,
+                            retry_after=resp.headers.get("retry-after"),
+                            base=(settings.RETRY_429_CONCURRENCY_WAIT
+                                  if concurrency_hit else settings.RETRY_429_WAIT),
+                            cap=settings.RETRY_429_WAIT_MAX,
+                            jitter=0.2,
+                        )
                         if concurrency_hit:
                             logs.warn(
                                 req_id,
@@ -3542,21 +3572,30 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
 
                 if status_code >= 500:
                     # 一般性上游错误：重试，耗尽才冷却账号并换号
-                    if retries_5xx < settings.RETRY_5XX_TIMES:
+                    if retry_policy.decide_retry(
+                            status_code=status_code, attempt=retries_5xx,
+                            max_attempts=settings.RETRY_5XX_TIMES):
                         retries_5xx += 1
                         reqlog.note_retry(req_id, "5xx")
-                        reqlog.note_wait(req_id, "5xx", settings.RETRY_5XX_WAIT)
+                        wait_5xx = retry_policy.retry_delay(
+                            retries_5xx,
+                            retry_after=resp.headers.get("retry-after"),
+                            base=settings.RETRY_5XX_WAIT,
+                            cap=max(settings.RETRY_5XX_WAIT, 30),
+                            jitter=0.2,
+                        )
+                        reqlog.note_wait(req_id, "5xx", wait_5xx)
                         reqlog.mark_attempt(req_id, account.name, account.mode,
                                             channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
                                             status=status_code, ms=(time.time() - attempt_t0) * 1000,
-                                            error=f"上游 {status_code}，{settings.RETRY_5XX_WAIT}s 后重试")
+                                            error=f"上游 {status_code}，{wait_5xx:.1f}s 后重试")
                         logs.warn(
                             req_id,
                             f"账号 {account.name} 上游 HTTP {status_code}，"
-                            f"{settings.RETRY_5XX_WAIT}s 后重试（{retries_5xx}/{settings.RETRY_5XX_TIMES}）",
+                            f"{wait_5xx:.1f}s 后重试（{retries_5xx}/{settings.RETRY_5XX_TIMES}）",
                         )
                         _park_slot(slot_box)
-                        await _sleep(settings.RETRY_5XX_WAIT)
+                        await _sleep(wait_5xx)
                         if not _reacquire_slot(account, slot_box):
                             logs.warn(req_id, f"账号 {account.name} 5xx 等待后并发已满，切换下一个")
                             return _NEXT_ACCOUNT

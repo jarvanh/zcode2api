@@ -167,3 +167,16 @@ def test_malformed_thinking_never_raises():
 
     body, err = openai_to_anthropic(_payload(thinking="garbage", reasoning_effort=123))
     assert err is None  # 转换层绝不放大请求失败
+
+
+def test_default_effort_configurable_and_validated(monkeypatch):
+    monkeypatch.setattr(settings, "THINKING_DEFAULT_EFFORT", "high")
+    assert reasoning.normalize_effort(None) == "high"
+    assert reasoning._default_effort() == "high"
+
+    monkeypatch.setattr(settings, "THINKING_DEFAULT_EFFORT", "bogus")
+    assert reasoning.normalize_effort(None) == "max"
+
+    # 显式档位优先于默认值
+    monkeypatch.setattr(settings, "THINKING_DEFAULT_EFFORT", "low")
+    assert reasoning.normalize_effort("max") == "max"
