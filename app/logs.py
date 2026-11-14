@@ -44,6 +44,10 @@ def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _stamp() -> str:
+    return f"{_DIM}[{time.strftime('%m-%d %H:%M:%S')}]{_R}"
+
+
 def ok(module: str, msg: str):
     print(f"{_DIM}{_ts()}{_R}  {_G}[+]{_R} {_DIM}{module}{_R} {msg}")
 

@@ -241,8 +241,13 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
         # 2026-11-13 tebi 实证：GCP 大厂 ASN 直连可用（历史缺省），机房小 ASN
         # 直连 IP 会被 billing 风控拒（preview 空投放/429、验证码 3007）——
         # 走家宽代理 3/3 号立即可领。messages 端点与此独立（egress.py 判定）。
+        # per-account 出口隔离（2.7.36）：账号绑定专属代理时优先——billing 与
+        # messages 必须同 IP（token/风控同源）。
+        account_proxy = egress.account_proxy(account)
         trust_env = settings.BILLING_EGRESS == egress.PROXY
-        async with httpx.AsyncClient(timeout=25, trust_env=trust_env) as client:
+        client_kw = ({"proxy": account_proxy, "trust_env": False} if account_proxy
+                     else {"trust_env": trust_env})
+        async with httpx.AsyncClient(timeout=25, **client_kw) as client:
             res = await client.request(
                 method, url,
                 headers=headers, **kwargs,
@@ -310,7 +315,8 @@ async def report_activation_events(account: Account) -> str | None:
         return "JWT 无 user_id，跳过激活上报"
     for element in constants.ACTIVATION_ELEMENTS:
         try:
-            await post_activation_event(profile, user_id, element)
+            await post_activation_event(profile, user_id, element,
+                                        proxy=egress.account_proxy(account))
         except (httpx.HTTPError, RuntimeError) as err:
             return _activation_err_text(element, err)
     return None
@@ -1017,11 +1023,16 @@ async def claim(account: Account, plan_id: str | None = None, *,
                                                       allow_disabled=allow_disabled)
     # claim 的 billing 请求出口见 _billing_request（BILLING_EGRESS，2.7.32 起
     # 可配 direct/proxy）；验证码必须同出口解，否则 token 的出口与请求出口
-    # 不一致，上游判 unusual activity。
+    # 不一致，上游判 unusual activity。fork 语义：billing/claim 链路默认直连，
+    # claim_proxy 仅在 PER_ACCOUNT_EGRESS 开启且账号绑定出口时非 None
+    # （2.7.36 per-account 语义经 egress.account_proxy 接入）。
+    claim_egress = egress.egress_tag_for(account, settings.BILLING_EGRESS)
+    claim_proxy = egress.account_proxy(account)
+    _captcha_kw = {"proxy_url": claim_proxy} if claim_proxy else {}
     verify_param, verify_region = await captcha_manager.get_verify_param(
-        egress_tag=settings.BILLING_EGRESS
+        egress_tag=claim_egress, **_captcha_kw
     )
-    config = await captcha_manager.fetch_config(settings.BILLING_EGRESS)
+    config = await captcha_manager.fetch_config(claim_egress, **_captcha_kw)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
     body = await _billing_request(
@@ -1034,7 +1045,7 @@ async def claim(account: Account, plan_id: str | None = None, *,
         _clear_cooling_after_claim(account)
         return outcome
     if code == 3007:
-        captcha_manager.invalidate(settings.BILLING_EGRESS)  # 被拒的码出池，避免下轮复用
+        captcha_manager.invalidate(claim_egress)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
 
 

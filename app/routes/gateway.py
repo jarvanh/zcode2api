@@ -316,15 +316,21 @@ MODEL_CATALOG = constants.MODEL_CATALOG
 _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 
 
-def _messages_egress() -> str:
+def _messages_egress(account: Account | None = None) -> str:
     """messages 通道有效出口 tag（同时驱动 captcha 签发出口，见 app/egress.py）。
 
+    per-account 出口隔离（2.7.36）：账号绑定了专属代理时 tag = 该代理 URL
+    （闸门断路器 / 验证码池 / config 缓存都按它分键，token 出口 = 请求出口）；
+    否则维持全局 2 值 tag（proxy/direct）。
     ZCODE_MESSAGES_FORCE_DIRECT=true 强制直连：2026-11-04 线上实证 env 代理
     出口（GCP IP）被上游持续标记——messages 走代理 17h+ 零成功（3012
     unusual activity），而同账号 billing/claim/telemetry 直连全部正常。
     统一全链路出口，消除「CN billing + US messages」双 IP 异常信号；
     置 false 恢复历史行为（走 env 代理）。
     """
+    proxy = egress.account_proxy(account) if account is not None else None
+    if proxy:
+        return proxy
     if settings.MESSAGES_FORCE_DIRECT:
         return egress.DIRECT
     return egress.egress_for(settings.UPSTREAM["zai"])
@@ -414,8 +420,9 @@ def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> 
         return None
     low = text.lower()
 
-    # 2) body 业务码 3007 —— 状态无关（literal 业务码不会误撞）
-    if any(m in text for m in constants.CAPTCHA_BODY_MARKERS):
+    # 2) body 业务码 3007 —— 状态无关，business_code 精确解析（裸子串会被
+    # 长码值前缀误撞，3009/1113 的 logid 陷阱同一纪律，2026-11-14 review）
+    if business_error.business_code(_safe_json(text)) == constants.CAPTCHA_CHALLENGE_CODE:
         return "in-body-3007"
 
     # 3) 400/403 + 挑战文案（业务码已被上一步吃掉，剩下的只可能是真挑战）
@@ -659,11 +666,13 @@ async def _pace_account(account: Account) -> None:
         _pace_last[account.id] = time.monotonic()
 
 
-def _mark(account: Account, status_value: str, error: str | None = None) -> None:
+def _mark(account: Account, status_value: str, error: str | None = None,
+          cooldown: float | None = None) -> None:
     account.status = status_value
     account.last_error = error
     if status_value == Status.COOLING:
-        account.cooling_until = time.time() + settings.COOLING_SECONDS
+        seconds = settings.COOLING_SECONDS if cooldown is None else cooldown
+        account.cooling_until = time.time() + seconds
     store.update_account(account)
 
 
@@ -1431,7 +1440,7 @@ async def _bigmodel_openai_chat(payload: dict, requested_model: str, request: Re
         url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         headers = {"Authorization": f"Bearer {account.api_key}", "Content-Type": "application/json"}
         # 账号级出口代理：proxy_kwargs() 未配置时返回 {}，行为与直连一致
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=settings.UPSTREAM_READ_TIMEOUT, write=120.0, pool=30.0),
                                    **account.proxy_kwargs())
         reqlog.mark_account(req_id, account.name, account.mode)
         reqlog.mark_channel(req_id, "apikey")
@@ -1732,10 +1741,46 @@ async def count_tokens(request: Request):
     return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
 
 
+def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
+    """SSE 流统一异常契约装饰器（2026-11-14 review：三份消费体各自复制同一段
+    499/502/中断记账 + close 兜底，收敛后行为逐字节不变）。
+
+    fail_frames：UpstreamStreamError（上游在流内下发 error 事件）时产出客户端
+    可识别的失败帧——转译层各自形态；None = 无转译层的透传路径，该异常与普通
+    异常同走「流传输中断」记账（与原 to_streaming 行为一致）。
+    """
+    def decorate(gen_fn):
+        async def guarded():
+            try:
+                async for item in gen_fn():
+                    yield item
+            except asyncio.CancelledError:
+                reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+                raise
+            except Exception as err:  # noqa: BLE001
+                if isinstance(err, UpstreamStreamError) and fail_frames is not None:
+                    # 上游在流内下发 error 事件：必须以客户端可识别的错误帧收尾，
+                    # 不能让半截回答静默变成「成功」（2.7.33）
+                    logs.req_err(req_id, f"上游流式错误: {err}")
+                    reqlog.finish_error(req_id, f"上游流式错误: {err}", status=502,
+                                        t_first=up.t_first)
+                    for frame in fail_frames(err):
+                        yield frame
+                else:
+                    logs.req_err(req_id, f"流传输中断: {err}")
+                    reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+            finally:
+                await up.close()
+        return guarded
+    return decorate
+
+
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
     """把上游 Anthropic SSE 事件流转换为 OpenAI chunk 流。"""
     conv = StreamConverter(model)
 
+    @_sse_guard(req_id, up, fail_frames=lambda err: (
+        error_sse(str(err), err.code), conv.done()))
     async def _iter():
         try:
             yield conv.start()
@@ -1853,41 +1898,28 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
     chat_conv = StreamConverter(model)
     resp_conv = ResponsesStreamConverter(model)
 
+    @_sse_guard(req_id, up, fail_frames=lambda err: resp_conv.fail(str(err), err.code))
     async def _iter():
-        try:
-            for out in resp_conv.start():
-                yield out
-            async for line in up.resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if not data_str:
-                    continue
-                evt = _safe_json(data_str)
-                if not isinstance(evt, dict):
-                    continue
-                for chunk in chat_conv.feed_events(evt):
-                    for out in resp_conv.feed_chunk(chunk):
-                        yield out
-            for out in resp_conv.done():
-                yield out
-            logs.req_ok(req_id)
-            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
-                             input_tokens=chat_conv.usage.get("prompt_tokens"),
-                             output_tokens=chat_conv.usage.get("completion_tokens"))
-        except asyncio.CancelledError:
-            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
-            raise
-        except UpstreamStreamError as err:
-            logs.req_err(req_id, f"上游流式错误: {err}")
-            reqlog.finish_error(req_id, f"上游流式错误: {err}", status=502, t_first=up.t_first)
-            for out in resp_conv.fail(str(err), err.code):
-                yield out
-        except Exception as err:  # noqa: BLE001
-            logs.req_err(req_id, f"流传输中断: {err}")
-            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
-        finally:
-            await up.close()
+        for out in resp_conv.start():
+            yield out
+        async for line in up.resp.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            evt = _safe_json(data_str)
+            if not isinstance(evt, dict):
+                continue
+            for chunk in chat_conv.feed_events(evt):
+                for out in resp_conv.feed_chunk(chunk):
+                    yield out
+        for out in resp_conv.done():
+            yield out
+        logs.req_ok(req_id)
+        reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                         input_tokens=chat_conv.usage.get("prompt_tokens"),
+                         output_tokens=chat_conv.usage.get("completion_tokens"))
 
     return StreamingResponse(_iter(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache"})
@@ -2110,7 +2142,7 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
             plan_channel = account.provider == "zai" and account.uses_plan_channel()
             try:
                 needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
-                    _messages_egress()
+                    _messages_egress(account), account.proxy_url
                 )
                 result = await _try_account(
                     req_id, account, body, incoming_headers, plan_channel, needs_captcha,
@@ -2771,6 +2803,27 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
     )
 
 
+def _note_exhausted(account: Account, model_name: str | None,
+                    reset_ts: float | None = None) -> None:
+    """额度耗尽记账三件套（2026-11-14 review 去重：1005 与 429-1113 分支曾各自
+    复制同一段，且 1113 分支漏了 reset_ts 精化）。
+
+    - 后台 billing 刷新（去抖共享 last_checked_at）
+    - 池证据链（全池确认枯竭 → pool_hold）
+    - 模型级冷却：Plan 通道确认耗尽的（账号，模型）组合记一笔，后续点名同模型
+      的请求直接跳号（不撞必然的 1005/1113）；同号其它模型额度独立不连坐
+      （2.7.29）。model_name 传 None（非 Plan 通道/无模型名）时跳过。
+    reset_ts 有上游 reset 字段时用之，否则回退固定冷却窗。
+    """
+    _spawn_bg(_safe_refresh(account))
+    _note_pool_exhausted(account)
+    if model_name and model_name != "-":
+        plan_guard.note(
+            account.id, model_name,
+            reset_ts or (time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN),
+        )
+
+
 def _limit() -> int:
     """当前并发上限（0 = 不限）。控制台可改、meta 即时生效（v2.9.33 恢复）。"""
     return store.account_concurrency()
@@ -2880,13 +2933,14 @@ class _Upstream:
                 continue
             try:
                 callback()
-            except Exception:  # noqa: BLE001 - 槽位/闸门释放失败不掩盖主流程
-                pass
+            except Exception as exc:  # noqa: BLE001 - 释放失败不掩盖主流程，但必须留痕
+                logs.warn("slot", f"槽位/闸门释放回调异常（可能泄漏）: {exc!r}")
 
     def to_streaming(self, req_id: str) -> StreamingResponse:
         """原样透传（/v1/messages 直通路径）。"""
         up = self
 
+        @_sse_guard(req_id, up)
         async def _body_iter():
             try:
                 async for chunk in up.resp.aiter_bytes():
@@ -2989,7 +3043,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     force_fallback = False  # 仅供 _lane_for 监控口径；通道切换已改由 _jump_to_fallback 驱动
     model_name = str(body.get("model") or "-")
     # 验证码必须与本次 zcode-plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
-    captcha_egress = _messages_egress() if plan_channel else None
+    captcha_egress = _messages_egress(account) if plan_channel else None
     gate_acquired = False
 
     def _drop_gate() -> None:
@@ -3068,7 +3122,8 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 cap_t0 = time.time()
                 try:
                     # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
-                    # 换出口使用会被上游判 unusual activity（3012）。
+                    # 换出口使用会被上游判 unusual activity（3012）。per-account
+                    # 模式下 = 账号绑定代理（token 出口 = 请求出口）。
                     verify_param, verify_region = await captcha_manager.get_verify_param(
                         egress_tag=_messages_egress(),
                         proxy_url=account.proxy_url,
@@ -3139,7 +3194,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # ZCODE_MESSAGES_FORCE_DIRECT 时账号代理照常生效（2.7.16 语义：该开关只
             # 压制 env/系统代理，账号级显式代理仍是账号自己的出口决策）。
             client = httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+                timeout=httpx.Timeout(connect=30.0, read=settings.UPSTREAM_READ_TIMEOUT, write=120.0, pool=30.0),
                 trust_env=not settings.MESSAGES_FORCE_DIRECT,
                 **account.proxy_kwargs())
             # 出口观测：账号自带代理 / env 系统代理 / 直连（egress_for 与 httpx 判定逐字一致）
@@ -3931,5 +3986,5 @@ async def _safe_refresh(account: Account) -> None:
             if last and time.time() - last < settings.BILLING_REFRESH_MIN_INTERVAL:
                 return
             await fetch_quota(live)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 - 后台刷新不放大请求失败，但必须留痕
+        logs.warn(f"quota/{account.name}", f"后台额度刷新异常: {exc!r}")

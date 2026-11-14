@@ -159,7 +159,8 @@ class _StubCaptcha:
     async def fetch_config(self, egress_tag: str | None = None) -> dict:
         return dict(self.config)
 
-    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+    async def model_requests_need_captcha(self, egress_tag: str | None = None,
+                                          proxy: str | None = None) -> bool:
         return self.needs_captcha
 
     async def get_verify_param(self, egress_tag: str | None = None,
@@ -232,10 +233,10 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     _gate._window_start = 0.0
     _gate._window_count = 0
     _gate._inflight = 0
-    _gate._edge_until = 0.0
-    _gate.edge_hits = 0
-    _gate._busy_hits = []
-    _gate._busy_until = 0.0
+    _gate._edge_until = {}
+    _gate.edge_hits = {}
+    _gate._busy_hits = {}
+    _gate._busy_until = {}
     _gate._pool_hold_until = 0.0
     gateway_module._busy_hold["until"] = 0.0
     gateway_module._busy_hold["hits"] = []

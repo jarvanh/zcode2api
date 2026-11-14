@@ -187,6 +187,8 @@ class Account:
     # 账号级出口代理：仅作用于 chat 网关上游（每请求新建 client 时注入）。
     # billing/claim/额度/验证码链路刻意直连（见 claim._billing_request 注释），
     # 不得引用。None = 直连；socks5 需 socksio（requirements 已含）。
+    # （上游 2.7.36 的同义字段 egress 不落 dataclass——由下方 egress property
+    # 双向别名到 proxy_url，持久化仍走 proxy_url，见 to_dict。）
     proxy_url: str | None = None
 
     @staticmethod
@@ -797,8 +799,22 @@ class Account:
                 return "coding-plan"
         return ""
 
+    # ── 上游 egress 字段别名（2.7.36 持久化兼容）────────────────────────────
+    # fork 的账号出口真源是 proxy_url（scripts/assign_egress.py 写入）；上游
+    # 2.7.36 改用 egress 字段命名。这里提供双向别名：egress 读 proxy_url、
+    # 写 proxy_url，store 的入池分配/补分配逻辑零改动即可工作。
+    @property
+    def egress(self) -> str | None:
+        return self.proxy_url
+
+    @egress.setter
+    def egress(self, value: str | None) -> None:
+        self.proxy_url = value
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("egress", None)  # 别名不落库：真源只有 proxy_url
+        return d
 
     @staticmethod
     def from_dict(data: dict) -> Account:
@@ -894,6 +910,10 @@ class Account:
             # 轮询是否会选中它（额度判死/冷却/停用都在这里体现）：后台排障时
             # 「状态 active 但不发请求」最常见的原因就是这一项为 false
             "selectable": self.is_selectable(),
+            # per-account 出口绑定（fork proxy_url / 上游 egress 别名）：
+            # None = 共享出口；排障「该账号从哪个 IP 出去」一眼可读
+            "egress": self.egress,
+            "proxy_url": self.proxy_url,
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,

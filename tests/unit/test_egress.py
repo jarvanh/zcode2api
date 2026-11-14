@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import os
+
 import httpx
 import pytest
 
@@ -142,7 +144,7 @@ class TestCaptchaEgressSeparation:
     def _manager(self, monkeypatch, hot: str, solved: list[str]) -> CaptchaManager:
         mgr = CaptchaManager()
 
-        async def _config(tag=None):
+        async def _config(tag=None, proxy_url=None):
             return {"sceneId": "s", "region": "cn", "prefix": "p"}
 
         async def _solve(config, tag=egress.DIRECT, proxy_url=None):
@@ -153,7 +155,7 @@ class TestCaptchaEgressSeparation:
         monkeypatch.setattr(mgr, "_solve_one", _solve)
         monkeypatch.setattr(CaptchaManager, "hot_egress", lambda self: hot)
 
-        async def _no_refill(need, tag=None):
+        async def _no_refill(need, tag=None, proxy=None):
             return None
 
         monkeypatch.setattr(mgr, "_refill_batch", _no_refill)
@@ -261,6 +263,39 @@ class TestCaptchaEgressSeparation:
         with pytest.raises(RuntimeError):
             await mgr._run_solver("s", "cn", "p", egress.PROXY)
 
+    async def test_solver_env_per_account_proxy(self, monkeypatch):
+        """per-account 出口隔离（2.7.36）：显式 proxy 参数注入 solver env——
+        token 出口 = 请求出口 不变式的关键路径。"""
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        mgr = CaptchaManager()
+        captured: dict[str, dict] = {}
+
+        class _FakeProc:
+            pid = 4322
+
+            def kill(self) -> None:
+                pass
+
+            async def communicate(self):
+                return b"VERIFY_PARAM=mock\n", b""
+
+            async def wait(self):
+                return 0
+
+        async def _fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env") or {}
+            return _FakeProc()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+        if hasattr(os, "killpg"):
+            monkeypatch.setattr(os, "killpg", lambda *_a: None)
+
+        acct_proxy = "http://127.0.0.1:11031"
+        await mgr._run_solver("s", "cn", "p", acct_proxy, proxy_url=acct_proxy)
+        assert captured["env"].get("HTTP_PROXY") == acct_proxy
+        assert captured["env"].get("HTTPS_PROXY") == acct_proxy
+
 
 class TestConfigFetchProxyFallback:
     """fetch_config 走账号代理；代理不可用时回退直连。"""
@@ -313,7 +348,7 @@ class TestModelRequestCaptchaGating:
     def _manager(self, monkeypatch, config: dict) -> CaptchaManager:
         mgr = CaptchaManager()
 
-        async def _config(tag=None):
+        async def _config(tag=None, proxy_url=None):
             return dict(config)
 
         monkeypatch.setattr(mgr, "fetch_config", _config)

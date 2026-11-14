@@ -428,7 +428,8 @@ class CaptchaManager:
             )
             return dict(constants.CAPTCHA_DEFAULTS)
 
-    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+    async def model_requests_need_captcha(self, egress_tag: str | None = None,
+                                          proxy_url: str | None = None) -> bool:
         """模型请求是否该带验证码——官方 `requiresRequestVerification` 的等价物。
 
         bundle 原文：`mode==="start-plan" && enabled!==false && skipModelRequest!==true`。
@@ -436,7 +437,7 @@ class CaptchaManager:
         `X-Aliyun-Captcha-Verify-Param`；hub 长期无条件带，这正是「官方不会干的
         事」，也是 3012 的结构性嫌疑。无配置时官方仍要求验证码，故默认 False。
         """
-        config = await self.fetch_config(egress_tag)
+        config = await self.fetch_config(egress_tag, proxy_url=proxy_url)
         return config.get("enabled") is not False and config.get("skip_model_request") is not True
 
     # ── 预解池 ───────────────────────────────────────────────────────────────
@@ -861,6 +862,7 @@ class CaptchaManager:
         # 出口必须与取用该 token 的请求一致（见 app/egress.py）：
         #   direct → 剥掉代理变量，chrome 不带 --proxy-server
         #   proxy  → 注入代理变量，solver 用它作 --proxy-server
+        # per-account 模式（2.7.36）：proxy = 账号绑定代理 URL，每账号独立出口
         solver_env = {
             **os.environ,
             "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH),

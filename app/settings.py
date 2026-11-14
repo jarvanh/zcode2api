@@ -228,6 +228,10 @@ COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 # 不再共用 COOLING_SECONDS 的 300s 整号一刀切。
 NET_COOLING_BASE = _int("ZCODE_NET_COOLING_BASE", 60)
 NET_COOLING_CAP = _int("ZCODE_NET_COOLING_CAP", 600)
+# 上游 2.7.38 的命名（连接失败冷却秒数）；fork 的等价实现是
+# NET_COOLING_BASE/CAP（base×2 递进 + cap 封顶），此别名仅为兼容上游测试与
+# 旧部署 env，实际计算以 NET_COOLING_* 为准。
+CONNECT_FAIL_COOLDOWN = _int("ZCODE_CONNECT_FAIL_COOLDOWN", 60)
 # 1113「无余额/无资源包」按模型冷却：同一账号可能只缺某个模型的包，
 # 不能整号禁用；冷却到期后由下一次请求探测，成功才恢复（指数退避封顶）。
 MODEL_NO_QUOTA_COOLDOWN_BASE = _int("ZCODE_MODEL_NO_QUOTA_COOLDOWN_BASE", 1800)  # 30m
@@ -355,6 +359,17 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
 # 2026-11-14 调参 150→100：C8/C12 压测零 3008/WAF，释放一点吞吐；出现
 # 3008/WAF 计数抬升时回调。
 ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 100)
+
+# ── per-account 出口隔离开关（上游 2.7.36 引入；fork 语义 = 账号 proxy_url）──
+# fork 已有更完整的 per-account 出口实现（Account.proxy_url + assign_egress
+# 脚本 + mihomo pinned listeners + 405 节点轮换），真源是 proxy_url；上游的
+# egress listener 池分配逻辑经 Account.egress 别名同样落到 proxy_url。此开关
+# 控制 egress.account_proxy/egress_tag_for 是否返回账号绑定代理（关 = 全链路
+# 维持 fork 现状：账号 proxy_url 仅作用于 chat 网关上游，billing 直连）。
+PER_ACCOUNT_EGRESS = _bool("ZCODE_PER_ACCOUNT_EGRESS", False)
+# 上游 EGRESS_LISTENERS 池（逗号分隔 URL）：开启 per-account 且用 store 自动
+# 分配时才需要；fork 部署用 scripts/assign_egress.py 手工绑定，默认留空。
+EGRESS_LISTENERS = [u.strip() for u in os.getenv("ZCODE_EGRESS_LISTENERS", "").split(",") if u.strip()]
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -432,7 +447,11 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.56"
+# 上游读空闲超时（秒，2.7.35 review 整改）：httpx read 超时是「相邻 chunk 之间」
+# 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
+# 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
+UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
+APP_VERSION = "2.9.57"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
