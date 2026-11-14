@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 登录</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
-  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
-  <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
+  <link href="css/app.css" rel="stylesheet">
+  <script src="js/theme.js"></script>
 </head>
 <body class="login-body">
   <div class="login-shell">
@@ -23,8 +23,9 @@
       </div>
     </div>
   </div>
-  <script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
-  <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+  <script src="js/config.js"></script>
+<script src="js/auth.js"></script>
+  <script src="js/toast.js"></script>
   <script>
     const el=document.getElementById('key');
     el.addEventListener('keypress',e=>{if(e.key==='Enter')login();});
@@ -33,14 +34,14 @@
       if(!key)return;
       try{
         const r=await fetch(ADMIN_API+'/verify?login=1',{headers:{Authorization:`Bearer ${key}`}});
-        if(r.ok){await adminKey.set(key);location.href='/admin/accounts';}
+        if(r.ok){await adminKey.set(key);location.href='accounts.html';}
         else if(r.status===429) showToast('尝试次数过多，请 5 分钟后再试','error');
         else showToast('密码无效','error');
       }catch{showToast('连接失败','error');}
     }
     (async()=>{
       const key=await adminKey.get();
-      if(key)try{if(await verifyKey(ADMIN_API+'/verify',key))location.href='/admin/accounts';}catch{}
+      if(key)try{if(await verifyKey(ADMIN_API+'/verify',key))location.href='accounts.html';}catch{}
     })();
   </script>
 </body>

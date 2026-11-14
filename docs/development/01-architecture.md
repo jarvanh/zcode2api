@@ -71,7 +71,7 @@ zcode-hub/
 │   ├── reqlog.py          # 内存环形请求日志 + 并发仪表（四口径/峰值/分钟曲线）
 │   └── vitals.py          # 进程体征采样（RSS/solver 与 Chromium 后代/僵尸/池/loop 延迟）
 ├── captcha_node/          # Bun 主路径 solver-bun.ts + vendored captcha-happy.ts；回退 node solver.js
-├── frontend/              # 后台静态页（accounts / settings / login）
+├── frontend/              # 后台静态页（admin/ 下 accounts / settings / login；2.7.34 起纯静态，可独立部署）
 ├── tests/
 │   ├── unit/
 │   ├── integration/

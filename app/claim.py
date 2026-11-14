@@ -129,22 +129,32 @@ def parse_plan(raw: dict) -> dict | None:
         return None
     grants = []
     for ent in raw.get("entitlements") or []:
+        if not isinstance(ent, dict):
+            continue
         if ent.get("meter") != "model_usage" or ent.get("unit_type") != "token":
             continue
         name = str(ent.get("show_name") or ent.get("showName") or "").strip()
         if not name:
             continue
         units = ent.get("grant_units", ent.get("grantUnits")) or 0
+        try:
+            units = float(units)
+        except (TypeError, ValueError):
+            units = 0.0  # 上游偶发字符串/None 形态：不让单个脏字段炸掉整个 preview
         grants.append({
             "name": name,
-            "units": float(units),
+            "units": units,
             "period": ent.get("period") or "one_time",
         })
+    try:
+        priority = int(raw.get("priority") or 0)
+    except (TypeError, ValueError):
+        priority = 0  # preview 排序要求可比较，脏值归零而不是抛 TypeError
     return {
         "plan_id": plan_id,
         "name": str(raw.get("name") or "").strip(),
         "description": str(raw.get("description") or "").strip(),
-        "priority": raw.get("priority") or 0,
+        "priority": priority,
         "grants": grants,
     }
 
@@ -227,10 +237,12 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
     headers = dict(kwargs.pop("headers"))
     url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
     try:
-        # trust_env=False：billing 全家桶直连。实测「解码直连 + claim 直连」才能过
-        # 上游风控（claim 走 US 出口被拒「unusual activity」，直连 code:0）；
-        # messages 端点与此相反（直连曾被 3012 风控），仍走 env 的 US 代理。
-        async with httpx.AsyncClient(timeout=25, trust_env=False) as client:
+        # 出口由 settings.BILLING_EGRESS 决定（trust_env 按 direct/proxy 切）。
+        # 2026-11-13 tebi 实证：GCP 大厂 ASN 直连可用（历史缺省），机房小 ASN
+        # 直连 IP 会被 billing 风控拒（preview 空投放/429、验证码 3007）——
+        # 走家宽代理 3/3 号立即可领。messages 端点与此独立（egress.py 判定）。
+        trust_env = settings.BILLING_EGRESS == egress.PROXY
+        async with httpx.AsyncClient(timeout=25, trust_env=trust_env) as client:
             res = await client.request(
                 method, url,
                 headers=headers, **kwargs,
@@ -240,7 +252,18 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
         raise ClaimError(f"上游网络错误: {err}") from err
     if res.status_code in (401, 403):
         text = (res.text or "").lower()
-        if "captcha" not in text and "verify" not in text:
+        is_challenge = "captcha" in text or "verify" in text
+        if not is_challenge:
+            # 403 + 风控文案 ≠ 凭证失效：标 INVALID 会把健康号永久踢出领取链
+            #（与 messages 链 3012 判定同一口径，2.7.33）。
+            is_risk = res.status_code == 403 and any(
+                m.lower() in text for m in constants.RISK_CONTROL_MARKERS
+            )
+            if is_risk:
+                raise ClaimError(
+                    f"上游风控拒绝 HTTP 403（非凭证失效）: {' '.join((res.text or '').split())[:160]}",
+                    code=403,
+                )
             _mark_auth_failure(account)
             raise ClaimError(AUTH_EXPIRED_MESSAGE)
     try:
@@ -738,6 +761,14 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
             logs.ok("claim", f"账号 {account.name} 自动领取成功: "
                              f"{result.get('plan_name') or plan['plan_id']}")
         except ClaimError as err:
+            if err.code == 1003:
+                # 「已经领取过」= 幂等成功：上游投放会重复列出同一 plan，
+                # 把 1003 记成失败会让每轮都报错（2.7.33）
+                outcomes.append({"account_id": account.id, "account_name": account.name,
+                                 "ok": True, "already_claimed": True,
+                                 "plan_id": plan["plan_id"], "message": str(err)})
+                logs.info("claim", f"账号 {account.name} 套餐 {plan['plan_id']} 已领取过，跳过")
+                continue
             outcome = {"account_id": account.id, "account_name": account.name,
                        "ok": False, "plan_id": plan["plan_id"], "message": str(err)}
             if err.code != -1:
@@ -746,6 +777,10 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
                 outcome["next_at"] = err.next_at
             outcomes.append(outcome)
             logs.warn("claim", f"账号 {account.name} 自动领取 {plan['plan_id']} 失败: {err}")
+            if err.code == 3007:
+                # 验证码被拒是上游风险信号：本账号本轮不再打第二个套餐
+                #（单发即止，2.6.5 口径；此前循环继续 → 每个套餐都白烧一枚码）
+                break
         except Exception as err:  # noqa: BLE001
             logs.warn("claim", f"账号 {account.name} 自动领取异常: {err}")
             outcomes.append({"account_id": account.id, "account_name": account.name,
@@ -980,12 +1015,13 @@ async def claim(account: Account, plan_id: str | None = None, *,
 
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id,
                                                       allow_disabled=allow_disabled)
-    # claim 的 billing 请求走 trust_env=False 直连，验证码必须同样直连解，
-    # 否则 token 的出口与请求出口不一致，上游判 unusual activity。
+    # claim 的 billing 请求出口见 _billing_request（BILLING_EGRESS，2.7.32 起
+    # 可配 direct/proxy）；验证码必须同出口解，否则 token 的出口与请求出口
+    # 不一致，上游判 unusual activity。
     verify_param, verify_region = await captcha_manager.get_verify_param(
-        egress_tag=egress.DIRECT
+        egress_tag=settings.BILLING_EGRESS
     )
-    config = await captcha_manager.fetch_config(egress.DIRECT)
+    config = await captcha_manager.fetch_config(settings.BILLING_EGRESS)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
     body = await _billing_request(
@@ -998,7 +1034,7 @@ async def claim(account: Account, plan_id: str | None = None, *,
         _clear_cooling_after_claim(account)
         return outcome
     if code == 3007:
-        captcha_manager.invalidate(egress.DIRECT)  # 被拒的码出池，避免下轮复用
+        captcha_manager.invalidate(settings.BILLING_EGRESS)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
 
 

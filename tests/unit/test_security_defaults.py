@@ -210,11 +210,14 @@ def test_configured_gateway_key_allows_public_bind(fresh_app, monkeypatch):
     main_module._validate_security_defaults()
 
 
-async def test_empty_gateway_key_denies_non_loopback_request(fresh_app):
+async def test_empty_gateway_key_denies_non_loopback_request(fresh_app, monkeypatch):
+    # 2.7.33 起未配置密钥一律 fail-closed 403（不再给回环来源开后门）
+    monkeypatch.setattr(settings, "GATEWAY_ALLOW_NO_KEY", False)
     with pytest.raises(HTTPException) as exc:
         await auth_admin.verify_gateway_key(_request("203.0.113.9"))
-    assert exc.value.status_code == 401
+    assert exc.value.status_code == 403
 
 
-async def test_empty_gateway_key_allows_loopback_request(fresh_app):
-    await auth_admin.verify_gateway_key(_request("127.0.0.1"))
+async def test_empty_gateway_key_allowed_with_explicit_opt_in(fresh_app, monkeypatch):
+    monkeypatch.setattr(settings, "GATEWAY_ALLOW_NO_KEY", True)
+    await auth_admin.verify_gateway_key(_request("203.0.113.9"))

@@ -46,7 +46,13 @@ from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..gate import gate
 from ..models import Account, Status
-from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
+from ..openai_compat import (
+    StreamConverter,
+    UpstreamStreamError,
+    anthropic_to_openai,
+    error_sse,
+    openai_to_anthropic,
+)
 from ..quota import fetch_quota, refresh_accounts
 from ..responses_compat import ResponsesStreamConverter, chat_to_response, responses_to_chat
 from ..store import store
@@ -392,8 +398,10 @@ def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> 
 
     三种形态：
       1. 响应头 x-aliyun-captcha-verify-param 存在（官方挑战信号）
-      2. HTTP 400/403 + body {"code":3007}（2026-08 观测的 body 内挑战）
-      3. HTTP 403 + 文案 captcha/verify（老检测，保留兼容）
+      2. body 业务码 3007 —— **不限 HTTP 状态**：上游会用 HTTP 200 承载业务
+         错误（status_code 之后被局部改写成本地 400/403），只看 resp 原始状态
+         会漏掉「200 + {"code":3007}」这条真实路径（2.7.33 修复）
+      3. HTTP 400/403 + 文案 captcha/verify（老检测，保留兼容）
     返回挑战标记（非 None 即挑战），否则 None。
     """
     # 1) challenge 响应头
@@ -405,12 +413,12 @@ def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> 
         return None
     low = text.lower()
 
-    # 2) body code 3007（400/403 任意状态）
-    if resp.status_code in (400, 403) and any(m in text for m in constants.CAPTCHA_BODY_MARKERS):
+    # 2) body 业务码 3007 —— 状态无关（literal 业务码不会误撞）
+    if any(m in text for m in constants.CAPTCHA_BODY_MARKERS):
         return "in-body-3007"
 
-    # 3) 403 + 挑战文案
-    if resp.status_code == 403 and _is_captcha_error(low):
+    # 3) 400/403 + 挑战文案（业务码已被上一步吃掉，剩下的只可能是真挑战）
+    if resp.status_code in (400, 403) and _is_captcha_error(low):
         return "text"
 
     return None
@@ -420,6 +428,10 @@ def _is_exhausted(status_code: int, text: str) -> bool:
     # 429 是频控信号，优先于一切 body 关键词：429 body 带额度文案时
     # （api.z.ai 实测形态）必须走频控重试，不得判成额度耗尽踢号。
     if status_code == 429:
+        return False
+    # 5xx 是上游故障（网关错误页常带 "rate limit exceeded" 等文案）：必须走
+    # 冷却+换号，绝不能判成额度耗尽把健康账号踢成 EXHAUSTED（2.7.33 修复）。
+    if status_code >= 500:
         return False
     if status_code in constants.EXHAUST_HTTP_STATUSES:
         return True
@@ -1726,6 +1738,13 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
             raise
+        except UpstreamStreamError as err:
+            # 上游在流内下发 error 事件：必须以客户端可识别的错误帧收尾，
+            # 不能让半截回答静默变成「成功」（2.7.33）
+            logs.req_err(req_id, f"上游流式错误: {err}")
+            reqlog.finish_error(req_id, f"上游流式错误: {err}", status=502, t_first=up.t_first)
+            yield error_sse(str(err), err.code)
+            yield conv.done()
         except Exception as err:  # noqa: BLE001
             logs.req_err(req_id, f"流传输中断: {err}")
             reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
@@ -1838,6 +1857,11 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
             raise
+        except UpstreamStreamError as err:
+            logs.req_err(req_id, f"上游流式错误: {err}")
+            reqlog.finish_error(req_id, f"上游流式错误: {err}", status=502, t_first=up.t_first)
+            for out in resp_conv.fail(str(err), err.code):
+                yield out
         except Exception as err:  # noqa: BLE001
             logs.req_err(req_id, f"流传输中断: {err}")
             reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
@@ -1932,6 +1956,10 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
         )
 
     for pi, provider in enumerate(providers):
+        # 尝试预算是 **按 provider** 计的（2.7.33）：此前 attempts 跨 provider 共享，
+        # zai 池烧满 5 次后 bigmodel 一次也轮不到（降级链名存实亡）。tried 仍跨
+        # provider 保留，同一账号不会被重复尝试。
+        attempts = 0
         while attempts < MAX_ACCOUNT_ATTEMPTS:
             if deadline and time.time() - t0 > deadline:
                 logs.warn(req_id, f"请求级死线 {deadline}s 已到，停止重试（已试 {len(tried)} 账号）")
@@ -2894,8 +2922,20 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         return True
 
     def _jump_to_fallback() -> bool:
-        """风控/鉴权后跳过所有 plan 系渠道，直达 api-key 渠道（如持有）。"""
+        """风控/鉴权后跳过所有 plan 系渠道，直达 api-key 渠道（如持有）。
+
+        Key 处于 1113 无余额冷却时直接跳过：1113 是永久态，尝试必然 429 1113
+        （有界重探 = 冷却到期后第一次触发才会真正尝试，~1h 一探）。否则每次
+        进程级停摆（如边缘 405）都会让全部账号刷一遍「429 1113 无余额」失败
+        记录，把真实根因（405 边缘封禁）淹死在账号失败日志里。
+        """
         fallback = "zai_fallback" if account.provider == "zai" else "bigmodel"
+        if _key_no_balance_cooling(account.id):
+            logs.warn(
+                req_id,
+                f"账号 {account.name} Key 无余额冷却中，跳过 Key 回退（保留根因记录）",
+            )
+            return False
         return _jump_to_channel(target=fallback)
 
     try:

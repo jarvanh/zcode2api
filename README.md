@@ -184,7 +184,10 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | `ZCODE_PORT` | 3000 | 服务端口 |
 | `ZCODE_HOST` | 127.0.0.1 | 监听地址（默认仅回环；空网关 Key 时非回环监听拒绝启动） |
 | `ZCODE_ADMIN_KEY` | 空 | 后台密码初始值（之后写库，以库为准）；留空 = 首启随机生成并打印，旧版默认 `zcode` 会被随机替换 |
-| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空仅允许回环访问（非回环监听会拒绝启动） |
+| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空 = fail-closed（`/v1` 一律 403，非回环监听还会拒绝启动） |
+| `ZCODE_GATEWAY_ALLOW_NO_KEY` | 0 | 仅本地开发/测试：显式 `1` 才允许未配置网关 Key 时匿名访问 |
+| `ZCODE_CORS_ORIGINS` | 空 | 前后端分离（2.7.34）：允许跨源调用本 API 的前端源，逗号分隔；空 = 仅同源 |
+| `ZCODE_BILLING_EGRESS` | direct | billing/claim 链路出口：`direct` 或 `proxy`（机房小 ASN 被风控拒时切家宽代理；token 与请求必须同出口） |
 | `ZCODE_TRUST_PROXY_IP` | 0 | 仅显式 `1` 且来源为受信代理时信任 `cf-connecting-ip` / `x-real-ip`；直连忽略转发头 |
 | `ZCODE_TRUSTED_PROXIES` | 127.0.0.0/8,::1 | 受信反向代理来源（逗号分隔 IP/CIDR） |
 | `ZCODE_BIGMODEL_CHANNEL` | 0 | bigmodel Key 回退通道（`bigmodel/` 前缀 / `x-provider: bigmodel` 头）；默认关闭，`1` 开启（后台「设置」可改，以库为准）|

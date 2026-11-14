@@ -12,7 +12,7 @@ import uuid
 
 import httpx
 
-from . import business_error, constants, logs, settings
+from . import business_error, constants, egress, logs, settings
 from .gate import gate
 from .models import Account, Status, expires_epoch, window_expired, window_usable
 from .models import _plan_bonus_active as _bonus_active
@@ -127,7 +127,11 @@ async def fetch_quota(account: Account) -> dict:
     base = settings.ZCODE_BILLING_BASE
     result: dict = {}
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    # 出口必须与 billing/claim 链一致：BILLING_EGRESS=proxy 时走家宽代理，
+    # direct 时绕过 env/系统代理。此前默认 trust_env=True 会在 proxy 模式下
+    # 让「占多数」的 quota 刷新从直连出口出去（与领奖/请求出口错配）。
+    trust_env = settings.BILLING_EGRESS == egress.PROXY
+    async with httpx.AsyncClient(timeout=20, trust_env=trust_env) as client:
         async def _get(path: str):
             try:
                 return await client.get(f"{base}{path}", headers=headers)
@@ -149,16 +153,22 @@ async def fetch_quota(account: Account) -> dict:
     now = time.time()
     account.last_checked_at = now
 
-    # 鉴权失败 → 标记 invalid
+    # 鉴权失败 → 标记 invalid（403 + 风控文案除外：那是风控不是废 JWT，2.7.33）
     if billing_res is not None and billing_res.status_code in (401, 403):
         body = (billing_res.text or "").lower()
         if "captcha" not in body and "verify" not in body:
-            from .claim import AUTH_EXPIRED_MESSAGE
+            is_risk = billing_res.status_code == 403 and any(
+                m.lower() in body for m in constants.RISK_CONTROL_MARKERS
+            )
+            if not is_risk:
+                from .claim import AUTH_EXPIRED_MESSAGE
 
-            account.status = Status.INVALID
-            account.last_error = AUTH_EXPIRED_MESSAGE
-            store.update_account(account)
-            return {"error": account.last_error}
+                account.status = Status.INVALID
+                account.last_error = AUTH_EXPIRED_MESSAGE
+                store.update_account(account)
+                return {"error": account.last_error}
+            # 风控 403：保留账号状态与额度快照，只留痕（下次刷新重试）
+            account.last_error = "上游风控拒绝 HTTP 403（非凭证失效）"
 
     # HTTP 200 承载的业务错误（Plan 通道实测：额度/风控类拒绝常是 200 +
     # {"code":1005,...}）。三条 billing 请求各自判：命中业务错误的**不得写库**，
@@ -201,6 +211,9 @@ async def fetch_quota(account: Account) -> dict:
                 # 归并进 plans_by_id（不在此直接写 account.plans）：current 与
                 # balance 的 plans 按 plan_id 合并后再统一赋值，避免投放空窗时
                 # current 的空列表把 balance 已生效套餐洗掉（2026-10-31 实证）。
+                # 2.7.33 补强：归并结果为空同样不覆盖——billing/current 偶发回
+                # 空数组会把已知套餐洗掉，plan_kind 退化成「未知」、赠送池判定
+                # 失效；赋值条件见下方 plans_by_id 非空。
                 plans_source_ok = _collect_plans(data) or plans_source_ok
         except (ValueError, KeyError):
             pass
@@ -250,7 +263,7 @@ async def fetch_quota(account: Account) -> dict:
         except (ValueError, KeyError):
             pass
 
-    if plans_source_ok:
+    if plans_source_ok and plans_by_id:
         # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个。
         # 两侧都拿不到 plans 数据时保持原值，不用空列表覆盖历史事实。
         account.plans = list(plans_by_id.values())
@@ -275,6 +288,16 @@ async def fetch_quota(account: Account) -> dict:
         except (ValueError, KeyError):
             pass
 
+    # 赠送池有效性不依赖 balance 是否返回窗口（2.7.33）：balance 空但 plans
+    # 里已有生效的 one_time 授权时，账号仍然可用——原实现只在 quota_map 分支
+    # 内计算 has_bonus，空 balances 的号永远无法从 EXHAUSTED 复活。
+    now = time.time()
+    has_bonus = _bonus_active(account.plan, now) or any(
+        _bonus_active(p, now) for p in account.plans
+    )
+    has_daily = False
+    all_expired = False
+
     if quota_map:
         account.quota = quota_map
         # 快照真实写库的时刻 = 「过期后实查」的证据点（见 models.Account.quota_expired）。
@@ -296,8 +319,12 @@ async def fetch_quota(account: Account) -> dict:
         elif not account.enabled:
             pass  # 手动停用语义优先于额度语义，面板才能读出停用原因
         elif not has_daily and not has_bonus:
-            account.status = Status.EXHAUSTED
-            account.last_error = "额度已过期" if all_expired else "额度已用完"
+            # COOLING 保留冷却态（2.7.33）：EXHAUSTED 的 is_selectable 恒 False
+            #（不看 cooling_until），降级等于把还在指数退避的号永久踢出池子；
+            # 保留 COOLING 让冷却到期后自然重探。
+            if not account.is_cooling():
+                account.status = Status.EXHAUSTED
+                account.last_error = "额度已过期" if all_expired else "额度已用完"
         elif account.status in (Status.EXHAUSTED, Status.COOLING) and (
             has_daily or has_bonus
         ):
@@ -336,6 +363,44 @@ async def fetch_quota(account: Account) -> dict:
     elif not (quota_map or billing_plans or result.get("usage")):
         if account.use_count == 0 and account.status == Status.ACTIVE:
             account.last_error = "billing 为空，待首次请求验证（疑似新号体验额度）"
+
+    # 状态机（2.7.33 重整）：证据只有两处——balance 窗口（quota_map 非空）
+    # 与 plans 一次性赠送池（has_bonus）。缺证据（billing 空/业务错误）不判死。
+    # 风控禁用 / 废 JWT：billing 数据照写（领取链要用），但**绝不**用额度数字改
+    # 状态——否则 DISABLED→EXHAUSTED→（额度恢复）→ACTIVE 会绕过人工/风控封禁。
+    if account.status not in (Status.INVALID, Status.DISABLED):
+        if not has_daily and not has_bonus:
+            if quota_map:
+                # 冷却期内的号不得降级成 EXHAUSTED（2.7.33）：EXHAUSTED 的
+                # is_selectable 恒 False（不看 cooling_until），降级等于把还在
+                # 指数退避的号永久踢出池子；保留 COOLING，冷却到期后自然重探。
+                if account.status == Status.COOLING and account.is_cooling():
+                    account.last_error = "额度已用完（冷却期内保留冷却态）"
+                else:
+                    account.status = Status.EXHAUSTED
+                    account.last_error = "额度已过期" if all_expired else "额度已用完"
+        elif account.status in (Status.EXHAUSTED, Status.COOLING) and not account.is_cooling():
+            # 额度恢复（窗口重置 / 赠送池生效）→ 重新激活。冷却期内不提前解除；
+            # 废 JWT / 风控禁用绝不能因额度数字复活 Plan 通道。
+            account.status = Status.ACTIVE
+            account.last_error = None
+            account.cooling_until = None
+
+    # 套餐窗口闸门解除：任一号实查到可用窗口或生效的赠送池（哪怕它本来状态就
+    # 健康，如 hold 期间未被消息请求碰过的号），全池「确认枯竭」的前提即被推翻。
+    # 放在状态机之外——闸门是进程级状态，不与单账号状态耦合（2026-11-12）。
+    if has_daily or has_bonus:
+        gate.clear_pool_hold()
+        # 模型级额度耗尽冷却**定向**清除（2.7.30 review 整改）：billing 拿到了
+        # 该号账本，就知道哪些窗口可用——只清「可用窗口对应的模型」。整号清除
+        # 会把旗舰冷却反复抹掉（同号 Flash 还有余量时 has_daily 恒真），1005
+        # 重探从 1 次/30min 退化成 1 次/60s（billing 去抖间隔）。模型名与窗口
+        # 名对不上的不清，宁可留给 TTL 兜底。
+        from .plan_guard import clear_model as _pg_clear
+
+        for w_name, w in quota_map.items():
+            if window_usable(w, now):
+                _pg_clear(account.id, w_name)
 
     store.update_account(account)
     # 「三路全业务错误」才整体报失败（调用方据此区分「上游拒绝」与「上游确实

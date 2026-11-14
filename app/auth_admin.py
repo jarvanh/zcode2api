@@ -9,6 +9,7 @@ import time
 
 from fastapi import Header, HTTPException, Query, Request, status
 
+from . import settings
 from .store import store
 
 ADMIN_FAIL_LIMIT = 8
@@ -140,16 +141,21 @@ def _extract_bearer(authorization: str | None) -> str | None:
     return token
 
 
+def _key_equal(token: str, key: str) -> bool:
+    """常数时间比较（UTF-8 字节）：str 版 compare_digest 遇非 ASCII 会抛
+    TypeError（500），等价于把「任意非 ASCII 输入」变成可观测的异常侧信道。"""
+    return hmac.compare_digest(token.encode("utf-8"), key.encode("utf-8"))
+
+
 async def verify_admin_key(
     request: Request,
     authorization: str | None = Header(default=None),
-    app_key: str | None = Query(default=None),
     login: str | None = Query(default=None),
 ) -> None:
     """校验后台管理密钥。
 
-    支持 `Authorization: Bearer <key>` 头或 `?app_key=<key>` 查询参数
-    （后者用于 EventSource 等无法发送自定义头的场景）。
+    只接受 `Authorization: Bearer <key>` 头；查询参数鉴权（`?app_key=`）随上游
+    2.7.33 移除——URL 会进访问日志、浏览器历史、Referer，密钥不该出现在 URL 里。
 
     `login=1` 标记「人正在提交密码」（登录页），失败计入防爆破计数；不带
     则视为会话探测（页面轮询检查本地密钥是否仍有效），失败不计入锁定——
@@ -163,24 +169,15 @@ async def verify_admin_key(
     if not key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未配置后台密钥")
 
-    token = _extract_bearer(authorization) or app_key
+    token = _extract_bearer(authorization)
     probed = login is None or str(login).strip().lower() not in ("1", "true", "yes")
     if token is None:
         _record_failure(ip, probed=probed)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少鉴权凭证")
-    if not hmac.compare_digest(token, key):
+    if not _key_equal(token, key):
         _record_failure(ip, probed=probed)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "鉴权凭证无效")
     _failures.pop(ip, None)
-
-
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 async def verify_gateway_key(
@@ -188,19 +185,22 @@ async def verify_gateway_key(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
-    """校验 /v1/messages 网关访问密钥。
+    """校验 /v1/messages 网关访问密钥（未配置则拒绝：fail-closed）。
 
-    未配置 key 时仅放行回环来源：非回环监听+空 key 在启动阶段已被拒绝，
-    这里再兜底一次（例如 uvicorn --host 覆盖了 ZCODE_HOST 的部署方式）。
+    未配置密钥时放行等于把上游账号池暴露成公开代理——只要部署后忘了设置
+    gateway key，任何人都能用你的额度（2.7.33）。唯一逃生口是显式设置
+    `ZCODE_GATEWAY_ALLOW_NO_KEY=1`（本地开发/测试）。
     """
     key = store.gateway_key()
     if not key:
-        peer = request.client.host if request.client and request.client.host else ""
-        if peer and _is_loopback(peer):
+        if settings.GATEWAY_ALLOW_NO_KEY:
             return
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "网关未配置 API Key，仅允许回环访问")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "网关密钥未配置：请先在后台设置 Gateway API Key 再使用 /v1 端点",
+        )
     token = _extract_bearer(authorization) or x_api_key
     if token is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少 API Key")
-    if not hmac.compare_digest(token, key):
+    if not _key_equal(token, key):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "API Key 无效")

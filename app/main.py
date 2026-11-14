@@ -208,11 +208,29 @@ def create_app() -> FastAPI:
     from app import inflight_metrics
     app.add_middleware(inflight_metrics.InflightMiddleware)
 
-    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
+    # 前后端分离（2.7.34）：前端默认同源 /static 服务，设置 ZCODE_CORS_ORIGINS
+    # 后即可部署到任意源跨域调用本 API（Bearer 鉴权，无 cookie，CSRF 面为零）。
+    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+            max_age=86400,
+        )
 
     app.include_router(pages.router)
     app.include_router(admin_api.router)
     app.include_router(gateway.router)
+    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
+    # 前端相对资产路径（js/... css/...）在 /admin/* 页面形态下的服务点；路由
+    # （/admin/api/*、/admin/login 等）注册在前，优先级高于本挂载。
+    app.mount("/admin", StaticFiles(directory=str(settings.FRONTEND_DIR / "admin"), html=True),
+              name="admin-static")
     return app
 
 

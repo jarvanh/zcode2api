@@ -1,5 +1,5 @@
 /* zcode2api — Auth module (localStorage 加密存储后台密钥) */
-const ADMIN_API = '/admin/api';
+const ADMIN_API = (window.ZCODE_API_BASE || '') + '/admin/api';
 
 const _ENC = new TextEncoder(), _DEC = new TextDecoder();
 const _SECRET = 'zcode2api-admin';
@@ -47,14 +47,13 @@ async function guardUnauthorized(r){
   location.href='/admin/login';
   return true;
 }
-
 async function verifyKey(url,key){
   const r=await fetch(url,{headers:key?{Authorization:`Bearer ${key}`}:{}});
   await guardUnauthorized(r);
   return r.ok;
 }
 
-function adminLogout(){adminKey.clear();location.href='/admin/login';}
+function adminLogout(){adminKey.clear();location.href='login.html';}
 
 /* 统一的后台 API 调用封装 */
 async function api(method,path,body){

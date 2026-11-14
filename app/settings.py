@@ -118,6 +118,10 @@ CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
+# 同时运行的求解器进程上限（含预热与热路径现解）。每次求解是一个真 Chromium
+# （数百 MB + 单核），池空突发时若无上限会按并发请求数同时拉起 N 个浏览器，
+# 在 1–2GB 小机上直接把内存打满（2.7.33）。超出的求解排队，而不是并行。
+CAPTCHA_MAX_CONCURRENT_SOLVES = max(1, _int("ZCODE_CAPTCHA_MAX_SOLVES", 2))
 # 预热哪个出口的 token 池：空 = 跟随 messages 上游的实际出口（推荐）。
 # 可强制 "proxy" / "direct"；非预热出口按需现解（claim 一小时一轮，够用）。
 CAPTCHA_POOL_EGRESS = (os.getenv("ZCODE_CAPTCHA_POOL_EGRESS", "").strip().lower() or "")
@@ -378,6 +382,21 @@ AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
 # 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
 # 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
 MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
+# 网关密钥未配置时是否放行（默认拒：未配置 = 公开代理，任何人可白嫖账号池）。
+# 仅本地开发/测试可显式打开；生产请务必在后台设置 Gateway API Key（2.7.33）。
+GATEWAY_ALLOW_NO_KEY = _bool("ZCODE_GATEWAY_ALLOW_NO_KEY", False)
+# 前后端分离跨域白名单（2.7.34）：前端部署到独立源（GitHub Pages/CF Pages/独立
+# nginx）时填该源，逗号分隔；默认空 = 仅同源（不输出 CORS 头）。鉴权是纯
+# Bearer 头（无 cookie），跨域无 CSRF 面。
+CORS_ORIGINS = os.getenv("ZCODE_CORS_ORIGINS", "")
+# billing/claim 链路出口（2026-11-13 tebi 线上实证）："direct"（历史缺省，
+# GCP 类大厂 ASN 直连可用）或 "proxy"（机房小 ASN 直连 IP 被 billing 风控
+# 拒——preview 空投放/429、验证码 token 3007；走家宽代理 3/3 号立即可领）。
+# 覆盖四处：_billing_request / report_activation（trust_env）、claim 验证码
+# egress tag——三者必须同出口，token 与请求 IP 不一致会被判 unusual activity。
+BILLING_EGRESS = (os.getenv("ZCODE_BILLING_EGRESS", "direct").strip().lower() or "direct")
+if BILLING_EGRESS not in ("direct", "proxy"):
+    BILLING_EGRESS = "direct"
 # 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
 ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
@@ -391,26 +410,13 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.48"
+APP_VERSION = "2.9.49"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表
 # 供 admin API（GET /admin/api/sections/freshness）与 healthcheck 读取；
 # 风控波次确认时若已过时，日志给「高度疑似措辞触发」提示（gateway 波次点）。
 SECTIONS_STALE_DAYS = _int("ZCODE_SECTIONS_STALE_DAYS", 21)
-_FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
-
-
-def frontend_version() -> str:
-    """前端版本号（frontend/version 文件，每次读取 → 前端独立发版即生效）。
-
-    文件缺失/为空时回退 APP_VERSION，保证本地开发与旧部署不破。
-    """
-    try:
-        v = _FRONTEND_VERSION_FILE.read_text("utf-8").strip()
-        return v or APP_VERSION
-    except OSError:
-        return APP_VERSION
 
 # ── 失败请求诊断留存（app/diaglog.py，2026-10-31 405 排障经验）──────────────
 # 上游 4xx/5xx/业务错误时按天落双侧现场（响应体截断 + 请求形状指纹，不含对话

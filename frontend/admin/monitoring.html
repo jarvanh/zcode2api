@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 请求监控</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
-  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
-  <script src="/static/js/theme.js?v={{APP_VERSION}}"></script>
+  <link href="css/app.css" rel="stylesheet">
+  <script src="js/theme.js"></script>
 </head>
 <body>
 <div id="admin-header" data-active="/admin/monitoring"></div>
@@ -121,9 +121,10 @@
   <div class="acct-list" id="list"></div>
 </main>
 
-<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
-<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
-<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script src="js/config.js"></script>
+<script src="js/auth.js"></script>
+<script src="js/toast.js"></script>
+<script src="js/header.js"></script>
 <script>
 let entries = [];      // 实时层：内存环形日志
 let hist = null;       // 历史层：/monitoring/history 聚合结果
@@ -852,7 +853,7 @@ function startPoll(){
 
 (async()=>{
   const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='login.html';
   renderChips();
   syncMode();
   syncTabs();
