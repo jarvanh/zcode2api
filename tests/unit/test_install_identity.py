@@ -6,6 +6,7 @@ import uuid
 
 import httpx
 
+from app import settings
 from app.models import Account
 
 
@@ -257,7 +258,7 @@ class TestConcurrencySetting:
     startGate 排队闸（v2.9.32）吃掉放大链后交还运营调节。"""
 
     def test_default_3(self, fresh_app):
-        assert fresh_app.account_concurrency() == 3
+        assert fresh_app.account_concurrency() == settings.ACCOUNT_CONCURRENCY
 
     def test_meta_value_wins(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "8")
@@ -269,7 +270,7 @@ class TestConcurrencySetting:
 
     def test_bad_meta_value_falls_back(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "abc")
-        assert fresh_app.account_concurrency() == 3
+        assert fresh_app.account_concurrency() == settings.ACCOUNT_CONCURRENCY
 
     def test_negative_meta_clamped(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "-3")

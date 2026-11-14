@@ -38,7 +38,7 @@ class TestStoreSelectLoadBalancing:
 
         # 尽管 a 有 1 个在飞请求、b 有 0 个，但 a 是会话亲和号且未达上限 -> 坚持选 a
         inflight = {a.id: 1, b.id: 0}
-        pick = fresh_app.select("zai", inflight=inflight, pinned_id=a.id)
+        pick = fresh_app.select("zai", inflight=inflight, pinned_id=a.id, max_inflight=2)
         assert pick is not None
         assert pick.id == a.id
 

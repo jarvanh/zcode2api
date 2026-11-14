@@ -262,6 +262,51 @@ class TestCaptchaEgressSeparation:
             await mgr._run_solver("s", "cn", "p", egress.PROXY)
 
 
+class TestConfigFetchProxyFallback:
+    """fetch_config 走账号代理；代理不可用时回退直连。"""
+
+    async def test_proxy_fetch_falls_back_to_direct(self, monkeypatch):
+        from app import captcha as captcha_module
+
+        mgr = CaptchaManager()
+        calls: list[dict] = []
+
+        class _Resp:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {"data": {"configs": {"captcha": {
+                    "region": "sgp", "skip_model_request": True,
+                }}}}
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                calls.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url):
+                if self.kwargs.get("proxy"):
+                    raise httpx.ConnectError("proxy down")
+                return _Resp()
+
+        monkeypatch.setattr(captcha_module.httpx, "AsyncClient", _Client)
+        cfg = await mgr.fetch_config(egress.PROXY, proxy_url="http://127.0.0.1:7891")
+
+        assert cfg["region"] == "sgp"
+        assert calls[0]["proxy"] == "http://127.0.0.1:7891"
+        assert calls[0]["trust_env"] is False
+        # 代理失败后的回退：直连、且不碰 env 代理
+        assert "proxy" not in calls[1]
+        assert calls[1]["trust_env"] is False
+
+
 class TestModelRequestCaptchaGating:
     """`skip_model_request` 语义：官方在模型请求上带不带验证码的等价物。"""
 

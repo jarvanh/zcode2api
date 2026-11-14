@@ -1,4 +1,4 @@
-"""账号并发限制集成测试：单账号上限默认 3（env / meta 可调，0 = 不限）。
+"""账号并发限制集成测试：单账号上限默认 1（env / meta 可调，0 = 不限）。
 
 依赖 mock 上游 slow 场景（0.3s 延迟）制造重叠；用 conc_max 仪表（按凭证）
 断言单账号同时刻在飞请求数不超过限制。fork 保留 v2.9.32 的限界排队语义：
@@ -114,8 +114,8 @@ class TestAccountConcurrency:
         assert statuses == [200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
 
-    def test_env_default_is_three(self):
-        assert settings.ACCOUNT_CONCURRENCY == 3
+    def test_env_default_is_one(self):
+        assert settings.ACCOUNT_CONCURRENCY == 1
 
     async def test_429_wait_does_not_hold_concurrency_slot(
         self, gateway_client, fresh_app, monkeypatch

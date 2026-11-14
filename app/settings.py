@@ -343,9 +343,9 @@ MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
 # MAX_ACTIVE_ACCOUNTS 同模式）。2026-11-04 曾按线上实测写死 2；2026-11-08
 # 恢复可改 —— v2.9.32 的 startGate 排队闸已把「并发满 → 敲上游 → 503」
 # 的放大链吃掉，上调并发不再有 3008 风暴放大风险，交还运营调节。
-# 2.9.48 采纳上游 2.7.31 口径：上游 ZCode 单账号并发写死 3，默认值随之上调；
-# fork 仍保留 env / meta 覆盖（运营可调，见 store.account_concurrency）。
-ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 3)
+# 默认 1：2026-11-14 主人要求「默认 2 个账号各 1 并发」——上游按账号限突发，
+# 单账号并发抬高只会放大 3008/WAF；env / meta 仍可覆盖（见 store.account_concurrency）。
+ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
 # 单账号最小请求间隔（毫秒）：上游按账号限制突发并发，account_concurrency=1
 # 时两个请求只要同拍到达仍可能撞 3008。给每个账号加 150ms 的最小间隔，
 # 让突发在本地自然排队，而不是同时压上游。0 = 关闭。
@@ -427,7 +427,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.9.53"
+APP_VERSION = "2.9.54"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

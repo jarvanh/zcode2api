@@ -346,22 +346,32 @@ class CaptchaManager:
         return f"proxy:{text}"
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
-    async def fetch_config(self, egress_tag: str | None = None) -> dict:
-        """取 captcha 配置（按出口缓存）。`egress_tag` 决定拉取走哪条出口。"""
+    async def fetch_config(self, egress_tag: str | None = None,
+                           proxy_url: str | None = None) -> dict:
+        """取 captcha 配置（按出口缓存）。
+
+        `proxy_url` 是账号自己的出口代理；传入后配置拉取走同一出口，
+        账号代理不可用时**回退直连**（配置只是元数据，不值得为代理故障
+        把整条 captcha 链路拖死）。
+        """
         tag = egress_tag or self.hot_egress()
+        cache_key = self._egress_key(tag, proxy_url)
         ttl = settings.CAPTCHA_CONFIG_CACHE_TTL
-        if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
-            return self._config_cache[tag]
+        if self._config_cache.get(cache_key) and _now_ms() - self._config_cache_at.get(cache_key, 0) < ttl:
+            return self._config_cache[cache_key]
         async with self._config_lock:
             # 双检：等锁期间可能已被其他请求填充
-            if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
-                return self._config_cache[tag]
+            if self._config_cache.get(cache_key) and _now_ms() - self._config_cache_at.get(cache_key, 0) < ttl:
+                return self._config_cache[cache_key]
             err: Exception | None = None
 
-            async def _try_fetch(use_proxy: bool) -> dict | None:
-                """单次拉取（trust_env 按 use_proxy）；成功返回 captcha 配置。"""
+            async def _try_fetch(use_proxy: bool, proxy: str | None = None) -> dict | None:
+                """单次拉取；proxy 显式给定时优先于 trust_env。"""
                 try:
-                    async with httpx.AsyncClient(timeout=30, trust_env=use_proxy) as client:
+                    kwargs: dict = {"timeout": 30, "trust_env": use_proxy and not proxy}
+                    if proxy:
+                        kwargs["proxy"] = proxy
+                    async with httpx.AsyncClient(**kwargs) as client:
                         res = await client.get(
                             f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
                         )
@@ -372,37 +382,48 @@ class CaptchaManager:
                     err = exc
                     return None
 
+            explicit = (proxy_url or "").strip()
             captcha: dict | None = None
-            for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，同出口重试一次
-                captcha = await _try_fetch(tag == egress.PROXY)
-                if captcha:
-                    break
-            if not captcha:
-                # 主出口两连败 → 另一条出口兜底（2026-11-04 线上实锤：proxy 整晚
-                # 超时而 direct 稳定；配置拿不到会误开「模型请求带码」→ 3012）
-                alt = egress.DIRECT if tag == egress.PROXY else egress.PROXY
-                captcha = await _try_fetch(alt == egress.PROXY)
-                if captcha:
-                    logs.info("captcha", f"出口 {tag} 拉取失败，已用 {alt} 兜底")
+            if explicit:
+                # 账号代理优先；不可用直接回退直连（不碰 env 代理）
+                captcha = await _try_fetch(False, explicit)
+                if not captcha:
+                    logs.warn(
+                        "captcha",
+                        f"账号出口 {cache_key} 拉取配置失败，回退直连",
+                    )
+                    captcha = await _try_fetch(False, None)
+            else:
+                for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，同出口重试一次
+                    captcha = await _try_fetch(tag == egress.PROXY)
+                    if captcha:
+                        break
+                if not captcha:
+                    # 主出口两连败 → 另一条出口兜底（2026-11-04 线上实锤：proxy 整晚
+                    # 超时而 direct 稳定；配置拿不到会误开「模型请求带码」→ 3012）
+                    alt = egress.DIRECT if tag == egress.PROXY else egress.PROXY
+                    captcha = await _try_fetch(alt == egress.PROXY)
+                    if captcha:
+                        logs.info("captcha", f"出口 {tag} 拉取失败，已用 {alt} 兜底")
             if captcha:
-                self._config_cache[tag] = captcha
-                self._config_cache_at[tag] = _now_ms()
+                self._config_cache[cache_key] = captcha
+                self._config_cache_at[cache_key] = _now_ms()
                 return captcha
             # 两条出口都失败：优先沿用该出口上一次成功拉到的配置（stale-while-
             # error）。退回 CAPTCHA_DEFAULTS 会让 model_requests_need_captcha()
             # 认为「该带码」，而实际配置可能是 skip_model_request=true —— 给
             # 官方不会带码的请求带上验证码头 = 3012 的结构性嫌疑（2.7.33）。
-            stale = self._config_cache.get(tag)
+            stale = self._config_cache.get(cache_key)
             if stale:
                 logs.warn(
                     "captcha",
-                    f"获取配置失败（出口={tag}，含兜底），沿用上次缓存配置"
+                    f"获取配置失败（出口={cache_key}，含兜底），沿用上次缓存配置"
                     f"（{type(err).__name__ if err else '无响应'}: {err}）",
                 )
                 return stale
             logs.warn(
                 "captcha",
-                f"获取配置失败（出口={tag}，含兜底），使用默认: "
+                f"获取配置失败（出口={cache_key}，含兜底），使用默认: "
                 f"{type(err).__name__ if err else '无响应'}: {err}",
             )
             return dict(constants.CAPTCHA_DEFAULTS)
@@ -698,7 +719,8 @@ class CaptchaManager:
 
         # 2) 池空/全过期/非热路径出口：竞速现解（对齐 zapi takeToken：
         #    空池到达本身即扩容信号）
-        config = await self.fetch_config(tag)
+        config = (await self.fetch_config(tag, proxy_url=proxy_url)
+                  if proxy_url else await self.fetch_config(tag))
         token = await self._solve_raced(config, key, proxy_url=proxy_url)
         if token is not None:
             self._mark_issued(token)
