@@ -194,13 +194,13 @@ class TestRateLimit429:
 
 @pytest.mark.integration
 class TestEdgeBlockBreaker:
-    """边缘 405 封 IP：全进程暂停 plan 渠道，不惩罚账号。"""
+    """边缘 405 封 IP：只暂停该出口，不惩罚账号。"""
 
     async def test_edge_block_trips_gate_and_blocks_next_request(
         self, gateway_client, fresh_app, monkeypatch, stub_captcha
     ):
         client, mock = gateway_client
-        from app.gate import gate
+        from app import edge
         from tests.conftest import seed_account
 
         monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 5)
@@ -219,7 +219,7 @@ class TestEdgeBlockBreaker:
         assert after.status == Status.ACTIVE
         assert after.cooling_until is None
         assert after.risk_strikes == 0
-        assert gate.edge_remaining() > 0
+        assert edge.held(edge.egress_key(None, "zai"))
 
         # 断路器生效期间第二个请求在本地被拒，不再撞上游、不再吃验证码
         before = len(mock.state.calls)
@@ -234,7 +234,7 @@ class TestEdgeBlockBreaker:
     async def test_edge_block_with_apikey_falls_back(self, gateway_client, fresh_app, monkeypatch):
         """IP 被封时 Key 渠道（api.z.ai）风险面不同，同请求可回退成功。"""
         client, mock = gateway_client
-        from app.gate import gate
+        from app import edge
         from tests.conftest import seed_account
 
         monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 5)
@@ -250,7 +250,8 @@ class TestEdgeBlockBreaker:
         paths = _paths(mock, before)
         assert paths.count(_PLAN_PATH) == 1
         assert paths.count(_KEY_PATH) == 1
-        assert gate.edge_remaining() > 0  # 回退成功不解除断路器
+        # 回退成功不解除该出口的静默
+        assert edge.held(edge.egress_key(None, "zai"))
         after = fresh_app.find("zai", acc.id)
         assert after.status == Status.ACTIVE
 
@@ -647,7 +648,9 @@ class TestGateRefusalFailover:
         seed_account(fresh_app, _JWT_MIX_PLAN, name="a-planonly")
         from app import edge as edge_mod
         gate.trip_edge()
-        edge_mod.arm("zai")  # fork 的本地拦截由 edge.held 驱动（gate 只管计数/拒绝）
+        # fork 的本地拦截由 edge.held 驱动（gate 只管计数/拒绝）；
+        # 出口静默键 = 直连账号的 direct:<provider>
+        edge_mod.arm(edge_mod.egress_key(None, "zai"))
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)

@@ -36,16 +36,34 @@ class TestEdgeHold:
     def teardown_method(self):
         edge.reset()
 
-    def test_arm_holds_provider(self):
+    def test_arm_holds_egress_key(self):
         until = edge.arm("zai", seconds=180)
         assert edge.held("zai")
         assert edge.until("zai") == until
         assert 1 <= edge.remaining("zai") <= 180
 
-    def test_hold_is_per_provider(self):
+    def test_hold_is_per_egress_key(self):
         edge.arm("zai", seconds=60)
         assert edge.held("zai")
         assert not edge.held("bigmodel")
+
+    def test_egress_key_normalization(self):
+        # 代理按 host:port 归一化；同一代理的多个账号共享一个键
+        assert edge.egress_key("http://127.0.0.1:7891", "zai") == "proxy:127.0.0.1:7891"
+        assert (edge.egress_key("http://user:pass@127.0.0.1:7891", "zai")
+                == edge.egress_key("http://127.0.0.1:7891", "zai"))
+        # 直连账号按 provider 归并（同一本机出口）
+        assert edge.egress_key(None, "zai") == "direct:zai"
+        assert edge.egress_key("", "zai") == "direct:zai"
+        assert edge.egress_key(None, "bigmodel") == "direct:bigmodel"
+
+    def test_hold_is_per_egress_not_whole_provider(self):
+        """一个代理出口被封，不得连带静默另一个出口。"""
+        blocked = edge.egress_key("http://127.0.0.1:7891", "zai")
+        healthy = edge.egress_key("http://127.0.0.1:7892", "zai")
+        edge.arm(blocked, seconds=60)
+        assert edge.held(blocked)
+        assert not edge.held(healthy)
 
     def test_arm_extends_but_never_shortens(self):
         first = edge.arm("zai", seconds=60)

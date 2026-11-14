@@ -2049,6 +2049,15 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                 max_inflight=limit if limit > 0 else 10_000,
             )
             if account is None:
+                # 全部出口都在 WAF 静默：直接回 405，让下游切 provider。
+                if provider == "zai":
+                    held_all = _provider_edge_held(provider)
+                    if held_all is not None:
+                        remaining, key = held_all
+                        logs.warn(req_id, f"全部出口处于 WAF 静默（剩 ~{remaining}s），回 405")
+                        reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中",
+                                            status=405, kind="edge")
+                        return _edge_response(key)
                 # 本 provider 池选不到号：限界排队等一等，吃掉「额度分钟级
                 # 滚动恢复」型故障。返回 None 表示不排队（关闭 / 预算耗尽 /
                 # 空池 / 无可恢复账号 / 波次暂停）→ 按上游语义下沉下一 provider。
@@ -2416,7 +2425,12 @@ def _risk_wave_reset_for_tests() -> None:
     edge.reset()
 
 
-def _edge_response(provider: str) -> JSONResponse:
+def _edge_key(account: Account) -> str:
+    """账号的出口身份：代理按 host:port，直连按 provider 归并。"""
+    return edge.egress_key(account.proxy_url, account.provider)
+
+
+def _edge_response(edge_key: str) -> JSONResponse:
     """静默期内/刚命中拦截页时的本地应答。
 
     刻意回 405（而不是 503）：下游 OmniRoute / magpie 把 405 当作
@@ -2424,7 +2438,7 @@ def _edge_response(provider: str) -> JSONResponse:
     回 503 反而会被当成 node 故障计入熔断。文案对齐 magpie 的
     provider.BlockedHint，便于它直接识别。
     """
-    until = edge.until(provider) or (time.time() + settings.EDGE_HOLD_SECONDS)
+    until = edge.until(edge_key) or (time.time() + settings.EDGE_HOLD_SECONDS)
     remaining = max(1, int(until - time.time() + 0.999))
     stamp = time.strftime("%H:%M:%S", time.localtime(until))
     return JSONResponse(
@@ -2443,6 +2457,26 @@ def _edge_response(provider: str) -> JSONResponse:
         status_code=405,
         headers={"Retry-After": str(remaining), "x-zcode-edge": "1"},
     )
+
+
+def _provider_edge_held(provider: str) -> tuple[int, str] | None:
+    """provider 下所有账号的出口都在静默时，返回 (最长剩余秒, 对应 key)。
+
+    只要还有一个健康出口就返回 None，让调度继续用它；全部被封时才回 405
+    让下游切 provider。
+    """
+    accounts = store.list_accounts(provider)
+    if not accounts:
+        return None
+    best: tuple[int, str] | None = None
+    for account in accounts:
+        key = _edge_key(account)
+        remaining = edge.remaining(key)
+        if remaining <= 0:
+            return None
+        if best is None or remaining > best[0]:
+            best = (remaining, key)
+    return best
 
 
 def _reacquire_slot(account: Account, slot_box: list[str | None] | None) -> bool:
@@ -2970,14 +3004,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             reqlog.mark_account(req_id, account.name, account.mode)
             verify_param = verify_region = None
             # 出口 IP 静默期内不要解验证码：直接按 fork 契约回 405（不再花码）
-            if channel == "zai" and edge.held(account.provider):
+            if channel == "zai" and edge.held(_edge_key(account)):
                 if _jump_to_fallback():
-                    logs.warn(req_id, f"出口 IP 封锁静默中（剩 ~{edge.remaining(account.provider)}s），"
+                    logs.warn(req_id, f"出口 IP 封锁静默中（剩 ~{edge.remaining(_edge_key(account))}s），"
                                       f"账号 {account.name} 改走 API Key 回退")
                     needs_captcha = False
                     continue
-                reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中", status=405, kind="edge")
-                return _edge_response(account.provider)
+                logs.warn(req_id, f"账号 {account.name} 出口 {_edge_key(account)} 静默中，切换下一个")
+                return _NEXT_ACCOUNT
 
             # 仅 zcode-plan（`zai`）渠道用验证码；apikey 免码
             if channel == "zai" and needs_captcha:
@@ -3033,19 +3067,17 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 静默期内 zcode-plan 通道一个字节都不发上游（封的是出口 IP → plan 主机）。
             # 有 Key 回退的账号下沉 api.z.ai（另一个 host，不受同一防火墙影响）；
             # 否则本地回同款 405，让下游切 provider。plan_std/apikey 渠道不受影响。
-            if channel == "zai" and edge.held(account.provider):
+            if channel == "zai" and edge.held(_edge_key(account)):
                 if _jump_to_fallback():
                     logs.warn(
                         req_id,
-                        f"出口 IP 封锁静默中（剩 ~{edge.remaining(account.provider)}s），"
+                        f"出口 IP 封锁静默中（剩 ~{edge.remaining(_edge_key(account))}s），"
                         f"账号 {account.name} 改走 API Key 回退",
                     )
                     needs_captcha = False
                     continue
-                reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中",
-                                    status=405, kind="edge")
-                # fork 契约：405 + edge_blocked_ip（OmniRoute/magpie 据此切 provider）
-                return _edge_response(account.provider)
+                logs.warn(req_id, f"账号 {account.name} 出口 {_edge_key(account)} 静默中，切换下一个")
+                return _NEXT_ACCOUNT
 
             # 进程级闸门（上游 2.7.23）：只对 zcode-plan 渠道生效。被拒时优先
             # 下沉 API Key 渠道；无可下沉时换号，交给 dispatch 兜底。
@@ -3172,13 +3204,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
 
                 # 405 + HTML 拦截页 = 本机出口 IP 被阿里云 ESA/WAF 拦（
                 # app/edge.py）。2026-11-05 对齐 magpie 0.1.43（plugins#649）：
-                # 进程级静默、**不给账号记 strike** —— 封的是地址，罚账号只会
+                # 按出口静默、**不给账号记 strike** —— 封的是地址，罚账号只会
                 # 把健康号打进冷却（11-03 那 12 次拦截页就是这么烧掉的）。
                 # 上游宽口径（405 + 边缘页文案/HTML，排除 3012）与 fork edge.py
-                # 载体判定合并；命中即记进程级闸门（gate_edge_hold）。
+                # 载体判定合并；命中只静默该出口，其他出口的账号继续服务。
                 if status_code == 405 and (_is_edge_block(status_code, text) or edge.is_page(text)):
-                    gate.trip_edge()
-                    until = edge.arm(account.provider)
+                    hold_key = _edge_key(account)
+                    until = edge.arm(hold_key)
                     snippet = " ".join(text.split())[:120]
                     reqlog.mark_upstream_meta(req_id, _upstream_trace(resp))
                     reqlog.mark_attempt(
@@ -3192,13 +3224,16 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     logs.warn(
                         req_id,
                         f"账号 {account.name} 命中阿里云 WAF 拦截页（出口 IP 级，非账号风控），"
-                        f"全池静默至 {time.strftime('%H:%M:%S', time.localtime(until))}，不记 strike；"
+                        f"静默出口 {hold_key} 至 "
+                        f"{time.strftime('%H:%M:%S', time.localtime(until))}，不记 strike；"
                         f"上游body={snippet!r}",
                     )
                     if _jump_to_fallback():
                         needs_captcha = False
                         continue
-                    return _edge_response(account.provider)
+                    # 只静默该出口，交给 dispatch 换其他出口的账号；全部出口
+                    # 都被封时由 dispatch 统一回 405。
+                    return _NEXT_ACCOUNT
 
                 # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
                 # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控

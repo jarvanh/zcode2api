@@ -3,7 +3,7 @@
 拦截页 = 本机出口 IP 被阿里云 ESA/WAF 拦：
   - 回客户端 405（不是 503），带 permission_error / edge_blocked_ip
   - **不记 strike、不改账号状态**（封的是地址，罚账号只会把好号打死）
-  - 进程级静默：静默期内下一个请求不再打上游
+  - 出口级静默：同一出口的后续请求不再打上游，其他出口不受影响
 
 3012 = 账号风控：行为不变（记 strike、冷却、换号）。
 """
@@ -49,8 +49,8 @@ class TestEdgeBlockPage:
         acc = fresh_app.list_accounts("zai")[0]
         assert acc.risk_strikes == 0
         assert acc.status == Status.ACTIVE
-        # 已进入进程级静默
-        assert edge.held("zai")
+        # 已进入出口级静默（直连账号 → direct:<provider>）
+        assert edge.held(edge.egress_key(None, "zai"))
 
     async def test_hold_fast_fails_next_request_without_upstream(self, gateway_client, fresh_app):
         client, mock = gateway_client
@@ -84,4 +84,4 @@ class TestEdgeBlockPage:
         assert res.status_code != 405 or res.json().get("error", {}).get("code") != "edge_blocked_ip"
         acc = fresh_app.list_accounts("zai")[0]
         assert acc.risk_strikes >= 1
-        assert not edge.held("zai")
+        assert not edge.held(edge.egress_key(None, "zai"))

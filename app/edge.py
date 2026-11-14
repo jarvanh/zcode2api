@@ -8,10 +8,11 @@
   （仍走 `_apply_risk_strike`，见 routes/gateway.py）。
 
 为什么 IP 级要单独处理：封锁期内从同一地址继续请求（不管换哪个账号、
-哪个会话）只会让防火墙计数继续涨，封锁被拉长。所以命中拦截页后，
-进程内所有账号对 zcode plan 通道一起静默 `settings.EDGE_HOLD_SECONDS`；
-静默期内本地直接回同款 405，让下游（OmniRoute / magpie）立刻切到别的
-provider，而不是把它当 node 故障去重试。
+哪个会话）只会让防火墙计数继续涨，封锁被拉长。所以命中拦截页后，只静默
+**该出口**（按账号 `proxy_url` 归一化；无代理的账号共享 provider 级
+`direct:<provider>` 键），而不是整个 provider —— 多出口号池里一个 IP 被
+封，不应把其余健康出口一起停掉。全部出口都静默时，网关仍回 405，让下游
+（OmniRoute / magpie）立刻切到别的 provider，而不是把它当 node 故障去重试。
 
 两条不变量：
 1. **不记 strike、不改账号状态** —— 罚账号对地址封锁毫无作用，只会把
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import re
 import time
+from urllib.parse import urlsplit
 
 from . import constants, settings
 
@@ -37,8 +39,28 @@ EDGE_PAGE = re.compile(
     re.IGNORECASE,
 )
 
-# provider -> 静默截止时刻（epoch 秒）。进程级：同进程内所有账号共享。
+# egress_key -> 静默截止时刻（epoch 秒）。进程级：只影响同一出口的账号。
 _until: dict[str, float] = {}
+
+
+def egress_key(proxy_url: str | None, provider: str) -> str:
+    """出口身份：有代理按 host:port 归一化；无代理按 provider 归并为 direct。
+
+    只用于进程内静默键，不落库、不回传客户端。同一代理（同一 host:port）
+    的多个账号共享一个键；直连账号共享 `direct:<provider>`，因为它们从
+    同一个本机出口发出。
+    """
+    text = (proxy_url or "").strip()
+    if text:
+        try:
+            parts = urlsplit(text)
+            host = (parts.hostname or "").lower()
+            if host:
+                return f"proxy:{host}:{parts.port}" if parts.port else f"proxy:{host}"
+        except ValueError:
+            pass
+        return f"proxy:{text}"
+    return f"direct:{provider}"
 
 
 def is_page(text: str | None) -> bool:
