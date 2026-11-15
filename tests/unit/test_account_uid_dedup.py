@@ -10,6 +10,8 @@
 import base64
 import json
 
+import pytest
+
 from app.models import jwt_upstream_uid
 from app.store import Store
 
@@ -91,3 +93,84 @@ class TestStartupMergeDuplicates:
         fresh_app.add_account("zai", "k2", "plain-key2")
         fresh_app._merge_duplicate_identities()
         assert len(fresh_app.list_accounts("zai")) == 2
+
+
+class TestEditPathUidGate:
+    @pytest.mark.asyncio
+    async def test_edit_rejects_foreign_uid_token(self, fresh_app, gateway_client):
+        """编辑路径 uid 闸：把 B 号的重登 token 灌进 A 号 → 409 拒绝
+        （add_account 已收口，admin PUT 是最后一个绕过口，2026-11-15）。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        fresh_app.add_account("zai", "acc-b", _jwt("uid-B"))
+
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}", json={"token": _jwt("uid-B") + "y"},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 409
+        assert "acc-b" in res.json()["detail"]
+        # A 号 token 未被污染
+        assert fresh_app.find_any(a.id).jwt_token == _jwt("uid-A")
+        assert len(fresh_app.list_accounts("zai")) == 2  # 不产生第三行
+
+    @pytest.mark.asyncio
+    async def test_edit_own_uid_token_still_allowed(self, fresh_app, gateway_client):
+        """同号重登 token 原地更新自己的行——正常操作不拦。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        new_token = _jwt("uid-A") + "z"
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}", json={"token": new_token},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        assert fresh_app.find_any(a.id).jwt_token == new_token
+
+
+class TestEditGateAtomicity:
+    @pytest.mark.asyncio
+    async def test_edit_409_does_not_leak_name_change(self, fresh_app, gateway_client):
+        """R5：409 拒绝不得留下半生效的 name 变更（闸在任何写入之前）。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        fresh_app.add_account("zai", "acc-b", _jwt("uid-B"))
+
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}",
+            json={"name": "renamed-a", "token": _jwt("uid-B") + "y"},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 409
+        assert fresh_app.find_any(a.id).name == "acc-a"  # name 未漂移
+
+
+class TestProbeStreakLifecycle:
+    @pytest.mark.asyncio
+    async def test_rebalance_success_clears_streak(self, fresh_app, monkeypatch):
+        """R1：换绑提交即清 streak——旧节点失败账不得背到新节点头上。
+        （否则新节点首轮抖动即够 2/2 误换绑。）"""
+        from app import egress_pool as egress_pool_mod
+
+        pool = egress_pool_mod.egress_pool
+        acc = fresh_app.add_account("zai", "streak-acc", _jwt("uid-STREAK"))
+        acc.enabled = True
+        acc.egress_node = "node-old"
+        pool._probe_fail_streak[acc.id] = 1  # 旧节点失败一轮的残留
+
+        async def fake_tp_ban(*a, **k):
+            return True
+
+        async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+            account.egress_node = "node-new"
+            return {"node_name": "node-new", "exit_ip": "1.2.3.4"}
+
+        async def fake_probe(account, proxy_url, jwt):
+            return 200, '{"data":{"model":"GLM"}}'  # JSON-APP 放行
+
+        monkeypatch.setattr(egress_pool_mod, "tp_ban", fake_tp_ban)
+        monkeypatch.setattr(egress_pool_mod, "tp_acquire", fake_tp_acquire)
+        monkeypatch.setattr(pool, "_probe_via", fake_probe)
+        monkeypatch.setattr(
+            "app.captcha.captcha_manager.invalidate", lambda *a, **k: None)
+
+        ok = await pool.rebalance(acc, reason="health_probe_fail", ban=False)
+        assert ok is True
+        assert acc.id not in pool._probe_fail_streak  # 已清零

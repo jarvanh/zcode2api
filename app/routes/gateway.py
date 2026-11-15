@@ -3722,7 +3722,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             retry_after=resp.headers.get("retry-after"),
                             base=(settings.RETRY_429_CONCURRENCY_WAIT
                                   if concurrency_hit else settings.RETRY_429_WAIT),
-                            cap=settings.RETRY_429_WAIT_MAX,
+                            # 2.7.44：并发族封顶 30s（槽位释放时间不可知，退太久
+                            # 只会吊死客户端）；真限流仍用 120s 上限。
+                            cap=(settings.RETRY_429_CONCURRENCY_WAIT_MAX
+                                 if concurrency_hit else settings.RETRY_429_WAIT_MAX),
                             jitter=0.2,
                         )
                         if concurrency_hit:

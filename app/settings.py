@@ -199,6 +199,11 @@ EARLY_FLUSH_BEAT = _int("ZCODE_EARLY_FLUSH_BEAT", 15)
 # 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
 # Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
 RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
+# 并发族（3008/3009/3010）重试指数退避上限（2.7.44）：第 n 次等待
+# RETRY_429_CONCURRENCY_WAIT * 2^(n-1)，封顶 30s。2026-11-15 生产数据 935 次
+# 重试呈 1/5→5/5 线性分布，恒定 3s 下约半数是白等；30s 覆盖槽位释放即可。
+# 真限流（1302/1303/无码 429）不受影响，仍走 RETRY_429_WAIT_MAX=120s。
+RETRY_429_CONCURRENCY_WAIT_MAX = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT_MAX", 30)
 # 纯无号/排队超时类 503 的 Retry-After（秒）：给客户端一个短退避提示，
 # 避免上游网关把 503 当「节点坏了」立刻重试造成二次风暴。0/负值按 1s 处理。
 RETRY_503_AFTER = _int("ZCODE_RETRY_503_AFTER", 5)
@@ -476,7 +481,7 @@ USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 # 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
 # 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.59"
+APP_VERSION = "2.9.60"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

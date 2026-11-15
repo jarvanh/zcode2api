@@ -68,3 +68,26 @@ class TestEdgeBlock:
 
     def test_unrelated_405_is_not_edge(self):
         assert _is_edge_block(405, '{"msg":"method not allowed"}') is False
+
+
+class TestConcurrencyBackoffSequence:
+    def test_backoff_is_exponential_with_cap(self, monkeypatch):
+        """3008 重试等待指数退避（2026-11-15 生产数据：恒定 3s 下 1/5→5/5
+        线性分布说明约半数白等）。序列 = base*2^(n-1) 封顶 MAX。
+        fork 已统一走 retry_policy.retry_delay，故这里直接验它的骨架
+        （jitter=0），而不是复刻 gateway 里的内联公式。"""
+        from app import retry_policy, settings
+
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 3)
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT_MAX", 30)
+        waits = [
+            retry_policy.retry_delay(
+                n,
+                retry_after=None,
+                base=settings.RETRY_429_CONCURRENCY_WAIT,
+                cap=settings.RETRY_429_CONCURRENCY_WAIT_MAX,
+                jitter=0,
+            )
+            for n in (1, 2, 3, 4, 5)
+        ]
+        assert waits == [3, 6, 12, 24, 30]  # 指数骨架 + 封顶生效
