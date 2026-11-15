@@ -351,7 +351,11 @@ PROXY_ROTATE_NET_STRIKES_MIN = _int("ZCODE_PROXY_ROTATE_NET_STRIKES_MIN", 2)
 # 同时投入的账号数上限（0 = 不限）。magpie 实测：同一出口 3 个号并发会被
 # 405 拒，2 个不会（plugins#649 引用 01huadalang 的 Discord 反馈）。
 # 控制台可改（meta 表即时生效）；超出的号留作备用，在用的号冷却/耗尽时顶上。
-MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 2)
+# 默认 0（不限）：有效上限由 store.max_active_accounts() 动态推导 ——
+#   有代理 → 代理数；无代理 → 2（直连保守值）。meta 仍可显式覆盖。
+MAX_ACTIVE_ACCOUNTS = _int("ZCODE_MAX_ACTIVE_ACCOUNTS", 0)
+# 无任何代理时的直连账号保守上限（2026-11-15 主人确认）
+DIRECT_ACTIVE_ACCOUNTS = _int("ZCODE_DIRECT_ACTIVE_ACCOUNTS", 2)
 # 单账号并发上限（env 默认值）。控制台可改（meta 表即时生效，与
 # MAX_ACTIVE_ACCOUNTS 同模式）。2026-11-04 曾按线上实测写死 2；2026-11-08
 # 恢复可改 —— v2.9.32 的 startGate 排队闸已把「并发满 → 敲上游 → 503」
@@ -481,7 +485,7 @@ USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 # 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
 # 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.61"
+APP_VERSION = "2.9.59"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

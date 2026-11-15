@@ -14,17 +14,47 @@ def _seed(store, secret: str, name: str):
 
 
 class TestMaxActiveAccounts:
-    def test_default_is_two(self, fresh_app):
-        assert fresh_app.max_active_accounts() == 2
-        assert settings.MAX_ACTIVE_ACCOUNTS == 2
+    def test_no_accounts_falls_back_to_direct_cap(self, fresh_app):
+        """空池（无账号 = 无代理）：动态上限回落到直连保守值。"""
+        assert fresh_app.max_active_accounts() == settings.DIRECT_ACTIVE_ACCOUNTS
+        assert settings.MAX_ACTIVE_ACCOUNTS == 0
 
-    def test_console_override(self, fresh_app):
+    def test_proxy_count_caps_when_no_meta(self, fresh_app):
+        """有代理 → 上限 = 代理数；再加一个直连号不影响。"""
+        a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "m-a")
+        a.proxy_url = "http://127.0.0.1:7891"
+        fresh_app.update_account(a)
+        assert fresh_app.max_active_accounts() == 1
+        b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "m-b")
+        b.proxy_url = "http://127.0.0.1:7892"
+        fresh_app.update_account(b)
+        assert fresh_app.max_active_accounts() == 2
+        _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "m-c")  # 直连号不加代理数
+        assert fresh_app.max_active_accounts() == 2
+
+    def test_all_direct_caps_at_two(self, fresh_app):
+        """全部直连：上限 = DIRECT_ACTIVE_ACCOUNTS（默认 2）。"""
+        _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "m-a")
+        _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "m-b")
+        _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "m-c")
+        assert fresh_app.max_active_accounts() == 2
+
+    def test_console_override_wins(self, fresh_app):
+        """meta 显式设置优先于动态推导（含 0 = 不限）。"""
         fresh_app.set_setting("max_active_accounts", "1")
         assert fresh_app.max_active_accounts() == 1
         fresh_app.set_setting("max_active_accounts", "0")
         assert fresh_app.max_active_accounts() == 0
         fresh_app.set_setting("max_active_accounts", "abc")
-        assert fresh_app.max_active_accounts() == settings.MAX_ACTIVE_ACCOUNTS
+        # 脏值 → 走动态推导（空池 = 直连上限）
+        assert fresh_app.max_active_accounts() == settings.DIRECT_ACTIVE_ACCOUNTS
+
+    def test_console_override_beats_proxy_count(self, fresh_app):
+        a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "m-a")
+        a.proxy_url = "http://127.0.0.1:7891"
+        fresh_app.update_account(a)
+        fresh_app.set_setting("max_active_accounts", "3")
+        assert fresh_app.max_active_accounts() == 3
 
     def test_cap_limits_distinct_accounts(self, fresh_app):
         a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "m-a")

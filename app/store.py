@@ -353,17 +353,30 @@ class Store:
             return settings.ACCOUNT_CONCURRENCY
 
     def max_active_accounts(self) -> int:
-        """同时投入的账号数上限（0 = 不限），后台可改、即时生效。
+        """同时投入的账号数上限，后台可改、即时生效。
 
-        对齐 magpie 的 maxAccounts（plugins#649）：同一出口同时用 3 个号会被
-        405 拒，2 个不会。超出的号不删不换，只是留作备用——在用的号冷却、
-        额度用完或停用时，空出的名额由下一个顶上。
+        解析顺序（2026-11-15 主人确认的规则）：
+        1. meta 显式设置 > 0：用 meta 值（含 0 = 不限，返回 0）；
+        2. 否则动态推导：
+           - 池内有绑定代理的账号 → 上限 = 代理数（1 代理 1 账号，与出口
+             隔离/轮换机制一一对应）；
+           - 全部直连 → 上限 = settings.DIRECT_ACTIVE_ACCOUNTS（默认 2，
+             无代理时只保守使用 2 个直连账号）。
+
+        超出的号不删不换，只是留作备用——在用的号冷却、额度用完或停用时，
+        空出的名额由下一个顶上。
         """
-        try:
-            return max(0, int(self.get_setting(
-                "max_active_accounts", settings.MAX_ACTIVE_ACCOUNTS)))
-        except (TypeError, ValueError):
-            return settings.MAX_ACTIVE_ACCOUNTS
+        raw = self.get_setting("max_active_accounts", None)
+        if raw is not None and str(raw).strip() != "":
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                pass  # 脏 meta 值走动态推导
+        proxy_count = sum(
+            1 for accounts in self._accounts.values()
+            for a in accounts if (a.proxy_url or "").strip()
+        )
+        return proxy_count if proxy_count > 0 else settings.DIRECT_ACTIVE_ACCOUNTS
 
     def claim_round_interval(self) -> int:
         """套餐自动领取轮间隔（0 = 关闭）。运行时可改（meta 表），改后即生效。"""
