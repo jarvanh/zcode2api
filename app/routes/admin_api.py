@@ -93,11 +93,16 @@ async def query_diaglog(days: int = 3, limit: int = 200, status: int | None = No
 
 @router.get("/accounts")
 async def list_accounts():
+    from .gateway import key_no_balance_remaining
+
     now = time.time()
     accounts = []
     for a in store.list_accounts():
         view = a.public_view()
         view["username"] = _username_for(a)
+        # Key 通道 1113 无余额冷却剩余秒数（>0 = 回退渠道对该号不可用；永久态按
+        # KEY_NO_BALANCE_COOLDOWN 有界重探）。全池都在冷却时 Plan 硬故障即无兜底。
+        view["key_no_balance_remaining_s"] = key_no_balance_remaining(a.id, now)
         accounts.append(view)
     stats = {"total": len(accounts), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
