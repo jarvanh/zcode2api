@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -370,6 +371,30 @@ PER_ACCOUNT_EGRESS = _bool("ZCODE_PER_ACCOUNT_EGRESS", False)
 # 上游 EGRESS_LISTENERS 池（逗号分隔 URL）：开启 per-account 且用 store 自动
 # 分配时才需要；fork 部署用 scripts/assign_egress.py 手工绑定，默认留空。
 EGRESS_LISTENERS = [u.strip() for u in os.getenv("ZCODE_EGRESS_LISTENERS", "").split(",") if u.strip()]
+# 出口供给源（2.7.39 Mode B 灰度）：listeners = 本地 mihomo listener 池（现状）；
+# tetherpool = 账号绑定 TetherPool 分配（每账号独立 IP，数据面走 :9101 网关，
+# 云端池 1553 us-west 节点）。灰度名单 = 账号名逗号分隔，空 = 全量。
+EGRESS_SUPPLY = (os.getenv("ZCODE_EGRESS_SUPPLY", "listeners").strip() or "listeners").lower()
+if EGRESS_SUPPLY not in ("listeners", "tetherpool"):
+    # 拼错静默回落 listeners = 灰度开关形同虚设（review 2026-11-15）——显式
+    # 纠偏 + 告警留痕
+    print(f"[settings] 警告: ZCODE_EGRESS_SUPPLY={EGRESS_SUPPLY!r} 非法，回落 listeners",
+          file=sys.stderr)
+    EGRESS_SUPPLY = "listeners"
+TP_API = os.getenv("ZCODE_TP_API", "http://127.0.0.1:9100").strip()
+TP_GATEWAY = os.getenv("ZCODE_TP_GATEWAY", "127.0.0.1:9101").strip()
+TP_TOKEN_FILE = os.getenv("ZCODE_TP_TOKEN_FILE", "/personal/tebi-zcode-hub/tetherpool_token")
+TP_SERVICE = os.getenv("ZCODE_TP_SERVICE", "zcode-hub").strip()
+TP_REGION = os.getenv("ZCODE_TP_REGION", "us-west").strip()
+TP_TYPE = os.getenv("ZCODE_TP_TYPE", "clash_proxy").strip()
+TP_TIER = os.getenv("ZCODE_TP_TIER", "standard").strip()
+TP_GRAY_ACCOUNTS = [g.strip() for g in os.getenv("ZCODE_TP_GRAY_ACCOUNTS", "").split(",") if g.strip()]
+TP_REBALANCE_DEBOUNCE = _int("ZCODE_TP_REBALANCE_DEBOUNCE", 120)
+TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防 0 自旋
+# 健康探针连续失败多少轮才 rebalance（2026-11-15 生产数据：03:48/04:13 探针
+# 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
+# 留痕，连续 N 轮（跨 ≥N 个间隔）仍失败才判定节点真死。
+TP_HEALTH_FAIL_THRESHOLD = max(_int("ZCODE_TP_HEALTH_FAIL_THRESHOLD", 2), 1)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -451,7 +476,7 @@ USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 # 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
 # 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.58"
+APP_VERSION = "2.9.59"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

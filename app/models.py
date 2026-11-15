@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
@@ -105,6 +106,28 @@ def _plan_bonus_active(plan: dict, now: float) -> bool:
     return False
 
 
+def jwt_upstream_uid(token: str | None) -> str | None:
+    """从 JWT 解析上游身份（**user_id claim**）——同一上游账号跨次登录签发的
+    token 不同，但 user_id 恒定。账号去重按 uid 而非 token 全文（2026-11-15
+    生产事故：trial/briar 各 2 行同 uid 双节点并行，一号双 IP 风控暴露面）。
+
+    只认 user_id：sub/id 是通用 JWT 语义（任意签发方都可能有），拿它当
+    上游身份会把不同账号的测试桩/同 sub 异源 token 误合并。"""
+    if not token or token.count(".") != 2:
+        return None
+    import base64
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        val = claims.get("user_id")
+        if val:
+            return str(val)
+    except Exception:  # noqa: BLE001 - 非 JWT/畸形载荷 → 无身份，去重退回 token 相等
+        return None
+    return None
+
+
 def _account_id(name: str) -> str:
     safe = "".join(c if c.isalnum() else "-" for c in (name or "account").lower())
     safe = safe.strip("-")[:32] or "account"
@@ -190,6 +213,9 @@ class Account:
     # （上游 2.7.36 的同义字段 egress 不落 dataclass——由下方 egress property
     # 双向别名到 proxy_url，持久化仍走 proxy_url，见 to_dict。）
     proxy_url: str | None = None
+    # TP 分配的节点名（上游 2.7.39 tetherpool 供给）：ban 目标 + 账号间互斥集合
+    # （风控核心：任何时刻不允许两账号共用节点）+ 运维可见性。None = 未引导。
+    egress_node: str | None = None
 
     @staticmethod
     def create(provider: str, name: str, secret: str) -> Account:
@@ -877,6 +903,18 @@ class Account:
             return fp
         return None
 
+    def egress_view(self) -> str | None:
+        """egress 的后台展示形态：剥离 userinfo（网关 URL 形态含固定口令段，
+        后台可见拓扑但不回显凭据——review 2026-11-15）。"""
+        url = self.egress
+        if not url:
+            return url
+        head, sep, tail = str(url).rpartition("@")
+        if sep and "://" in head:
+            scheme, _, _host = head.partition("://")
+            return f"{scheme}://***@{tail}"
+        return url
+
     def public_view(self) -> dict:
         """返回给前端的视图（脱敏 token）。"""
         secret = self.secret or ""
@@ -912,8 +950,10 @@ class Account:
             "selectable": self.is_selectable(),
             # per-account 出口绑定（fork proxy_url / 上游 egress 别名）：
             # None = 共享出口；排障「该账号从哪个 IP 出去」一眼可读
-            "egress": self.egress,
+            # egress 剥离 userinfo（拓扑可见、凭据不回显——review 2026-11-15）
+            "egress": self.egress_view(),
             "proxy_url": self.proxy_url,
+            "egress_node": self.egress_node,
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,

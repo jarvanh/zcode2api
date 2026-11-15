@@ -18,8 +18,8 @@ import time
 import uuid
 from contextlib import closing
 
-from . import logs, settings
-from .models import PROVIDERS, Account, Status
+from . import egress, logs, settings
+from .models import PROVIDERS, Account, Status, jwt_upstream_uid
 
 _TBL = "accounts"
 _META = "meta"
@@ -178,9 +178,15 @@ class Store:
             ).fetchall()
             for row in rows:
                 try:
-                    account = Account.from_dict(json.loads(row["data"]))
-                except (json.JSONDecodeError, TypeError) as exc:
-                    # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）
+                    blob = json.loads(row["data"])
+                    if not isinstance(blob, dict):
+                        raise TypeError(f"账号行非 object: {type(blob).__name__}")
+                    account = Account.from_dict(blob)
+                except (json.JSONDecodeError, TypeError, AttributeError,
+                        ValueError, KeyError) as exc:
+                    # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）；
+                    # 非 objecJSON/缺字段（from_dict 的 .items()/键访问）都不能
+                    # 崩掉整个启动——单行损坏只跳过该行（2026-11-15 review）
                     logs.err("store", f"账号行损坏已跳过: {exc}")
                     continue
                 if account.provider in self._accounts:
@@ -227,8 +233,48 @@ class Store:
                 conn.commit()
                 print(f"[cooling] 已到期的冷却状态洗回 active ×{len(changed)}: "
                       f"{', '.join(a.name for a in changed.values())}")
+        self._merge_duplicate_identities()
         # 启动补分配 per-account 出口（2.7.36；listener 池未配置时为 no-op）
         self.ensure_egress_assignments()
+
+    def _merge_duplicate_identities(self) -> None:
+        """启动合并同 uid 重复行（2026-11-15 生产事故修复）：同一上游账号
+        重登产生新 JWT 时曾各建一行 → 一号绑 2 节点、双 IP 并行（风控暴露面）。
+        合并规则：保留**新签**（created_at 最新且 enabled）那行；旧行删除且
+        其 TP 节点释放（不再占用互斥集合）。uid 取不到（apiKey/畸形 JWT）
+        的行不参与合并。"""
+        from . import logs
+
+        for provider in PROVIDERS:
+            items = self._accounts[provider]
+            by_uid: dict[str, Account] = {}
+            drop: list[Account] = []
+            for a in items:
+                uid = jwt_upstream_uid(a.secret)
+                if not uid:
+                    continue
+                keep = by_uid.get(uid)
+                if keep is None:
+                    by_uid[uid] = a
+                    continue
+                # 新签且 enabled 优先；并列时取 created_at 新者
+                swap = (a.enabled, a.created_at) > (keep.enabled, keep.created_at)
+                victim, winner = (keep, a) if swap else (a, keep)
+                if swap:
+                    by_uid[uid] = a
+                # 历史合并回旧 winner：把计数并集进保留行（轻量保真）
+                winner.use_count += victim.use_count
+                winner.fail_count += victim.fail_count
+                drop.append(victim)
+            if not drop:
+                continue
+            for v in drop:
+                logs.warn("store",
+                          f"合并同上游身份重复账号行：{v.name}（{v.id}，节点"
+                          f" {v.egress_node or '无'}）→ 保留 {by_uid[jwt_upstream_uid(v.secret)].id}")
+            self._accounts[provider] = [a for a in items if a not in drop]
+            for v in drop:
+                self._delete_account(v.id)
 
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:
@@ -399,9 +445,27 @@ class Store:
             for a in self._accounts[provider]:
                 if a.secret and a.secret == account.secret:
                     return a  # 跳过重复 token
+            # uid 级去重（2026-11-15 生产教训：同号重登 JWT 变化绕过 token 相等
+            # 去重 → 同一上游身份 2 行双节点并行，一号双 IP 风控暴露面）：
+            # 同 uid 已存在 → 视为换签回写该行（保 id/绑定/指纹/计数），不建新行
+            uid = jwt_upstream_uid(account.secret)
+            for a in self._accounts[provider]:
+                if a.mode == "jwt" and jwt_upstream_uid(a.secret) == uid and uid:
+                    a.jwt_token = account.jwt_token
+                    a.mode = "jwt"
+                    a.api_key = None if not a.has_apikey_fallback() else a.api_key
+                    a.status = Status.ACTIVE
+                    a.last_error = None
+                    self._persist_account(a)
+                    return a
             self._assign_fingerprint(account)  # 入池即分配独立设备指纹
             account.install_id = str(uuid.uuid4())  # 安装身份：稳定安装令牌
-            self._assign_egress(account)  # 入池即分配专属出口（每账号一个 IP）
+            if egress.tetherpool_enabled_for(account):
+                # TP 供给：网关 URL 确定性构造（同步、无 HTTP；TP 绑定由
+                # egress_pool 后台引导/网关首请求粘性建立）
+                account.egress = egress.tetherpool_gateway_url(account)
+            else:
+                self._assign_egress(account)  # 入池即分配专属出口（每账号一个 IP）
             self._accounts[provider].append(account)
             self._persist_account(account)
         return account
@@ -421,22 +485,50 @@ class Store:
         account.egress = free
 
     def ensure_egress_assignments(self) -> None:
-        """启动补分配：无 egress 绑定的账号按 created_at 序领取空闲 listener。"""
-        if not settings.EGRESS_LISTENERS:
+        """启动/供给切换补分配（2.7.39 supply 感知）：
+
+        - tetherpool：灰度命中账号 → 网关 URL（确定性构造）；非灰度账号若持
+          网关 URL（模式回退残留）→ 清空回落 listener/共享。
+        - listeners：网关 URL 形态的 egress 清空重领 listener（回滚通道）。
+        """
+        if settings.EGRESS_SUPPLY == "tetherpool":
+            with self._lock:
+                changed: list[Account] = []
+                for items in self._accounts.values():
+                    for account in sorted(items, key=lambda x: x.created_at):
+                        old = account.egress
+                        if egress.tetherpool_enabled_for(account):
+                            want = egress.tetherpool_gateway_url(account)
+                            if account.egress != want:
+                                account.egress = want
+                                changed.append(account)
+                        elif old and ":9101@" in old:
+                            account.egress = None  # 模式回退残留清理
+                            account.egress_node = None  # 语义对齐：无 TP 出口即无 TP 节点
+                            changed.append(account)
+                for account in changed:
+                    self._persist_account(account)
+            if changed:
+                logs.ok("store", f"per-account 出口补分配（tetherpool 供给）{len(changed)} 个账号")
             return
+        # listeners 供给：网关 URL 残留清空 + listener 池分配（2.7.36 行为）
         with self._lock:
             changed: list[Account] = []
             for items in self._accounts.values():
                 for account in sorted(items, key=lambda x: x.created_at):
-                    if account.egress:
-                        continue
-                    self._assign_egress(account)
-                    if account.egress:
+                    old = account.egress
+                    if old and ":9101@" in old:
+                        account.egress = None
+                        account.egress_node = None  # 语义对齐（回滚不留 TP 节点）
                         changed.append(account)
+                    elif not account.egress:
+                        self._assign_egress(account)
+                        if account.egress:
+                            changed.append(account)
             for account in changed:
                 self._persist_account(account)
         if changed:
-            logs.ok("store", f"per-account 出口补分配 {len(changed)} 个账号")
+            logs.ok("store", f"per-account 出口补分配（listeners 供给）{len(changed)} 个账号")
 
     @staticmethod
     def _assign_fingerprint(account: Account) -> None:

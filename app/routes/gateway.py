@@ -29,6 +29,7 @@ from .. import (
     diaglog,
     edge,
     egress,
+    egress_pool,
     freshness,
     logs,
     plan_guard,
@@ -3240,14 +3241,37 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             cm = client.stream("POST", url, headers=headers, content=payload)
             try:
                 resp = await cm.__aenter__()
+            except asyncio.CancelledError:
+                # 客户端断开（取消是常态）也要释放连接池——GC 回收延迟会积 fd
+                await client.aclose()
+                _drop_gate()
+                raise
             except httpx.HTTPError as err:
                 reqlog.mark_attempt(req_id, account.name, account.mode,
                                     channel=_lane_for(force_fallback, plan_channel, url, channel=channel),
                                     error=f"连接失败: {err}")
                 await client.aclose()
                 _drop_gate()
-                account.record_result(False, f"连接失败: {err}")
+                # 异常链展开（httpx ConnectError str 不含 cause，仅记顶层 =
+                # 「All connection attempts failed」无从归因）
+                _cause = err.__cause__ or err.__context__
+                _detail = f"连接失败: {err}" + (f" ({type(_cause).__name__}: {_cause})" if _cause else "")
+                account.record_result(False, _detail)
                 riskmetrics.record("net", account.name, err=str(err))
+                # per-account 出口隔离（2.7.39+）：TP 供给下连接失败先探针验证
+                # 绑定节点——住宅链路瞬态抖动是常态，直接 force_rebalance 会
+                # 无意义漂移；探针通 = 瞬态（只冷却），探针不通 = 节点死 →
+                # rebalance（自带换节点验证）。聚类触发器在低流量时段永不达
+                # （60s 冷却稀释采样），已证失效，退役。
+                if settings.EGRESS_SUPPLY == "tetherpool" and \
+                        settings.PER_ACCOUNT_EGRESS:
+                    _spawn_bg(egress_pool.verify_then_rebalance(
+                        account, reason="node_unreachable"))
+                else:
+                    egress.note_conn_fail(_messages_egress(account))
+                    if egress.conn_fail_clustered(_messages_egress(account)):
+                        logs.warn(req_id, f"账号 {account.name} 出口连接失败聚类，人工复核")
+                        egress.clear_conn_fails(_messages_egress(account))
                 # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan；
                 # 通道级风控退避在场时同理（连接失败不得覆盖风控退避文案与计数）
                 if (account.status in (Status.INVALID, Status.DISABLED)
@@ -3274,7 +3298,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             f"连接失败（第 {account.net_strikes:.0f} 次，冷却至 "
                             f"{time.strftime('%H:%M', time.localtime(until))}）: {err}")
                     store.update_account(account)
-                logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
+                logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个({_detail[:160]})")
                 return _NEXT_ACCOUNT
 
             status_code = resp.status_code
@@ -3287,9 +3311,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 透传，客户端拿到「200 但没有 message」。JSON 正文一次读净：合法响应改走内存
             # 流（下游消费逻辑不变），业务错误码映射成等价 HTTP 状态走下面统一分支。
             if status_code < 400 and resp.headers.get("content-type", "").startswith("application/json"):
-                raw = await resp.aread()
-                await cm.__aexit__(None, None, None)
-                await client.aclose()
+                try:
+                    raw = await resp.aread()
+                finally:
+                    # aread 异常（ReadTimeout/协议错）也不能漏 cm/client 关闭
+                    await cm.__aexit__(None, None, None)
+                    await client.aclose()
                 cm = client = None  # 已关闭，_Upstream.close 容忍 None
                 decoded = raw.decode("utf-8", "ignore")
                 data = _safe_json(decoded)
@@ -3312,9 +3339,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             if status_code >= 400:
                 _drop_gate()  # 本趟上游尝试已结束；continue 的下一趟会重新申请
                 if text is None:
-                    text = (await resp.aread()).decode("utf-8", "ignore")
-                    await cm.__aexit__(None, None, None)
-                    await client.aclose()
+                    try:
+                        text = (await resp.aread()).decode("utf-8", "ignore")
+                    finally:
+                        # 同上：aread 异常时也要保证响应体/客户端释放
+                        await cm.__aexit__(None, None, None)
+                        await client.aclose()
 
                 # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。zcode-plan
                 # 渠道上即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
@@ -3365,6 +3395,11 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         f"{time.strftime('%H:%M:%S', time.localtime(until))}，不记 strike；"
                         f"上游body={snippet!r}",
                     )
+                    # per-account 出口隔离（2.7.39）：TP 供给下自动 rebalance 换绑定
+                    if settings.EGRESS_SUPPLY == "tetherpool" and \
+                            settings.PER_ACCOUNT_EGRESS:
+                        _spawn_bg(egress_pool.rebalance(
+                            account, reason="edge_405_html", ban=True))
                     if _jump_to_fallback():
                         needs_captcha = False
                         continue

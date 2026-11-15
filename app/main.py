@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from . import constants, endpoint_routing, freshness, hostinfo, logs, reqlog, settings, vitals
 from .captcha import captcha_manager
 from .claim import claim_round
+from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
 from .quota import model_probe, monitor, risk_lane_probe
 from .routes import admin_api, gateway, pages
 from .version_tracker import version_tracker
@@ -166,7 +167,8 @@ async def lifespan(app: FastAPI):
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
     endpoint_routing.start()  # 端点映射跟随轮（agent/configs mapping，fail-open；fork 增强）
     version_tracker.init_from_store()
-    version_tracker.start()   # 官方版本自动探测与同步（上游 2.7.16）
+    version_tracker.start()   # 官方版本自动探测与同步
+    egress_pool.start()       # TetherPool 出口健康循环（supply=tetherpool 时生效）
     restored = reqlog.restore_recent_from_disk()  # 实时层回放：重启后仍可见重启前请求
     conc_task = reqlog.start_sampler()   # 并发仪表心跳（1s：槽位快照 + 分钟曲线）
     vitals.start()                       # 进程体征心跳（RSS/solver/池/loop 延迟）
@@ -196,6 +198,7 @@ async def lifespan(app: FastAPI):
         await claim_round.stop()
         await endpoint_routing.stop()
         await version_tracker.stop()
+        await egress_pool.stop()
         await captcha_manager.close()
 
 
