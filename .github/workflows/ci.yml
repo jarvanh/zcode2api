@@ -1,13 +1,26 @@
 name: ci
 
+# 本 fork 的 CI：push main / PR / tag 时触发。2026-11-15 排查发现该 fork 自
+# 2026-09 建仓起 workflow 虽注册 active 但从未产生过任何 run（total=0），
+# 疑似 fork 复制时触发器未随源生效；显式加 workflow_dispatch + workflow_call
+# 兜底手动/复用触发，push 触发保持不变。
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+# 并发去重：同一分支新推送取消旧 run，省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
