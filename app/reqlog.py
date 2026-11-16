@@ -56,7 +56,7 @@ def _clip(value, limit: int) -> str:
     return str(value or "")[:limit]
 
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # 可重入：finish_* 持锁调用 _persist，其日切分支内再加锁
 _entries: deque = deque(maxlen=KEEP)
 _inflight: dict[str, dict] = {}
 # 终态事件轻量副本（账号健康窗口与阈值值守的共用源）：只留排障要的 6 个字段，
@@ -67,6 +67,7 @@ _recent: deque = deque(maxlen=HEALTH_KEEP)
 
 _hist_lock = threading.Lock()
 _last_prune_day = ""
+_restored = 0  # 本次进程启动时从磁盘回放的条数（stats 观测用）
 
 # ── 并发仪表（实时四口径 + 分钟峰值曲线）───────────────────────────────
 # 口径为什么要四个（互不相等且必须同时看）：
@@ -328,6 +329,8 @@ def restore_recent_from_disk(limit: int = KEEP) -> int:
                 entry = _row_to_entry(row)
                 _entries.append(entry)
                 restored += 1
+        global _restored
+        _restored = restored
         if restored:
             logs.ok("reqlog", f"实时层已从磁盘回放 {restored} 条终态（重启前请求可见）")
         return restored
@@ -824,6 +827,40 @@ def snapshot() -> list[dict]:
     """全部条目，最新在前（含在途）。"""
     with _lock:
         return [dict(e) for e in reversed(_entries)]
+
+
+def shutdown_flush() -> int:
+    """优雅停机收口：把仍在途的请求落盘为「中断」终态（fork 每日 JSONL 持久化）。
+
+    在途请求 begin 时不落盘，若不收口，这部分流量在重启后消失。
+    收口条目按请求开始日期归属文件（跨日停机时落入前一日文件，语义合理）。
+    返回收口条数；由 lifespan finally 调用。
+    """
+    with _lock:
+        n = 0
+        for entry in _inflight.values():
+            entry["ok"] = False
+            entry["status"] = 499
+            entry["error"] = "网关重启，请求中断"
+            entry["t_total"] = time.time() - entry["ts"]
+            _persist(entry)
+            n += 1
+        _inflight.clear()
+        _entries.clear()
+        return n
+
+
+def stats() -> dict:
+    """持久化观测状态（管理端监控页展示用；fork 恒开每日 JSONL）。"""
+    with _lock:
+        return {
+            "persist": True,
+            "mode": "daily-jsonl",
+            "dir": str(_hist_dir()),
+            "inflight": len(_inflight),
+            "entries": len(_entries),
+            "restored": _restored,
+        }
 
 
 def clear() -> None:

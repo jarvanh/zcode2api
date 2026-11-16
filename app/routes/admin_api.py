@@ -1059,7 +1059,7 @@ async def monitoring():
     health 放在这里而非单独轮：它与 entries 同属「实时层」，5s 一跳的新鲜度
     已够（P95 要的是分钟级，不是秒级），省前端一个定时器与一次往返。
     """
-    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP,
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP, "stats": reqlog.stats(),
             "conc": reqlog.conc_snapshot(), "health": reqlog.health(1.0)}
 
 

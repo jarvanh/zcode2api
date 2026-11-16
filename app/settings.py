@@ -48,6 +48,10 @@ def _bool(env_name: str, default: bool) -> bool:
 DATA_DIR = _resolve_path("ZCODE_DATA_DIR", "data")
 # 账号与设置持久化到本地 SQLite（与 grok2api 的 local 后端一致）
 DB_PATH = DATA_DIR / "accounts.db"
+# 请求监控环形日志持久化（默认关 = 仅内存，行为同 2.7.x 及以前）：
+# 开启后追加写 DATA_DIR/reqlog.jsonl，启动时回读尾部 ≤KEEP 条，重启不清零。
+REQLOG_PERSIST = _bool("ZCODE_REQLOG_PERSIST", False)
+REQLOG_PATH = DATA_DIR / "reqlog.jsonl"
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
@@ -487,7 +491,7 @@ USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 # 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
 # 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.63"
+APP_VERSION = "2.9.64"
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

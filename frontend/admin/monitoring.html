@@ -228,7 +228,9 @@ function renderStats(list){
   const topErr=Object.entries(errCounts).sort((a,b)=>b[1]-a[1])[0];
 
   $('s-calls').textContent=total;
-  $('s-calls-sub').textContent=`进行中 ${inflight} · 探测 ${probes} · 内存保留 ${state.keep} 条`;
+  const st=state.stats;
+  const persistTag=st&&st.persist?` · <span title="持久化 ${esc(st.dir||st.file||'')} · 启动恢复 ${st.restored||0} 条">💾 已持久化${st.restored?`（恢复 ${st.restored}）`:''}</span>`:'';
+  $('s-calls-sub').textContent=`进行中 ${inflight} · 探测 ${probes} · 内存保留 ${state.keep} 条${persistTag}`;
   $('s-rate').textContent=total?(ok/(ok+fail||1)*100).toFixed(1)+'%':'—';
   $('s-rate-sub').textContent=`成功 ${ok} · 失败 ${fail}`;
   $('s-fail').textContent=fail;
@@ -374,6 +376,8 @@ function renderAgg(key){
 }
 
 function renderLive(){
+  const list=filtered();
+  if(!list.length){$('list').innerHTML='<div class="empty-state">所选时间范围内没有请求</div>';return;}
   const head=`<div class="mon-head mon-grid-live"><span>时间</span><span>账号</span><span>模型</span><span>状态</span><span>首字</span><span>总耗时</span><span>输入</span><span>输出</span><span>内容 / 错误</span></div>`;
   const list=filtered();
   const body=list.slice(0,200).map(e=>{
@@ -586,6 +590,7 @@ async function load(){
     const res=await api('GET','/monitoring');
     entries=res.entries||[];
     state.keep=res.keep||500;
+    if(res.stats)state.stats=res.stats;
     health=res.health||null;
     // 额度节奏与告警历史按天聚合，5s 刷新足够；与 entries 同拍取，不另开定时器
     const w=await api('GET','/monitoring/watch').catch(()=>({}));

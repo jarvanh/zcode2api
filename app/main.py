@@ -151,6 +151,10 @@ def _run_install_sequence_on_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.REQLOG_PERSIST:
+        restored = reqlog.restore()
+        if restored:
+            logs.ok("reqlog", f"请求监控日志恢复 ×{restored}（持久化开启）")
     replaced = _backfill_fingerprints()
     if replaced:
         logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{len(replaced)}")
@@ -191,6 +195,9 @@ async def lifespan(app: FastAPI):
             conc_task.cancel()
         await vitals.stop()
         reqlog.flush_conc()   # 关机前把当日未满分钟落盘，曲线不断尾
+        flushed = reqlog.shutdown_flush()
+        if flushed:
+            logs.info("reqlog", f"停机收口在途请求 ×{flushed}")
         await monitor.stop()
         await freshness.stop()
         await model_probe.stop()
