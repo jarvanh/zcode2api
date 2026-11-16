@@ -444,8 +444,9 @@ ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST
 # 取各通道最高版本；能否顶版仍由 PROMPT_ALIGNED_VERSION 正文锁决定
 # （文本未移植的新版只记录不顶版）。
 ZCODE_MANIFEST_CHANNELS = os.getenv("ZCODE_MANIFEST_CHANNELS", "1,3")
-# 官方版本自动探测间隔（秒，默认 12 小时）
-VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)
+# 官方版本自动探测间隔（秒，默认 6 小时；2026-11-16 从 12h 收紧，官方发版
+# 到看板/告警的盲窗减半，manifest 请求量仍可忽略）
+VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 21600)
 # 是否自动将客户端伪装对齐至官方最新版本
 AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
 # messages 通道强制直连（2026-11-04 线上实证：env 代理出口 GCP IP 被上游持续
