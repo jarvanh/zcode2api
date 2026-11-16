@@ -46,6 +46,12 @@ from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
+
+# ⚠️ 单例实例 import（2026-11-16 根因修复）：`from .. import egress_pool` 拿到的是
+# 模块，模块上没有 verify_then_rebalance/rebalance——连接失败触发器自 aa960eb
+# (2.7.39) 起每执行必 AttributeError（_spawn_bg 后台吞掉无日志），换绑从未生效，
+# 坏节点（trial-mvxmwyrg 070）因此一直换不掉。main.py:15 同款注释教训。
+from ..egress_pool import egress_pool as _egress_pool_singleton
 from ..gate import gate
 from ..models import Account, Status
 from ..openai_compat import (
@@ -1656,6 +1662,7 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
     except Exception as err:  # noqa: BLE001
         logs.req_err(req_id, f"读取上游响应失败: {err}")
         reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
+        _note_stream_abort(result, err, req_id)
         return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
     finally:
         await result.close()
@@ -1743,6 +1750,25 @@ async def count_tokens(request: Request):
     return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
 
 
+def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
+    """流中途中断的账号级记账与换绑触发（2026-11-16 盲区收口）。
+
+    建连失败（1320 分支）有完整链路：record_result + note_conn_fail +
+    verify_then_rebalance。而「已建连、读到一半断」（RemoteProtocolError /
+    incomplete chunked read）此前只写 reqlog——既不进 recent_results（后台
+    看不到失败），也不触发 egress_pool（坏节点永远换不掉）。此处补齐：
+    与建连失败同语义（出口链路故障），共用同一聚类 key 与换绑触发器。"""
+    account = getattr(up, "account", None)
+    if account is None:
+        return
+    detail = f"流中断: {err}"[:120]
+    account.record_result(False, detail)
+    if settings.EGRESS_SUPPLY == "tetherpool" and settings.PER_ACCOUNT_EGRESS:
+        egress.note_conn_fail(_messages_egress(account))
+        _spawn_bg(_egress_pool_singleton.verify_then_rebalance(
+            account, reason="node_unreachable"))
+
+
 def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
     """SSE 流统一异常契约装饰器（2026-11-14 review：三份消费体各自复制同一段
     499/502/中断记账 + close 兜底，收敛后行为逐字节不变）。
@@ -1771,6 +1797,7 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
                 else:
                     logs.req_err(req_id, f"流传输中断: {err}")
                     reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+                    _note_stream_abort(up, err, req_id)
             finally:
                 await up.close()
         return guarded
@@ -2937,11 +2964,11 @@ class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
     __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode",
-                 "model", "on_close", "gate_release", "_closed")
+                 "model", "on_close", "gate_release", "_closed", "account")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient | None,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
-                 model: str = "-", on_close=None, gate_release=None) -> None:
+                 model: str = "-", on_close=None, gate_release=None, account=None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
@@ -2952,6 +2979,12 @@ class _Upstream:
         self.on_close = on_close
         self.gate_release = gate_release
         self._closed = False
+        # 流中途中断（RemoteProtocolError / incomplete chunked read）的归因锚点：
+        # 建连失败有 1320 分支接聚类+换绑，而「已建连、流读到一半断」走
+        # _sse_guard / aread——没有 account 引用就永远够不到 egress_pool
+        # （2026-11-16 trial-mvxmwyrg 事故：15 条 Server disconnected 全是
+        # 此形态，坏节点被「探针通=瞬态」+「流中断不触发」双重盲区保住）
+        self.account = account
 
     async def close(self) -> None:
         """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。
@@ -3274,7 +3307,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if settings.EGRESS_SUPPLY == "tetherpool" and \
                         settings.PER_ACCOUNT_EGRESS:
                     egress.note_conn_fail(_messages_egress(account))
-                    _spawn_bg(egress_pool.verify_then_rebalance(
+                    _spawn_bg(_egress_pool_singleton.verify_then_rebalance(
                         account, reason="node_unreachable"))
                 else:
                     egress.note_conn_fail(_messages_egress(account))
@@ -3407,7 +3440,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     # per-account 出口隔离（2.7.39）：TP 供给下自动 rebalance 换绑定
                     if settings.EGRESS_SUPPLY == "tetherpool" and \
                             settings.PER_ACCOUNT_EGRESS:
-                        _spawn_bg(egress_pool.rebalance(
+                        _spawn_bg(_egress_pool_singleton.rebalance(
                             account, reason="edge_405_html", ban=True))
                     if _jump_to_fallback():
                         needs_captcha = False
@@ -4040,7 +4073,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             gate_acquired = False
             return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
                              account_name=account.name, mode=account.mode, model=model_name,
-                             gate_release=gate_release)
+                             gate_release=gate_release, account=account)
     finally:
         _drop_gate()
 
