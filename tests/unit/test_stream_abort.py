@@ -37,9 +37,11 @@ def tp_mode(monkeypatch):
 
 
 def _account(acc_id="acc-stream", name="sa", node="half-dead-node"):
+    # fork 的 Account 无 egress 构造参数（egress 是 proxy_url 的 property 别名，
+    # dataclass 字段只有 proxy_url）——构造时用 proxy_url。
     return Account(id=acc_id, name=name, provider="zai", mode="jwt",
                    jwt_token="h.eyJzdWIiOiJ1In0.sig",
-                   egress_node=node, egress="http://gw:9101")
+                   egress_node=node, proxy_url="http://gw:9101")
 
 
 def test_gateway_uses_singleton_not_module():
