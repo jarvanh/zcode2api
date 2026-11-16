@@ -856,8 +856,9 @@ class CaptchaManager:
 
     async def _run_solver(
         self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
-        proxy_url: str | None = None,
+        proxy: str | None = None,
     ) -> str | None:
+        # 形参统一为 proxy（上游 2.7.49 命名，slidex/pw 两路线同形参）。
         if settings.CAPTCHA_SOLVER_MODE == "slidex":
             return await self._run_solver_slidex(scene, region, prefix, tag, proxy)
         return await self._run_solver_pw(scene, region, prefix, tag, proxy)
@@ -937,7 +938,7 @@ class CaptchaManager:
             solver_env.pop(key, None)
         t0 = time.monotonic()
         # 显式账号代理优先（钉到账号出口）；未给时沿用环境出口语义。
-        explicit = (proxy_url or "").strip()
+        explicit = (proxy or "").strip()
         if explicit:
             proxy = explicit
         elif tag == egress.PROXY:
@@ -968,6 +969,13 @@ class CaptchaManager:
         reaped = False
         try:
             stdout, _ = await self._communicate_solver(proc)
+            # _communicate_solver 只回 stdout（上游共用 helper）；pw 路线的失败
+            # 诊断需要 stderr —— proc 已退出， communicate 已消费管道，改从
+            # proc.stderr 非阻塞读残留（正常退出时缓冲已满载可读）。
+            try:
+                stderr = (await proc.stderr.read()).decode("utf-8", "ignore")
+            except Exception:  # noqa: BLE001 - stderr 读不到不影响主流程
+                stderr = ""
         except TimeoutError:
             _kill_solver_tree(proc)
             reaped = True
