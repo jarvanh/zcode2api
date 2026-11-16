@@ -53,14 +53,15 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源；3.18.1 对齐 ZCode 官方构建当前版）──
+# ── 客户端版本（单一真相源；3.18.2 对齐 ZCode 官方构建当前版）──
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001。
-# 出处：ZCode 3.18.1 官方 AppImage（electron 预览清单 channel=3，2026-11-11 构建）
-# 内 resources/glm/zcode.cjs 与 3.18.0 源码（zai-org/ZCode@b95ebaffea）逐段比对：
-# cliPrefix/身份+Harness/dynamicBehavior/sessionGuidance/contextManagement 全部同文，
-# 仅版本号不同。前值 3.18.0（2026-11-12 跟进）、3.17.2（2026-11-09）、3.17.1（11-03）。
-# 注：桌面端 electron 稳定清单（channel=1）2026-11-11 仍报 3.17.2，3.18.x 先在
-# 预览/server 轨道落地（本机 ~/.zcode/server/current.json appVersion=3.18.0）。
+# 出处：ZCode 3.18.2 官方 Linux server runtime（~/.zcode/server/releases/
+# 3.18.2-linux-x64-c4ea27fffb92/runtime/zcode.cjs，2026-11-13 构建）与官方源码 tag
+# v3.18.2 逐段核对：cliPrefix/身份+Harness/dynamicBehavior/sessionGuidance/
+# contextManagement 全部同文，仅版本号不同。前值 3.18.1（2026-11-11 跟进）、
+# 3.18.0（2026-11-12）、3.17.2（2026-11-09）、3.17.1（11-03）。
+# 注：桌面端 electron 稳定清单曾滞后（2026-11-11 channel=1 仍报 3.17.2），
+# 3.18.x 先在预览/server 轨道落地；2026-11-16 两通道与本机 runtime 均 3.18.2。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
 # billing；hub 跑 Linux 无注册表，静态基线钉此处，运行期由 version_tracker
 # 轮询官方 manifest 接口自动更新活跃版本。
@@ -74,8 +75,9 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # 先移植新版提示词文本进 zcode_system.json，再同步抬高此常量。
 # 3.18.0 变更：Desktop 段（# ZCode Desktop Context）移出 system 块2，改由环境
 # 公告走 meta_user；块2 只剩身份+Harness（identity.ts 文本与 3.17.2 逐行相同）。
-# 3.18.1：文本与 3.18.0 完全一致（官方 AppImage 逐段比对），仅版本号差异。
-PROMPT_ALIGNED_VERSION = "3.18.1"
+# 3.18.2：文本与 3.18.1 完全一致（官方 server runtime + v3.18.2 源码逐段比对），
+# 仅版本号差异。
+PROMPT_ALIGNED_VERSION = "3.18.2"
 DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装

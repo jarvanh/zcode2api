@@ -93,7 +93,7 @@ class TestChannelLadderExhaust1310:
         # 402 + Retry-After（下游 OmniRoute 错误分类器对 429/503 判熔断，
         # 402 才能命中「仅配额耗尽回退」），与上游的 503 断言不同。
         assert acc.status == Status.EXHAUSTED
-        # 重置时间从 1310 msg 解析："将于 2026-11-15 23:59 重置"
+        # 重置时间从 1310 msg 解析："将于 2099-12-31 23:59 重置"
         assert acc.cooling_until is not None
         assert "额度已用完" in (acc.last_error or "")
         assert res.status_code == 402

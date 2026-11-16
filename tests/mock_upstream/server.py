@@ -303,10 +303,12 @@ def build_app() -> FastAPI:
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
         if scenario == "quota_exhausted_1310":
-            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2026-11-15 23:59 重置"}
+            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2099-12-31 23:59 重置"}
+            # 日期必须固定在未来：_parse_exhaust_reset 只接受未来时间，写死过去日期
+            # 会让测试随系统日期推移必然失败（2026-11-16 全量测试踩中）。
             return 200, {
                 "code": 1310,
-                "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",
+                "msg": "您已达到每周使用上限，将于 2099-12-31 23:59 重置",
             }, {}
         # risk_control_3012_200 场景在上方 fork 已定义（200 承载业务码 3012），
         # 上游重复追加的同一场景不再重复。
@@ -528,7 +530,7 @@ def build_app() -> FastAPI:
         scenario = getattr(app.state, "manifest_scenario", None) or headers.get("x-mock-manifest-scenario")
         if scenario == "fail_500":
             return Response("Internal Server Error", status_code=500)
-        ver = getattr(app.state, "mock_manifest_version", "3.18.1")
+        ver = getattr(app.state, "mock_manifest_version", "3.18.2")
         yaml_content = f"""version: {ver}
 releaseDate: "2026-11-02T06:43:49.471Z"
 releaseName: Release v{ver}

@@ -440,8 +440,9 @@ ZCODE_BILLING_BASE = constants.BILLING_BASE
 ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST_URL)
 # 版本探测的发布通道（逗号分隔，默认稳定 1 + 预览 3）：3.18.x 先在预览/server
 # 轨道发，只看 channel=1 会让「官方最新」永远停在旧版（2026-11-11 实证：
-# channel=1 → 3.17.2，channel=3 → 3.18.1）。取各通道最高版本；能否顶版仍由
-# PROMPT_ALIGNED_VERSION 正文锁决定（文本未移植的新版只记录不顶版）。
+# channel=1 → 3.17.2，channel=3 → 3.18.1；2026-11-16 两通道均已 3.18.2）。
+# 取各通道最高版本；能否顶版仍由 PROMPT_ALIGNED_VERSION 正文锁决定
+# （文本未移植的新版只记录不顶版）。
 ZCODE_MANIFEST_CHANNELS = os.getenv("ZCODE_MANIFEST_CHANNELS", "1,3")
 # 官方版本自动探测间隔（秒，默认 12 小时）
 VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)

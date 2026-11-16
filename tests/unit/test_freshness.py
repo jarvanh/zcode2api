@@ -35,7 +35,7 @@ def _isolated_sections(monkeypatch):
     yield holder
 
 
-def _meta(version="3.18.1", captured="2026-11-11"):
+def _meta(version="3.18.2", captured="2026-11-16"):
     return {"client_version": version, "captured_at": captured}
 
 
