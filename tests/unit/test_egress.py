@@ -292,7 +292,7 @@ class TestCaptchaEgressSeparation:
             monkeypatch.setattr(os, "killpg", lambda *_a: None)
 
         acct_proxy = "http://127.0.0.1:11031"
-        await mgr._run_solver("s", "cn", "p", acct_proxy, proxy_url=acct_proxy)
+        await mgr._run_solver("s", "cn", "p", acct_proxy, proxy=acct_proxy)
         assert captured["env"].get("HTTP_PROXY") == acct_proxy
         assert captured["env"].get("HTTPS_PROXY") == acct_proxy
 
