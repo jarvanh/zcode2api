@@ -100,17 +100,20 @@ CAPTCHA_STORM_DEDUPE = _int("CAPTCHA_STORM_DEDUPE", 720)     # 12 分钟去重
 # 任意 get_verify_param 取用（含池空竞速）立即恢复。0 = 不停解。
 CAPTCHA_IDLE_AFTER = _int("CAPTCHA_IDLE_AFTER", 600)
 
-# 验证码求解（真浏览器：puppeteer-core + 系统 Chromium 跑阿里云官方无痕 SDK，
-# 对齐 zcode-switch captcha.js）。happy-dom 路线（solver.js / solver-bun.ts）
-# 2026-09 起曾被风控「unusual activity」全拒，故默认仍走 pw 路线；
-# ZCODE_CAPTCHA_SOLVER=legacy 回退 solver.js。
-#
-# ZCODE_CAPTCHA_SOLVER_JS 可显式指定求解器脚本（相对路径按项目根解析），
-# 优先于 mode 推导的默认值 —— 上游 Bun + happy-dom 架构（solver-bun.ts）
-# 由此接入；留空则回落 mode 默认值。
+# 验证码求解（真浏览器跑阿里云官方无痕 SDK，对齐 zcode-switch captcha.js。
+# happy-dom 路线 2026-09 起被风控「unusual activity」全拒，solver.js 仅留作
+# 回滚：ZCODE_CAPTCHA_SOLVER=legacy）
+# slidex（2026-11-16 起，缺省）：playwright + slidex aliyun-captcha-js provider
+# （z.ai 站点实测内化的求解内核）。根修 Chrome --proxy-server 不支持带凭证代理
+# URL（ERR_NO_SUPPORTED_PROXIES）导致的求解盲区——playwright context 级 proxy
+# 原生支持 user:pass@host:port，token 出口 = 请求出口铁律不变。
+# pw = 旧 puppeteer 路线（ZCODE_CAPTCHA_SOLVER=pw 回滚用）。
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
-CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "pw").strip().lower() or "pw")
+CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "slidex").strip().lower() or "slidex")
+CAPTCHA_SOLVER_PY = CAPTCHA_SOLVER_DIR / "slidex_runner.py"
+# fork 保留：ZCODE_CAPTCHA_SOLVER_JS 可显式指定求解器脚本（相对路径按项目根
+# 解析），优先于 mode 推导的默认值；留空则回落 mode 默认值。
 if (os.getenv("ZCODE_CAPTCHA_SOLVER_JS") or "").strip():
     CAPTCHA_SOLVER_JS = _resolve_path("ZCODE_CAPTCHA_SOLVER_JS", "")
 else:
