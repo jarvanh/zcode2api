@@ -379,7 +379,6 @@ function renderLive(){
   const list=filtered();
   if(!list.length){$('list').innerHTML='<div class="empty-state">所选时间范围内没有请求</div>';return;}
   const head=`<div class="mon-head mon-grid-live"><span>时间</span><span>账号</span><span>模型</span><span>状态</span><span>首字</span><span>总耗时</span><span>输入</span><span>输出</span><span>内容 / 错误</span></div>`;
-  const list=filtered();
   const body=list.slice(0,200).map(e=>{
     const open=openDetails.has(e.req_id);
     return `<div class="mon-item">
