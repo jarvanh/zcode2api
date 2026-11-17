@@ -29,7 +29,6 @@ from .. import (
     diaglog,
     edge,
     egress,
-    egress_pool,
     freshness,
     logs,
     plan_guard,

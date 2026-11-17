@@ -966,7 +966,6 @@ class CaptchaManager:
         # 孤儿浏览器吃 27.6GB RSS）由 app/vitals 每秒观测；只登记不收割——
         # 回收权属于 asyncio 子进程 watcher，抢 wait 会让停机挂死。
         vitals.register_child(proc.pid)
-        reaped = False
         try:
             stdout, _ = await self._communicate_solver(proc)
             # _communicate_solver 只回 stdout（上游共用 helper）；pw 路线的失败
@@ -978,7 +977,6 @@ class CaptchaManager:
                 stderr = ""
         except TimeoutError:
             _kill_solver_tree(proc)
-            reaped = True
             self._last_solver_stderr = None  # 强杀拿不到 stderr
             captcha_ledger.record(route=solver.name, runtime=runtime, ok=False,
                                   dur_ms=int((time.monotonic() - t0) * 1000), region=region,
