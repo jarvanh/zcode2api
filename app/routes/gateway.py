@@ -1008,6 +1008,10 @@ async def list_models():
                 "created_at": "2025-01-01T00:00:00Z",
                 **({"context_window": spec["context_window"],
                     "max_output_tokens": spec["max_output_tokens"]} if spec else {}),
+                # 视觉声明：OmniRoute 只认严格的 true，缺字段等于不支持
+                **({"input_modalities": ["text", "image"],
+                    "capabilities": {"vision": True}}
+                   if constants.is_vision_model(m.split("/", 1)[1]) else {}),
             })
         return {"object": "list", "data": data}
     data = []
@@ -1025,6 +1029,10 @@ async def list_models():
                 "created_at": "2025-01-01T00:00:00Z",
                 **({"context_window": spec["context_window"],
                     "max_output_tokens": spec["max_output_tokens"]} if spec else {}),
+                # 视觉声明：同上，只对实测/公开确认的族输出
+                **({"input_modalities": ["text", "image"],
+                    "capabilities": {"vision": True}}
+                   if constants.is_vision_model(i) else {}),
             })
     return {"object": "list", "data": data}
 

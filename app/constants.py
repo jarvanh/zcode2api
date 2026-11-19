@@ -178,6 +178,26 @@ MODEL_CATALOG_NAMESPACED = [
 # 展示规格目录（context/max_output 同步自 zcode-api src/provider/models.ts，
 # 规格源自 ZCode 3.11.2 桌面端目录）。仅作 /v1/models 展示补充；实际允许
 # 的模型由账号 entitlements 的 capabilities 动态判定（套餐外上游 3006）。
+# 2026-11-19 视觉能力来源（两档，均可追溯）：
+#   1) 本项目真实图片探针（1x1 红色 PNG → 模型正确识别颜色）
+#   2) 上游公开模型信息（所属族官方声明支持图像输入）
+# 只有确定为视觉模型的条目才带 vision=True；未列出的保持缺省（= 不支持），
+# 避免把纯文本模型标成视觉导致带图请求被路由到不支持的腿、错误溢出客户端。
+_VISION_MODEL_FAMILIES = (
+    "glm-5.3", "glm-5.2", "glm-4.6v", "glm-4.5v", "glm-5v",
+    "deepseek-v4", "kimi-k3", "minimax-m3", "mimo-v2.6",
+    "qwen3.8", "qwen4", "hy4flash",
+)
+
+
+def is_vision_model(model_id):
+    """模型是否声明支持图像输入（实测 + 公开信息）。"""
+    key = str(model_id or "").strip().lower()
+    if not key:
+        return False
+    return any(tag in key for tag in _VISION_MODEL_FAMILIES)
+
+
 MODEL_CATALOG = [
     {"id": "glm-4.5-air", "context_window": 131_072, "max_output_tokens": 98_304},
     {"id": "glm-4.6", "context_window": 200_000, "max_output_tokens": 131_072},
