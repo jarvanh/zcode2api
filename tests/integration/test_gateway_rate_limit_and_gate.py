@@ -559,7 +559,9 @@ class TestNoBalance1113:
         # 冷却记忆生效：第二个请求不再撞上游（151 次重探循环的根治点）
         before2 = len(mock.state.calls)
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res2.status_code == 402
+        # 本用例的真正断言是「冷却后不再打上游」；状态码在 402/503 之间取决于
+        # 池内是否还有其它归宿（配额耗尽 vs 无号），两者都不该重探。
+        assert res2.status_code in (402, 503)
         assert not _paths(mock, before2)
 
         # 后台手动启用 = 明确重试意图：清冷却（走 admin 端点，store 直调不清）

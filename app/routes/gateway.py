@@ -2315,6 +2315,7 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
     # edge_hold（IP 被封）回 503。per-account 出口隔离（2.7.36）下 edge/busy
     # 按账号 tag 分键、循环内逐账号跳号——只有**全部**活跃出口都被 hold 才走到
     # 这里（共享模式 = 旧全池行为，逐字节还原）。
+    # 全局拒绝（分钟预算 rate_limit / 套餐窗口 pool_hold / 全池 edge/busy hold）。
     reason = gate.global_refusal_reason()
     hold_tag = "shared"
     if not reason:
@@ -2327,35 +2328,25 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
         if active_tags and len(held) == len(active_tags):
             hold_tag = held[0]
             reason = gate.hold_reason(hold_tag)
+    if not reason:
+        # 边缘封禁/忙碌断路器/分钟预算/套餐窗口的进程级兜底（上游 2.7.23/2.7.68）。
+        reason = gate.refusal_reason()
+        hold_tag = "shared"
     if reason:
         wait = gate.retry_after(hold_tag)
         status = 429 if reason in ("rate_limit", "busy_hold", "pool_hold") else 503
         logs.req_err(req_id, f"闸门 {reason}，拒绝本请求（Retry-After {wait}s）")
         reqlog.finish_error(req_id, f"gate_{reason}", status=status)
         return JSONResponse(
-            {"error": {
-                "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
-                "type": "no_available_account", "queued_seconds": round(queued),
-            }},
-            status_code=503,
+            {"error": {"message": f"上游保护闸门触发（{reason}），请 {wait}s 后重试",
+                       "type": f"gate_{reason}"},
+             "retry_after": wait},
+            status_code=status,
+            headers={"Retry-After": str(wait)},
         )
-    # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算/套餐窗口）兜底：所有 plan
-    # 账号都被本地拒绝到这里，必须带真实原因与 Retry-After（上游 2.7.23）。
-    _refuse = gate.refusal_reason()
-    if _refuse:
-        _wait = gate.retry_after()
-        _status = 429 if _refuse in ("rate_limit", "busy_hold", "pool_hold") else 503
-        logs.req_err(req_id, f"闸门 {_refuse}，拒绝本请求（Retry-After {_wait}s）")
-        reqlog.finish_error(req_id, f"gate_{_refuse}", status=_status)
-        return JSONResponse(
-            {"error": {"message": f"上游保护闸门触发（{_refuse}），请 {_wait}s 后重试",
-                       "type": f"gate_{_refuse}"}},
-            status_code=_status,
-            headers={"Retry-After": str(_wait)},
-        )
-
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     kind, wait = _recovery(req_provider, model_key)
+
     if wait and wait > time.time():
         if kind == "model":
             final_kind = "quota"

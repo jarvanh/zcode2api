@@ -130,8 +130,8 @@ class TestRaceLateArrival:
         胜者此时尚未消费故不拦），T3 被池内查重拦截 → 池=1（对齐上游）。"""
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
 
-        async def fast_solve(config, tag, proxy_url=None):
-            return _token()
+        async def fast_solve(config, tag, proxy_url=None, **_kw):
+            return _token(), None
 
         monkeypatch.setattr(mgr, "_solve_one", fast_solve)
         got = await mgr._solve_raced({})
@@ -143,13 +143,13 @@ class TestRaceLateArrival:
         monkeypatch.setattr(settings, "CAPTCHA_RACE_DEADLINE", 5)
         counter = {"n": 0}
 
-        async def fast_solve(config, tag, proxy_url=None):
+        async def fast_solve(config, tag, proxy_url=None, **_kw):
             counter["n"] += 1
             import base64
             import json as _json
 
             cid = f"cid-{counter['n']}"
-            return _token(base64.b64encode(_json.dumps({"certifyId": cid}).encode()).decode())
+            return _token(base64.b64encode(_json.dumps({"certifyId": cid}).encode()).decode()), None
 
         monkeypatch.setattr(mgr, "_solve_one", fast_solve)
         got = await mgr._solve_raced({})
