@@ -395,7 +395,6 @@ class TestUpstreamMark:
         reqlog.finish_ok("r4")
         files = list(Path(tmp_path).glob("reqlog-*.jsonl"))
         assert files, "磁盘历史未落盘"
-        import json as _json
 
         row = json.loads(files[0].read_text().strip())
         assert row["up"] is True

@@ -15,6 +15,7 @@ from .. import (
     captcha_ledger,
     dedup,
     diaglog,
+    egress,
     forecast,
     freshness,
     hostinfo,
@@ -22,10 +23,10 @@ from .. import (
     reqlog,
     riskmetrics,
     session_ctx,
+    settings,
     usage_stats,
     vitals,
 )
-from .. import egress, settings
 from ..auth_admin import verify_admin_key
 from ..body_transform import jwt_user_id
 from ..captcha import CaptchaSolveError

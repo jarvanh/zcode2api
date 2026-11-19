@@ -11,8 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import (constants, endpoint_routing, freshness, hostinfo, logs, plan_guard,
-               reqlog, settings, vitals)
+from . import constants, endpoint_routing, freshness, hostinfo, logs, plan_guard, reqlog, settings, vitals
 from .captcha import captcha_manager
 from .claim import claim_round
 from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
