@@ -101,6 +101,23 @@ def quota_recoverable(account: Account, quota_map: dict, now: float) -> tuple[bo
     return has_daily, has_bonus
 
 
+def _plans_all_expired(plans: list, now: float) -> bool:
+    """每个套餐都带结束时间且均已到期。
+
+    缺 ends_at/expires_at 的套餐视为「永久/未知」，一律返回 False——只有
+    「确定曾经有、且确定都已结束」才允许空账本判死（新号体验额度必须放行）。
+    """
+    ends = []
+    for plan in plans:
+        if not isinstance(plan, dict):
+            return False
+        end = expires_epoch(plan.get("ends_at") or plan.get("expires_at"))
+        if end is None:
+            return False
+        ends.append(end)
+    return bool(ends) and all(end < now for end in ends)
+
+
 async def fetch_quota(account: Account) -> dict:
     """拉取单个账号的 方案 / 余额 / 用量，写回账号状态并持久化。
 
@@ -180,6 +197,8 @@ async def fetch_quota(account: Account) -> dict:
     # 否则会把 quota 快照 / plans 洗空，看起来像「上游没投放、额度未知」。
     errors: dict[str, int] = {}
     billing_plans: list | None = None  # 本次 billing/current 实际解析到的 plans
+    billing_ok = False                 # billing/current 成功（code 0/200）且已解析
+    balance_empty = False              # balance 成功且 plans/balances 都为空
 
     # plans[] 归并（plan_id 去重）：current 在投放空窗会返回 code=0 且**无 data**
     # （plans 恒空），而 balance 一直带着已生效套餐。旧实现只认 current 且直接
@@ -212,6 +231,7 @@ async def fetch_quota(account: Account) -> dict:
             if code is not None:
                 errors["current"] = code
             else:
+                billing_ok = True
                 billing_plans = (data.get("data") or {}).get("plans") or []
                 # 归并进 plans_by_id（不在此直接写 account.plans）：current 与
                 # balance 的 plans 按 plan_id 合并后再统一赋值，避免投放空窗时
@@ -220,6 +240,7 @@ async def fetch_quota(account: Account) -> dict:
                 # 空数组会把已知套餐洗掉，plan_kind 退化成「未知」、赠送池判定
                 # 失效；赋值条件见下方 plans_by_id 非空。
                 plans_source_ok = _collect_plans(data) or plans_source_ok
+
         except (ValueError, KeyError):
             pass
 
@@ -235,11 +256,18 @@ async def fetch_quota(account: Account) -> dict:
             # 投放空窗时，这里就是套餐类型的唯一来源——少了它 trial 号会退化
             # 成「未知套餐」，拿不到体验档的并发收紧（见 models.Account.plan_kind）。
             # 归并由下方 plans_source_ok 统一做，此处不直接赋值（否则会与 current
-            # 的归并结果互相覆盖）。业务错误时下方 two 处都按 code 短路。
+            # 的归并结果互相覆盖）。
+            # 2.7.64（上游）：balance 成功且 plans/balances 双空 = 上游明确「没东西」，
+            # 用于过期套餐确认链；业务错误时按 code 短路。
+            bal_plans = (data.get("data") or {}).get("plans") or []
+            bal_windows = (data.get("data") or {}).get("balances") or []
+            if code is None:
+                balance_empty = not bal_plans and not bal_windows
             # 注意：quota_verified_at **不在这里**打点。balance 200 但 balances
             # 为空（新号 billing 全空形态，见下方注释）时什么也没确认——此时
             # 打点会把旧的过期快照误升格为「过期后实查确认」，正好把 2.7.8
             # 要救的号从另一扇门判死。打点在下方 quota_map 非空分支。
+
             for bal in [b for b in (data.get("data") or {}).get("balances") or []
                         if code is None]:
                 name = bal.get("show_name") or bal.get("model") or "model"
@@ -251,9 +279,14 @@ async def fetch_quota(account: Account) -> dict:
                 }
                 prev = quota_map.get(name)
                 if prev:
-                    # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
+                    # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者。
+                    # 2.7.68：任一侧 remaining/total/used 缺失（None）= 未知，
+                    # 合并结果保持 None——旧实现 `(x or 0) + (y or 0)` 把未知
+                    # 硬算成 0，window_usable 从「未知但有量」翻转为 False，
+                    # 状态机据此误判 EXHAUSTED（与 2.7.8 要救的形态同型）。
                     for k in ("total", "used", "remaining"):
-                        prev[k] = (prev.get(k) or 0) + (window.get(k) or 0)
+                        a, b = prev.get(k), window.get(k)
+                        prev[k] = None if (a is None or b is None) else (a + b)
                     # expires_at 保留**更晚**的那个。该字段线上是 epoch 秒、
                     # 快照里也出现过 ISO8601 字符串，直接 max() 会按字典序比
                     # （str 与 int 混型甚至 TypeError），必须先归一成 epoch 再挑。
@@ -261,7 +294,10 @@ async def fetch_quota(account: Account) -> dict:
                     new_end = expires_epoch(window.get("expires_at"))
                     if new_end is not None and (prev_end is None or new_end > prev_end):
                         prev["expires_at"] = window.get("expires_at")
-                    logs.warn("quota", f"balance 同名窗口 {name} 已合并")
+                    # 预期路径的常规合并（同名模型日窗+一次性并存是上游常态，
+                    # 每次刷新都会走到）：info 级留痕即可，warn 会刷屏——线上
+                    # 实测 30 分钟窗口 6+ 次，淹没真告警（2.7.54 巡检）。
+                    logs.info("quota", f"balance 同名窗口 {name} 已合并")
                 else:
                     quota_map[name] = window
             plans_source_ok = _collect_plans(data) or plans_source_ok
@@ -369,6 +405,38 @@ async def fetch_quota(account: Account) -> dict:
         if account.use_count == 0 and account.status == Status.ACTIVE:
             account.last_error = "billing 为空，待首次请求验证（疑似新号体验额度）"
 
+    # 上游**成功**回了空账本 + 本地套餐全部到期 → 确认「已无套餐」（2.7.64 线上实证）。
+    # 以前这条路径不判死：billing/current 返 plans:[] 不覆盖本地缓存（2.7.33 防抖），
+    # balance 返 balances:[] 又什么也不确认，于是 trial-mvxmwyrg 的 11-16 套餐在
+    # 11-17 17:00 到期后，账号仍带 2.68 亿「剩余额度」一直 ACTIVE/可选，每轮
+    # 轮询继续撞 1005。判死条件必须四者同时成立，缺一不可：
+    #   1) billing/current 成功且解析过（billing_ok）——业务错误/超时都不算证据；
+    #   2) balance 成功且 plans、balances 双空（balance_empty）——上游明确「没东西」；
+    #   3) 本地所有已知套餐都带结束时间且已过期——新号无 ends_at 的体验档必须放行；
+    #   4) 本地缓存窗口无一可用——防止上游短暂空账本误杀真有余量的号。
+    # 命中后只推进 quota_verified_at 与状态，**保留 plan/quota 快照**给前端展示。
+    known_plans = [
+        p for p in [account.plan, *(account.plans or [])]
+        if isinstance(p, dict) and p
+    ]
+    no_usable_cached = all(not window_usable(w, now) for w in account.quota.values())
+    if (
+        billing_ok
+        and balance_empty
+        and known_plans
+        and _plans_all_expired(known_plans, now)
+        and no_usable_cached
+        and not has_daily
+        and not has_bonus
+    ):
+        account.quota_verified_at = now
+        if account.status not in (Status.INVALID, Status.DISABLED):
+            if account.status == Status.COOLING and account.is_cooling():
+                account.last_error = "套餐已到期（冷却期内保留冷却态）"
+            else:
+                account.status = Status.EXHAUSTED
+                account.last_error = "套餐已到期（上游无套餐/余额）"
+
     # 状态机（2.7.33 重整）：证据只有两处——balance 窗口（quota_map 非空）
     # 与 plans 一次性赠送池（has_bonus）。缺证据（billing 空/业务错误）不判死。
     # 风控禁用 / 废 JWT：billing 数据照写（领取链要用），但**绝不**用额度数字改
@@ -471,16 +539,45 @@ async def fetch_coding_limits(account: Account) -> dict:
     return {"limits": _normalize_limits(data), "raw": data}
 
 
+# 跨入口同账号刷新合并（2.7.68）：monitor 轮 / admin /accounts/refresh /
+# gateway _safe_refresh / claim 轮四处入口可同时发起同一账号的刷新——旧实现
+# 只在 refresh_accounts 内部 Semaphore(8)，四路叠加瞬时上限 24 条 billing 请求
+# （每 fetch_quota gather 3 条 GET），而 constants 明载「billing 连续查询易触发
+# 拦截」且 403 会把号标 INVALID。同账号在飞任务合并为一次 await。
+_refresh_inflight: dict[str, asyncio.Task] = {}
+
+
 async def refresh_accounts(accounts: list[Account]) -> dict:
-    """并发刷新一批账号，返回汇总。"""
+    """并发刷新一批账号，返回汇总。同账号并发调用合并为一次真实刷新。"""
     if not accounts:
         return {"ok": 0, "fail": 0}
     sem = asyncio.Semaphore(8)
 
-    async def _one(acc: Account) -> bool:
+    async def _run_one(acc: Account) -> bool:
         async with sem:
             res = await fetch_quota(acc)
             return "error" not in res
+
+    async def _one(acc: Account) -> bool:
+        existing = _refresh_inflight.get(acc.id)
+        if existing is not None:
+            # shield：调用方被取消时不得捎带取消别人的在飞刷新
+            try:
+                return bool(await asyncio.shield(existing))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 刷新失败按 fail 计
+                return False
+        task = asyncio.create_task(_run_one(acc))
+        _refresh_inflight[acc.id] = task
+        try:
+            return bool(await asyncio.shield(task))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            _refresh_inflight.pop(acc.id, None)
 
     results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
     ok = sum(1 for r in results if r is True)

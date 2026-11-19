@@ -1,0 +1,298 @@
+"""store.select 负载均衡选号：同负载平局下剩余额度优先（2.7.46）。
+
+主排序 inflight 不变；次排序 -max(remaining)（额度快照未知记 0，全池未知
+退化为纯轮询）；末排序轮询偏移（额度同档均匀轮换）。
+背景（2026-11-17 线上实证）：凌晨全池 inflight=0 全平局时纯轮询把 5M 小窗
+与 3.05 亿大窗同权重随机分，use_count 长期失衡（4034 vs 68）。
+"""
+import time
+
+import pytest
+
+from app.models import Account, Status
+from app.store import Store
+
+
+def _acc(store: Store, name: str, remaining: int | None, model: str = "GLM-5.3-Flash") -> Account:
+    quota = {} if remaining is None else {model: {"total": remaining, "used": 0, "remaining": remaining}}
+    a = Account.create("zai", name, f"tok-{name}")
+    a.quota = quota
+    a.quota_verified_at = time.time()
+    store.add_account("zai", name, f"tok-{name}")
+    # add_account 返回的是 store 内对象；写 quota 到 live 对象
+    live = next(x for x in store.list_accounts("zai") if x.name == name)
+    live.quota = quota
+    return live
+
+
+@pytest.fixture
+def store(fresh_app: Store) -> Store:
+    return fresh_app
+
+
+class TestBalanceAwareSelection:
+    def test_richer_account_wins_tie(self, store: Store):
+        """同 inflight=0 平局：3.05 亿大窗优先于 5M 小窗。"""
+        _acc(store, "small", remaining=5_000_000)
+        _acc(store, "rich", remaining=305_000_000)
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "rich"
+
+    def test_inflight_still_dominates(self, store: Store):
+        """主排序不变：小余额但空载 > 大余额但满载。"""
+        live_rich = _acc(store, "rich-busy", remaining=305_000_000)
+        _acc(store, "small-idle", remaining=5_000_000)
+        got = store.select(
+            "zai",
+            inflight={live_rich.id: 3},  # 达上限（按 id 过滤）
+            max_inflight=3,
+        )
+        # rich-busy 被并发上限过滤；small-idle 是唯一候选
+        assert got.name == "small-idle"
+
+    def test_inflight_low_wins_over_quota(self, store: Store):
+        """inflight=1 的小余额号 优先于 inflight=0 的大余额号？否——inflight 主排序：
+        空载大余额 > 1 路小余额。这里验证小余额空载 vs 大余额 1 路：选小余额。"""
+        _acc(store, "small-idle", remaining=5_000_000)
+        live_rich = _acc(store, "rich-1w", remaining=305_000_000)
+        got = store.select("zai", inflight={live_rich.id: 1}, max_inflight=3)
+        assert got.name == "small-idle"
+
+    def test_unknown_quota_degrades_to_round_robin(self, store: Store):
+        """额度快照未知（新号）记 0：两个未知号之间仍轮换，不总是第一个。"""
+        _acc(store, "unk-a", remaining=None)
+        _acc(store, "unk-b", remaining=None)
+        first = store.select("zai", inflight={}, max_inflight=3).name
+        second = store.select("zai", inflight={}, max_inflight=3).name
+        assert {first, second} == {"unk-a", "unk-b"}
+
+    def test_unknown_prefers_known_when_tied(self, store: Store):
+        """未知快照（记 0）在同负载下劣于已知有量的号。"""
+        _acc(store, "new-unk", remaining=None)
+        _acc(store, "known", remaining=1000)
+        assert store.select("zai", inflight={}, max_inflight=3).name == "known"
+
+    def test_equal_quota_rotates(self, store: Store):
+        """额度同档：轮询偏移仍生效（不总选同一个）。"""
+        _acc(store, "eq-a", remaining=305_000_000)
+        _acc(store, "eq-b", remaining=305_000_000)
+        picks = {store.select("zai", inflight={}, max_inflight=3).name for _ in range(2)}
+        assert picks == {"eq-a", "eq-b"}
+
+    def test_max_across_windows(self, store: Store):
+        """多模型窗口取 max（窗口互不抵扣）：小 Flash 窗 + 大 Coding 窗 = 大。"""
+        _acc(store, "multi", remaining=5_000_000)
+        live = next(x for x in store.list_accounts("zai") if x.name == "multi")
+        live.quota = {
+            "GLM-5.3-Flash": {"total": 5_000_000, "remaining": 5_000_000},
+            "GLM-5.3-Coding": {"total": 300_000_000, "remaining": 300_000_000},
+        }
+        _acc(store, "flashonly", remaining=100_000_000)
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "multi"
+
+    def test_pinned_still_first(self, store: Store):
+        """亲和优先级高于余额排序。"""
+        rich = _acc(store, "rich", remaining=305_000_000)
+        _acc(store, "small", remaining=5_000_000)
+        got = store.select(
+            "zai", inflight={}, pinned_id=rich.id, max_inflight=3,
+        )
+        assert got.name == "rich"
+
+
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+class TestModelAwareRanking:
+    """2.7.55 模型感知排富：指定 model 时只看该模型窗口。
+
+    线上实证（2026-11-17）：zcodereg2 GLM-5.3 rem=0 但 Flash 有 2.9 亿，
+    GLM-5.3 请求照样把它当富号优先选中——plan_guard 冷却被夜间重启洗掉后，
+    每个请求都先撞一次必然失败的 1005。无关窗口的富余额不得给该模型排富。
+    """
+
+    def test_exhausted_model_not_rich_despite_other_window(self, store: Store):
+        """GLM-5.3 rem=0 的号在 GLM-5.3 请求里记 0，输给有 GLM-5.3 余量的号。"""
+        live = _acc(store, "flash-rich", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "flash-rich")
+        live.quota = {
+            "GLM-5.3": {"total": 3_000_000, "used": 3_000_000, "remaining": 0},
+            "GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000},
+        }
+        _acc(store, "g53-has", remaining=1_000_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_model_none_keeps_max_semantics(self, store: Store):
+        """model=None 保持原口径：Flash 富余额照常排富（向后兼容）。"""
+        live = _acc(store, "flash-rich", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "flash-rich")
+        live.quota = {
+            "GLM-5.3": {"total": 3_000_000, "used": 3_000_000, "remaining": 0},
+            "GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000},
+        }
+        _acc(store, "g53-only", remaining=1_000_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "flash-rich"
+
+    def test_missing_model_window_counts_zero(self, store: Store):
+        """快照不含该模型窗口（如 trial 号只有 Flash entitlement）= 未知记 0，
+        不被误当富号。"""
+        live = _acc(store, "trial", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "trial")
+        live.quota = {"GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000}}
+        _acc(store, "g53-has", remaining=500_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_expired_model_window_counts_zero(self, store: Store):
+        """该模型窗口已过期不排富（与 2.7.51 口径同源）。"""
+        live = _acc(store, "expired", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "expired")
+        live.quota = {
+            "GLM-5.3": {
+                "total": 300_000_000, "remaining": 300_000_000,
+                "expires_at": _iso(time.time() - 3600),
+            },
+        }
+        _acc(store, "g53-has", remaining=500_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_model_aware_all_zero_degrades_to_rotation(self, store: Store):
+        """全池该模型均无量（记 0）→ 轮换偏移平局，仍可选（不误伤可用性）。"""
+        _acc(store, "a", remaining=None)
+        _acc(store, "b", remaining=None)
+        picks = {
+            store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3").name
+            for _ in range(2)
+        }
+        assert picks == {"a", "b"}
+
+
+class TestWindowUsableAlignment:
+    """2.7.51 口径对齐：_max_remaining 只数 window_usable 的窗口。"""
+
+    def test_expired_big_window_not_rich(self, store: Store):
+        """过期大窗不排富：A{Flash 3亿 已过期 + Coding 5M 可用} 输给
+        B{Flash 1亿 可用}。线上真实形态：Flash 日窗 23:59 过期 + 快照陈旧期。"""
+        live_a = _acc(store, "expired-rich", remaining=5_000_000)
+        live = next(x for x in store.list_accounts("zai") if x.name == "expired-rich")
+        live.quota = {
+            "GLM-5.3-Flash": {
+                "total": 305_000_000, "remaining": 305_000_000,
+                "expires_at": _iso(time.time() - 3600),
+            },
+            "GLM-5.3-Coding": {"total": 5_000_000, "remaining": 5_000_000},
+        }
+        _acc(store, "healthy", remaining=100_000_000)
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "healthy"
+        # A 自身仍可选（另窗可用），只是不凭过期大窗排富
+        assert live_a.status == Status.ACTIVE
+
+    def test_missing_remaining_backfills_total_used(self, store: Store):
+        """窗口缺 remaining 按 total-used 回填（window_usable「未知但有量」同源）。"""
+        live = _acc(store, "implicit", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "implicit")
+        live.quota = {
+            "GLM-5.3": {"total": 100_000_000, "used": 30_000_000},  # 无 remaining
+        }
+        _acc(store, "explicit-small", remaining=50_000_000)
+        # 隐含 70M > 显式 50M → 隐含号优先
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "implicit"
+
+    def test_zero_remaining_after_backfill_counts_zero(self, store: Store):
+        """total-used 回填为 0 的窗口不排富（用尽但未过期），退化为轮询偏移。"""
+        live = _acc(store, "drained", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "drained")
+        live.quota = {"GLM-5.3": {"total": 10_000_000, "used": 10_000_000}}
+        _acc(store, "unknown", remaining=None)
+        got = store.select("zai", inflight={}, max_inflight=3)
+        # drained 有效余量 0 == unknown 记 0 → 轮询偏移平局，两者都合法
+        assert got.name in ("drained", "unknown")
+
+    def test_all_expired_degrades_to_zero(self, store: Store):
+        """全部窗口过期 = 记 0，与未知新号同档（轮询偏移平局），不排富。"""
+        live = _acc(store, "all-expired", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "all-expired")
+        live.quota = {
+            "GLM-5.3-Flash": {
+                "total": 300_000_000, "remaining": 300_000_000,
+                "expires_at": _iso(time.time() - 7200),
+            },
+        }
+        _acc(store, "new-unk", remaining=None)
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name in ("all-expired", "new-unk")
+
+
+class TestTieToleranceBand:
+    """2.7.53 余额平局带（5% 容差）：tebi 实证 9 号全在 2.83~2.96 亿档（差距
+    <5%），精确整数比较下轮换偏移永远被第二级压过——连选 8 次恒中同一号。
+    容差带内视为同档交还轮换偏移；带外显著差距仍大余额优先。"""
+
+    def test_within_band_rotates(self, store: Store):
+        """容差带内（29564万 vs 29471万，差 0.3%）视为同档 → 轮换生效。"""
+        _acc(store, "a-rich", remaining=295_637_706)   # tebi 实测 zcodereg5
+        _acc(store, "b-rich", remaining=294_710_000)   # tebi 实测 zcodereg2
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"a-rich", "b-rich"}, picks
+
+    def test_outside_band_still_richer_first(self, store: Store):
+        """带外真实差距（3亿 vs 1亿）大余额仍优先，不受容差影响。"""
+        _acc(store, "rich", remaining=300_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        for _ in range(4):
+            assert store.select("zai", inflight={}, max_inflight=3).name == "rich"
+
+    def test_band_edge_exactly_5pct_is_inside(self, store: Store):
+        """边界语义钉死：rj > rk*(1+5%) 才算带外。恰好 +5%（1.05亿 vs 1亿）
+        = 带内 → 轮换。单一判定式（abs 差值式曾与比例式在边界打架）。"""
+        _acc(store, "rich", remaining=105_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"rich", "mid"}, picks
+
+    def test_just_outside_band_richer_first(self, store: Store):
+        """刚出带（1.06亿 vs 1亿，+6%）= 显著更富 → 恒选富号。"""
+        _acc(store, "rich", remaining=106_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        for _ in range(3):
+            assert store.select("zai", inflight={}, max_inflight=3).name == "rich"
+
+    def test_tolerance_env_overridable(self, store: Store, monkeypatch):
+        """容差走 settings.SELECT_TIE_TOLERANCE（ZCODE_SELECT_TIE_TOLERANCE），
+        运维可调：放宽到 0.10 后 1.06亿 vs 1亿（+6%）也进带内 → 轮换。"""
+        from app import settings as _settings
+
+        _acc(store, "rich", remaining=106_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        monkeypatch.setattr(_settings, "SELECT_TIE_TOLERANCE", 0.10)
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"rich", "mid"}, picks
+
+    def test_inflight_dominates_despite_band(self, store: Store):
+        """容差不越过主排序：1 路在飞的带内富号 < 空载小余额号。"""
+        live_a = _acc(store, "busy-rich", remaining=300_000_000)
+        _acc(store, "idle-small", remaining=290_000_000)
+        got = store.select("zai", inflight={live_a.id: 1}, max_inflight=3)
+        assert got.name == "idle-small"
+
+    def test_band_ignores_expired_window(self, store: Store):
+        """容差带按有效余量比较：过期大窗不计入（口径与 2.7.51 一致）。"""
+        _acc(store, "a", remaining=5_000_000)
+        live = next(x for x in store.list_accounts("zai") if x.name == "a")
+        live.quota = {
+            "GLM-5.3-Flash": {
+                "total": 305_000_000, "remaining": 305_000_000,
+                "expires_at": _iso(time.time() - 3600),
+            },
+            "GLM-5.3-Coding": {"total": 5_000_000, "remaining": 5_000_000},
+        }
+        _acc(store, "b", remaining=4_900_000)  # 差 2%，带内
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"a", "b"}, picks

@@ -164,7 +164,8 @@ class _StubCaptcha:
         return self.needs_captcha
 
     async def get_verify_param(self, egress_tag: str | None = None,
-                               proxy_url: str | None = None) -> tuple[str, str | None]:
+                               proxy_url: str | None = None,
+                               retries: int | None = None) -> tuple[str, str | None]:
         self.solve_count += 1
         self.last_egress = egress_tag
         self.last_proxy = proxy_url

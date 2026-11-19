@@ -303,12 +303,15 @@ def build_app() -> FastAPI:
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
         if scenario == "quota_exhausted_1310":
-            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2099-12-31 23:59 重置"}
-            # 日期必须固定在未来：_parse_exhaust_reset 只接受未来时间，写死过去日期
-            # 会让测试随系统日期推移必然失败（2026-11-16 全量测试踩中）。
+            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 <未来> 23:59 重置"}
+            # 日期动态生成：gateway 只认未来时间戳（_parse_exhaust_reset），
+            # 写死日期随时间流逝必然失真（2026-11-17 实证：写死 11-15 已成过去）。
+            import datetime as _dt
+
+            _reset = (_dt.datetime.now() + _dt.timedelta(days=7)).strftime("%Y-%m-%d")
             return 200, {
                 "code": 1310,
-                "msg": "您已达到每周使用上限，将于 2099-12-31 23:59 重置",
+                "msg": f"您已达到每周使用上限，将于 {_reset} 23:59 重置",
             }, {}
         # risk_control_3012_200 场景在上方 fork 已定义（200 承载业务码 3012），
         # 上游重复追加的同一场景不再重复。

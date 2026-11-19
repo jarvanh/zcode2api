@@ -21,6 +21,8 @@ async function renderAdminHeader(){
         </div>
         <nav class="admin-nav">${nav}</nav>
         <div class="admin-header-right">
+          <status-indicator status="online" label="Gateway online"></status-indicator>
+          <theme-toggle storage-key="zcodehub-theme"></theme-toggle>
           ${version?`<span class="admin-header-version">${version}</span>`:''}
           <button data-theme-btn onclick="window.zcodeTheme&&zcodeTheme.cycle()" class="admin-header-theme-btn" title="主题：跟随系统（点击切换）" aria-label="切换主题">🖥 跟随系统</button>
           <button onclick="adminLogout()" class="admin-header-icon-btn" title="退出登录" aria-label="退出登录">
@@ -29,4 +31,17 @@ async function renderAdminHeader(){
         </div>
       </div>
     </header>`;
+}
+
+/* ── Motion helpers（awesome-ui 动效：staggered 入场 + 数字弹入）── */
+function staggerCards(root){
+  (root||document).querySelectorAll('.stat-cell,.settings-card').forEach((el,i)=>el.style.setProperty('--ri',i));
+}
+function popStatNumbers(root){
+  (root||document).querySelectorAll('.stat-num').forEach((el,i)=>{
+    el.style.setProperty('--ri',i);
+    el.classList.remove('num-pop');
+    void el.offsetWidth;
+    el.classList.add('num-pop');
+  });
 }

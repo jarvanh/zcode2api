@@ -1,30 +1,39 @@
-"""日志工具 — 带时间戳的终端彩色输出 (Windows GBK 兼容)
+"""运维事件日志 — ANSI 彩色 stdout + 结构化 JSONL 落盘（opslog）双通道。
 
-2026-11-03 主人要求补时间戳：此前是裸 print，claim 日志**没有任何时刻**
-（实测查「zai-156 的套餐几点领的」只能靠 DB 里的上游 starts_at 反推）。
-现在每行前缀本地时间，`grep 'claim'` 的结果直接可读。
+stdout 彩色行 = 人眼实时观测（supervisor out.log，版式 2026-11-14 边缘 405
+复盘定型）；opslog JSONL = 机器可查的完整事件流（时间戳含年、级别/模块
+字段化），跨日排查不再受 out.log 10MB 轮转截断影响。
 
-同一轮顺带修掉一个噪音：服务 StandardOutput 重定向到日志文件时
-isatty() 为 False，ANSI 转义码仍照写（实测日志里 7 万+ 个 ESC，
-`cat` 全是乱码、`cut` 宽度也算不准）。改为**非 TTY 自动关色**：
-人看终端仍有颜色，落盘日志是干净 UTF-8 纯文本。
+落盘设计对齐 reqlog.py 成熟模式（write-only 追加、文件侧日切、.1 轮转
+保留一代、写失败降级不影响主链路、NFS /data 安全）。开关
+ZCODE_OPSLOG_PERSIST（默认开）；关闭时零开销（一个布尔短路）。
 
-注意：消费方靠中文关键词 grep（如 tools/zcode2api-healthcheck.sh 的
-grep -c '立刻换号'），加前缀不影响，勿改成把关键词挪出正文的格式。
+排障口径（2.7.58-61 领取失败潮实战提炼）：
+- grep 时间线：opslog 每行独立 JSON，`_ts` 含年份，跨日事件可直接
+  按日期切片，不必再从 ANSI 脏文本里抠 MM-DD；
+- grep 模块：`tag` 字段与 stdout 的模块标签逐字一致（claim/captcha/
+  egress_pool/gateway...），`jq -r 'select(.tag=="captcha")'` 一刀切；
+- grep 级别：level ∈ ok/info/warn/err，与 [+] [-] [~] [!] 一一对应。
 """
 
-import sys
-import time
+from __future__ import annotations
 
-# 颜色只在真终端生效；重定向到文件/管道时关掉（见模块 docstring）。
+import json
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+
+# 颜色只在真终端生效；重定向到文件/管道时关掉（fork 语义：落盘日志干净
+# UTF-8，实测旧行为在 out.log 留下 7 万+ ESC，cat/cut 全乱）。
 try:
     _COLOR = sys.stdout.isatty()
-except Exception:  # noqa: BLE001 - 某些 Windows GBK 管道会抛，退化为无色
+except Exception:  # noqa: BLE001 - 某些 Windows GBK 管道会抛
     _COLOR = False
 
 
 def _c(code: str) -> str:
-    """按是否终端决定返回 ANSI 码还是空串。"""
     return code if _COLOR else ""
 
 
@@ -38,66 +47,162 @@ _B = _c("\033[1m")
 _MAG = _c("\033[35m")
 _W = _c("\033[37m")
 
+# opslog 落盘句柄（logs.py 自持，避免与 reqlog 的日切/句柄逻辑耦合）
+_fh = None
+_current_day = ""
+_lock = threading.Lock()
+_enabled: bool | None = None  # 惰性读 settings（logs 被 settings 前的模块引用）
+_path: Path | None = None
 
-def _ts() -> str:
-    """时间戳前缀：日志必须能回答「这事几点发生的」。"""
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 def _stamp() -> str:
-    return f"{_DIM}[{time.strftime('%m-%d %H:%M:%S')}]{_R}"
+    # fork：时间戳含年份（跨日排障不必再猜 MM-DD 是哪年）
+    return f"{_DIM}{time.strftime('%Y-%m-%d %H:%M:%S')}{_R}"
+
+
+def _opslog(level: str, tag: str, msg: str) -> None:
+    """事件行落盘 opslog.jsonl（write-only 追加；日切 + .1 轮转保留一代）。
+
+    任何失败都静默吞掉（磁盘满/NFS 抖动 → 丢弃本条、句柄作废、下条重试）：
+    观测组件绝不影响主链路。stdout print 本身已是第一通道，这里只做增强。
+    """
+    global _fh, _current_day, _enabled, _path
+    if _enabled is None:
+        try:
+            from . import settings
+
+            _enabled = bool(settings.OPSLOG_PERSIST)
+            _path = settings.OPSLOG_PATH
+        except Exception:  # pragma: no cover - settings 尚未就绪的极端时序
+            _enabled = False
+    if not _enabled or _path is None:
+        return
+    entry = {
+        "_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "level": level,
+        "tag": tag,
+        "msg": _ANSI_RE.sub("", msg),
+    }
+    try:
+        with _lock:
+            if _fh is None:
+                _path.parent.mkdir(parents=True, exist_ok=True)
+                _fh = _path.open("a", encoding="utf-8")
+                if _path.exists() and _path.stat().st_size > 0:
+                    # 首行日探测独立容错（2.7.68 review P2）：半行/超长损坏曾经
+                    # JSONDecodeError 冒泡进外层 except → 句柄作废 → 下一条重开
+                    # 再读再炸的粘性瘫死（opslog 从此一条不落，恰好发生在最需要
+                    # 证据的时刻）。对齐 reqlog.py:54-57 的正确回退：解析失败
+                    # 按「今日」处理，绝不连坐句柄。
+                    first_ts = ""
+                    try:
+                        with _path.open("r", encoding="utf-8") as f:
+                            first_ts = (json.loads(f.readline(4096) or "{}")).get("_ts", "")
+                    except (OSError, ValueError):
+                        first_ts = ""
+                    _current_day = first_ts[:10] or time.strftime("%Y-%m-%d")
+                else:
+                    _current_day = time.strftime("%Y-%m-%d")
+            today = time.strftime("%Y-%m-%d")
+            if _current_day != today:
+                _fh.close()
+                rot = _path.with_suffix(_path.suffix + ".1")
+                rot.unlink(missing_ok=True)
+                _path.rename(rot)
+                _fh = _path.open("a", encoding="utf-8")
+                _current_day = today
+            _fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+            _fh.flush()
+    except (OSError, ValueError):
+        try:
+            if _fh is not None:
+                _fh.close()
+        except OSError:
+            pass
+        _fh = None
+
+
+def _emit(level: str, marker: str, color: str, tag: str, msg: str, plain: bool = False):
+    """stdout 彩色行（人读）+ opslog 落盘（机器查）。plain=True 不落盘。"""
+    print(f"  {_stamp()} {color}{marker}{_R} {_DIM}{tag}{_R} {msg}")
+    if not plain:
+        _opslog(level, tag, msg)
 
 
 def ok(module: str, msg: str):
-    print(f"{_DIM}{_ts()}{_R}  {_G}[+]{_R} {_DIM}{module}{_R} {msg}")
+    _emit("ok", "[+]", _G, module, msg)
 
 
 def step(module: str, msg: str):
-    print(f"{_DIM}{_ts()}{_R}  {_C}[>]{_R} {_DIM}{module}{_R} {msg}")
+    _emit("info", "[>]", _C, module, msg)
 
 
 def info(module: str, msg: str):
-    print(f"{_DIM}{_ts()}  [-] {module} {msg}{_R}")
+    _emit("info", "[-]", _DIM, module, msg)
 
 
 def warn(module: str, msg: str):
-    print(f"{_DIM}{_ts()}{_R}  {_Y}[~]{_R} {_DIM}{module}{_R} {msg}")
+    _emit("warn", "[~]", _Y, module, msg)
 
 
 def err(module: str, msg: str):
-    print(f"{_DIM}{_ts()}{_R}  {_RED}[!]{_R} {_DIM}{module}{_R} {msg}")
-
-
-def header(module: str, msg: str):
-    print(f"{_DIM}{_ts()}{_R}  {_B}{_MAG}{module}{_R} {msg}")
+    _emit("err", "[!]", _RED, module, msg)
 
 
 def req(req_id: str, model: str, stream: bool, last_msg: str):
     """请求日志 — 一行显示关键信息"""
     s = "stream" if stream else "sync"
     msg_preview = last_msg[:40] + ("..." if len(last_msg) > 40 else "")
-    print(f"{_DIM}{_ts()}{_R}  {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}  {_DIM}\"{msg_preview}\"{_R}")
+    print(f"  {_stamp()} {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}  {_DIM}\"{msg_preview}\"{_R}")
+    _opslog("req", "gateway", f">>> {req_id} {model} {s} \"{msg_preview}\"")
 
 
 def req_ok(req_id: str, tokens: int = 0):
     """请求完成"""
     t = f"  {_DIM}{tokens}tok{_R}" if tokens else ""
-    print(f"{_DIM}{_ts()}{_R}  {_G}<<<{_R} {_DIM}{req_id}{_R}{t}")
+    print(f"  {_stamp()} {_G}<<<{_R} {_DIM}{req_id}{_R}{t}")
+    _opslog("req_ok", "gateway", f"<<< {req_id}" + (f" {tokens}tok" if tokens else ""))
 
 
 def req_err(req_id: str, msg: str):
     """请求错误 — 只显示 req_id + 简短原因，不泄露上游"""
-    print(f"{_DIM}{_ts()}{_R}  {_RED}<!>{_R} {_DIM}{req_id}{_R}  {msg}")
+    print(f"  {_stamp()} {_RED}<!>{_R} {_DIM}{req_id}{_R}  {msg}")
+    _opslog("req_err", "gateway", f"<!> {req_id}  {msg}")
+
+
+def header(module: str, msg: str):
+    _emit("info", "", _MAG, module, msg, plain=True)
 
 
 def banner(lines: list[str]):
-    """横幅：装饰性多行块，不加时间戳（加了反而割裂边框）。"""
-    import re
-
-    strip_ansi = re.compile(r"\033\[[0-9;]*m")
-    w = max(len(strip_ansi.sub("", line)) for line in lines) + 4
+    """启动横幅 — 保持无时间戳（版式块，非事件行）"""
+    w = max(len(_ANSI_RE.sub("", line)) for line in lines) + 4
     border = f"{_DIM}{'=' * w}{_R}"
     print(f"\n{border}")
     for line in lines:
         print(f"  {line}")
     print(f"{border}\n")
+
+
+def opslog_stats() -> dict:
+    """opslog 落盘状态（管理端/健康页可展示；纯观测）。"""
+    return {
+        "persist": bool(_enabled),
+        "file": str(_path) if _path else "",
+        "day": _current_day,
+        "open": _fh is not None,
+    }
+
+
+def opslog_close() -> None:
+    """停机收口：关闭落盘句柄（lifespan finally 调用；防止缓冲丢失）。"""
+    global _fh
+    with _lock:
+        if _fh is not None:
+            try:
+                _fh.close()
+            except OSError:
+                pass
+            _fh = None

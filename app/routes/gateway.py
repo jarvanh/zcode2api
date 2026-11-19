@@ -365,6 +365,10 @@ def _normalize_body(body: dict) -> dict:
         # 必须无条件剥掉并写回——否则映射后名称恰好不变时（如
         # zai/GLM-5.3-Flash → GLM-5.3-Flash）前缀会被原样透传，上游 3006。
         model = "/".join(model.split("/")[1:])
+        # 2026-11-15 实证：剥离 provider 前缀后必须回写 body["model"]——此前仅在
+        # 别名改写时回写，`zai/GLM-5.3-Flash` 这类「无别名命中」的请求把带前缀的
+        # 原名透传给上游，换来必然的 400 code 3006（model not allowed）。
+        body["model"] = model
     if isinstance(model, str):
         # 先按大小写别名改写，再兜底「已退役型号」→ 当前主力型号。上游对退役名
         # 一律 3006（model not allowed），原样透传只会让客户端拿必然失败的结果。
@@ -1754,7 +1758,30 @@ async def count_tokens(request: Request):
     model = body.get("model")
     if not isinstance(model, str) or not model.strip():
         return JSONResponse({"error": {"message": "必须提供 model 参数", "type": "invalid_request_error"}}, status_code=400)
-    return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
+    _normalize_body(body)
+    # 2026-11-17 review：_normalize_body 会原地剥离 provider 前缀/改写别名，
+    # 必须改写后再取——否则 poweredBy 注入的是带前缀旧值（差一个模型名的估算偏差）
+    model = str(body.get("model") or model)
+    return {"input_tokens": estimate_input_tokens_after_transform(body, model)}
+
+
+def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
+    """流中途中断的账号级记账与换绑触发（2026-11-16 盲区收口）。
+
+    建连失败（1320 分支）有完整链路：record_result + note_conn_fail +
+    verify_then_rebalance。而「已建连、读到一半断」（RemoteProtocolError /
+    incomplete chunked read）此前只写 reqlog——既不进 recent_results（后台
+    看不到失败），也不触发 egress_pool（坏节点永远换不掉）。此处补齐：
+    与建连失败同语义（出口链路故障），共用同一聚类 key 与换绑触发器。"""
+    account = getattr(up, "account", None)
+    if account is None:
+        return
+    detail = f"流中断: {err}"[:120]
+    account.record_result(False, detail)
+    if settings.EGRESS_SUPPLY == "tetherpool" and settings.PER_ACCOUNT_EGRESS:
+        egress.note_conn_fail(_messages_egress(account))
+        _spawn_bg(_egress_pool_singleton.verify_then_rebalance(
+            account, reason="node_unreachable"))
 
 
 def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
@@ -2281,6 +2308,30 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                 status_code=503,
                 headers={"Retry-After": str(retry_after)},
             )
+    # 进程级闸门拒绝（套餐窗口/分钟预算）期间的兜底 + 「全部出口被 edge/busy
+    # hold」的还原形态：必须带真实原因与 Retry-After，而不是误导性的
+    # 「无可用账号」。rate_limit/busy_hold/pool_hold 是限流语义回 429（客户端按
+    # 限流退避重试，magpie 同款；pool_hold 的 Retry-After 指向下一个套餐窗口），
+    # edge_hold（IP 被封）回 503。per-account 出口隔离（2.7.36）下 edge/busy
+    # 按账号 tag 分键、循环内逐账号跳号——只有**全部**活跃出口都被 hold 才走到
+    # 这里（共享模式 = 旧全池行为，逐字节还原）。
+    reason = gate.global_refusal_reason()
+    hold_tag = "shared"
+    if not reason:
+        active_tags = sorted({
+            _messages_egress(a) for a in store.list_accounts("zai")
+            if a.enabled and a.status == Status.ACTIVE
+        })
+        held = [t for t in active_tags
+                if gate.hold_reason(t) in ("edge_hold", "busy_hold")]
+        if active_tags and len(held) == len(active_tags):
+            hold_tag = held[0]
+            reason = gate.hold_reason(hold_tag)
+    if reason:
+        wait = gate.retry_after(hold_tag)
+        status = 429 if reason in ("rate_limit", "busy_hold", "pool_hold") else 503
+        logs.req_err(req_id, f"闸门 {reason}，拒绝本请求（Retry-After {wait}s）")
+        reqlog.finish_error(req_id, f"gate_{reason}", status=status)
         return JSONResponse(
             {"error": {
                 "message": f"所有账号均不可用、额度已用完或并发已满（已排队等待 {queued:.0f}s），请在后台检查账号状态",
@@ -2965,6 +3016,16 @@ def _upstream_biz_error(text: str) -> tuple[int, str, str] | None:
     if msg:
         return (502, "upstream_error", f"上游业务错误 {code}：{msg[:200]}")
     return None
+
+
+def _pool_inflight_saturated(limit: int) -> bool:
+    """zai 池 ACTIVE 账号的 inflight 是否全部打满（并发饱和 ≠ 账号真不可用，
+    槽位秒级释放——2026-11-14 review：此形态原来落裸 503 无 Retry-After）。"""
+    if limit <= 0:
+        return False
+    pool = [a for a in store.list_accounts("zai")
+            if a.enabled and a.status == Status.ACTIVE]
+    return bool(pool) and all(_inflight.get(a.id, 0) >= limit for a in pool)
 
 
 class _Upstream:
@@ -3760,9 +3821,30 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                                   + (f"（429 扣号 {hold_secs}s 至 "
                                      f"{time.strftime('%H:%M', time.localtime(until))}）" if hold_secs else ""))
                         return _NEXT_ACCOUNT
+                    # 并发族连败提前止损（上游 2.7.54）：同号连续 N 次并发族 429
+                    # （重试中途无自愈）= 上游排队队列已满，继续耗完退避序列是让
+                    # 客户端干等——立即止损换号或切 Key 回退（fork 侧换号优先已在
+                    # 上方；此处为 failover 关闭时的兜底）。
+                    if (_is_concurrency_hit(text)
+                            and 0 < settings.CONCURRENCY_GIVEUP_AFTER <= retries_429):
+                        if _jump_to_fallback():
+                            account.record_result(False, "并发族连败提前止损，切 API Key 回退")
+                            logs.warn(req_id,
+                                      f"账号 {account.name} 并发已满连败 {retries_429} 次"
+                                      f"（≥{settings.CONCURRENCY_GIVEUP_AFTER}），提前止损切 API Key 回退")
+                            needs_captcha = False
+                            continue
+                        gate.note_busy(_messages_egress(account))
+                        account.record_result(False, "并发族连败提前止损")
+                        store.update_account(account)
+                        logs.warn(req_id,
+                                  f"账号 {account.name} 并发已满连败 {retries_429} 次"
+                                  f"（≥{settings.CONCURRENCY_GIVEUP_AFTER}），提前止损切换下一个")
+                        return _NEXT_ACCOUNT
                     if retry_policy.decide_retry(
                             status_code=429, attempt=retries_429,
                             max_attempts=settings.RETRY_429_TIMES):
+                        retries_429 += 1
                         retries_429 += 1
                         reqlog.note_retry(req_id, "429")
                         concurrency_hit = busy_hit

@@ -37,6 +37,13 @@ def _int(env_name: str, default: int) -> int:
         return default
 
 
+def _float(env_name: str, default: float) -> float:
+    try:
+        return float(os.getenv(env_name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _bool(env_name: str, default: bool) -> bool:
     raw = (os.getenv(env_name) or "").strip().lower()
     if not raw:
@@ -52,6 +59,12 @@ DB_PATH = DATA_DIR / "accounts.db"
 # 开启后追加写 DATA_DIR/reqlog.jsonl，启动时回读尾部 ≤KEEP 条，重启不清零。
 REQLOG_PERSIST = _bool("ZCODE_REQLOG_PERSIST", False)
 REQLOG_PATH = DATA_DIR / "reqlog.jsonl"
+# 运维事件日志落盘（2.7.64）：logs.py 全部事件行（ok/info/warn/err/req*）同步
+# 追加写 DATA_DIR/opslog.jsonl，结构化字段（_ts 含年/level/tag/msg），日切 +
+# .1 轮转保留一代。默认开——排障不再受 out.log 10MB 轮转截断与 ANSI 脏文本
+# 干扰（2.7.58-61 领取失败潮跨日排查实战提炼）；关闭 = ZCODE_OPSLOG_PERSIST=0。
+OPSLOG_PERSIST = _bool("ZCODE_OPSLOG_PERSIST", True)
+OPSLOG_PATH = DATA_DIR / "opslog.jsonl"
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
@@ -123,6 +136,17 @@ else:
 # Chromium 可执行文件（solver_pw.js 用；env 可覆盖，缺省按常见路径探测）
 CHROMIUM_PATH = os.getenv("ZCODE_CHROMIUM_PATH", "/usr/local/bin/chromium")
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
+# 领取链求解重试上限（2.7.68 预算解耦）：messages 池路径保持 CAPTCHA_SOLVE_RETRIES
+# （求解是热路径可用性兜底，跑满预算值得）；claim 一小时一轮 × 11 号串行，单号
+# 跑满 4×240s ≈ 16 分钟会把整晚窗口吃穿（11-16~11-18 三晚 0 成功的结构性放大器，
+# opslog 实测轮内 19:11→20:25 逐号串行）。领取路径缺省 2 次，env 可覆盖。
+CAPTCHA_CLAIM_SOLVE_RETRIES = max(_int("ZCODE_CAPTCHA_CLAIM_RETRIES", 2), 1)
+# 连续 N 次超时型归因即止损（2.7.68）：DEGRADED 是环境级判定（单次即止），
+# 但 DEADLINE / TRACELESS:TIMEOUT / EXC:TimeoutError / SETUP:TimeoutError /
+# 求解进程超时这些链式超时形态此前不命中任何止损——每号照样跑满 4×240s
+# （11-18 opslog：159 次求解 0 成功，主形态即链式超时）。连续 2 次（换过
+# context/进程仍超时）= 环境级失败，第 3 次起不再白烧。1 = 首次超时即止。
+CAPTCHA_TIMEOUT_GIVEUP_AFTER = max(_int("ZCODE_CAPTCHA_TIMEOUT_GIVEUP_AFTER", 2), 1)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
@@ -231,6 +255,15 @@ BUSY_WAITS = (1, 2)
 # 实测上游槽位释放中位 64.7s，默认 20s 平衡「早恢复」与「不空等」；
 # 仍 3008 会续闸（上限 QUEUE_WAIT 240s / 同步 60s 由请求预算兜底）。
 BUSY_GATE_WAIT = _int("ZCODE_BUSY_GATE_WAIT", 20)
+# 并发族连败提前止损（2.7.54）：同号连续 N 次并发族 429（重试中途无自愈）=
+# 上游排队队列已满，继续耗完 RETRY_429_TIMES 退避序列（3+6+12+24+30 ≈ 75s）
+# 是让客户端干等——立即止损换号（store.select 零等待）或切 Key 回退。
+# 2 = 第 3 次连败即止损（前两轮保留快路径：单次抖动自愈成本低于换号重连）。
+# 0/负 = 关闭（回 2.7.53 旧行为）。
+CONCURRENCY_GIVEUP_AFTER = _int("ZCODE_CONCURRENCY_GIVEUP_AFTER", 2)
+# 以下三个冷却键 fork 已在「§ 渠道冷却」段定义（RATE_LIMIT_COOLDOWN /
+# KEY_NO_BALANCE_COOLDOWN / PLAN_MODEL_EXHAUST_COOLDOWN），此处不重复定义。
+
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -383,6 +416,20 @@ ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 100)
 # egress listener 池分配逻辑经 Account.egress 别名同样落到 proxy_url。此开关
 # 控制 egress.account_proxy/egress_tag_for 是否返回账号绑定代理（关 = 全链路
 # 维持 fork 现状：账号 proxy_url 仅作用于 chat 网关上游，billing 直连）。
+# 注：ACCOUNT_CONCURRENCY 由 fork 的动态计算维护（代理数 / 直连 2），此处不取
+# 上游写死的 3。
+# 选号余额平局带（2.7.53，上游）：相对容差——候选 j 比 k 富出超过此比例才算「显著
+# 更富」（带外直接胜出），带内视为同档交还轮换偏移。快照间必有微小漂移，
+# 精确比较下轮换会被余额排序压过（tebi 实证：9 号差距 <5%，连选 8 次同一号）。
+# env 可覆盖：档位分层过细时运维可放宽。
+SELECT_TIE_TOLERANCE = float(os.getenv("ZCODE_SELECT_TIE_TOLERANCE", "0.05"))
+# ── per-account 出口隔离（2.7.36，需求 = 每账号一个独立 IP 互相隔离）──────────
+# 依据：①上游按出口 IP 风控（magpie 实证：同 IP 同时用 3 个账号即触发边缘
+# 405 封地址，2 个不封——共享出口下 7 号远超红线）；②3008 风暴全池均匀爆发
+# = 上游按 IP 维度限并发的实证。开关关闭时全链路走共享出口现状（行为零变化）。
+# listener 池 = 逗号分隔的 mihomo listener URL（tebi 上 11031-11037 各钉一个
+# pigeonw 节点）；账号入池/启动补分配时领取，随 data blob 持久化。
+
 PER_ACCOUNT_EGRESS = _bool("ZCODE_PER_ACCOUNT_EGRESS", False)
 # 上游 EGRESS_LISTENERS 池（逗号分隔 URL）：开启 per-account 且用 store 自动
 # 分配时才需要；fork 部署用 scripts/assign_egress.py 手工绑定，默认留空。
@@ -406,11 +453,48 @@ TP_TYPE = os.getenv("ZCODE_TP_TYPE", "clash_proxy").strip()
 TP_TIER = os.getenv("ZCODE_TP_TIER", "standard").strip()
 TP_GRAY_ACCOUNTS = [g.strip() for g in os.getenv("ZCODE_TP_GRAY_ACCOUNTS", "").split(",") if g.strip()]
 TP_REBALANCE_DEBOUNCE = _int("ZCODE_TP_REBALANCE_DEBOUNCE", 120)
+# 网关级故障熔断（2.7.68）：一次 rebalance 内连续 N 个候选都「探针连接级失败
+# （st=0）」= 本地网关（EasyTier→TP 9101）故障而非节点问题——继续 acquire/
+# 探针只会全池 churn 并把 egress_node 改写到从未探通的候选（11-18 晚 EasyTier
+# 崩溃重启期实测形态）。命中即中止本轮 rebalance 并显式告警。1 = 首个连接失败
+# 即熔断（最保守）；0/负 = 关闭（旧行为）。
+TP_GATEWAY_FAIL_ABORT = max(_int("ZCODE_TP_GATEWAY_FAIL_ABORT", 2), 0)
+# 启动时 TP 孤儿分配对账（2.7.68）：allocs 里 zh-<id> 不在本库账号集合 → 逐个
+# release。11-17 实查 27 个分配 16 个陈旧（历史删除账号），删除释放只堵新增
+# 不清存量；对账从源头回收占位。默认开。
+TP_ORPHAN_RECONCILE = _bool("ZCODE_TP_ORPHAN_RECONCILE", True)
 TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防 0 自旋
 # 健康探针连续失败多少轮才 rebalance（2026-11-15 生产数据：03:48/04:13 探针
 # 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
 # 留痕，连续 N 轮（跨 ≥N 个间隔）仍失败才判定节点真死。
 TP_HEALTH_FAIL_THRESHOLD = max(_int("ZCODE_TP_HEALTH_FAIL_THRESHOLD", 2), 1)
+# 阿里云验证码 CDN 路由验收（2026-11-18 1117 全灭复盘新增维度）：TP 验收/
+# 健康探针此前只测 zcode.z.ai——teleapi 节点对 o.alicdn.com 路由劣化（实测
+# 9.9~31.9s/资源，直连 0.15s）照样「JSON-APP 放行」，验证码 SDK 引导/
+# traceless 后端签名全部超时 → len-76 无 securityToken 降级 stub（2.7.60
+# 拒收）→ popup 兜底渲染不出 → claim 求解全灭。换绑候选与健康判定新增
+# alicdn 维度：超阈值/失败 = 拒收该候选（不 ban——路由差≠信誉烂，ban 会
+# 白白烧池子）。缺省 5.0s = 实测最慢可用档（3.5~5s）上界：再慢即判不合格。
+EGRESS_ALICDN_MAX_SECONDS = _float("ZCODE_EGRESS_ALICDN_MAX", 5.0)
+EGRESS_ALICDN_PROBE_TIMEOUT = _int("ZCODE_EGRESS_ALICDN_PROBE_TIMEOUT", 12)
+# claim IP 信誉驱动重试（2026-11-17 深度迭代收编）：信誉型失败（403 风控文案/
+# 3007/验证码求解失败）换绑重试上限与间隔。间隔给 TP ban/新 allocation 生效
+# 留缓冲；求解单次可达分钟级，上限过大会让 claim 轮拖长（见 2.7.50 review）。
+CLAIM_EGRESS_RETRIES = max(_int("ZCODE_CLAIM_EGRESS_RETRIES", 2), 0)
+CLAIM_EGRESS_RETRY_DELAY = _float("ZCODE_CLAIM_EGRESS_RETRY_DELAY", 20.0)
+# 领取轮级 wall-clock 预算（秒，2.7.68）：单号最坏 ≈90 分钟（求解长尾 × 换绑链），
+# 11 号串行会把 19-23 点窗口吃穿、轮尾下一拍已出窗。预算到点后剩余账号本轮跳过
+# （下拍自然续领），保证轮在窗口内收尾。0/负 = 不限（旧行为）。缺省 2700s（45min）
+# = interval 3600s 内留出健康余量。
+CLAIM_ROUND_BUDGET = _float("ZCODE_CLAIM_ROUND_BUDGET", 2700.0)
+# 领取轮账号并发数（2.7.68）：轮内逐号串行是三天 0 成功的吞吐瓶颈；求解进程级
+# 上限（CAPTCHA_MAX_CONCURRENT_SOLVES）与 TP rebalance 互斥（per-account lock）
+# 都有自己的全局闸，这里 2 并发只是调度并行度，不会放大浏览器/上游压力。
+CLAIM_ROUND_CONCURRENCY = max(_int("ZCODE_CLAIM_ROUND_CONCURRENCY", 2), 1)
+# 手动 POST /admin/api/claim 的响应预算（秒，2.7.68）：预算内跑完多少号就返回
+# 多少号的结果，剩余账号转后台 job 继续执行（GET /admin/api/claim/{job_id} 续查）。
+# 缺省 90s——CF Tunnel 100s 硬超时之内，客户端永不 524。
+CLAIM_API_BUDGET = _float("ZCODE_CLAIM_API_BUDGET", 90.0)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -494,7 +578,8 @@ USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 # 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
 # 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.65"
+APP_VERSION = "2.9.66"  # fork：并入上游 2.7.50–2.7.68（领取链预算/求解器预算解耦/供给模式 gate/opslog）
+
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
 # 真源 _meta.captured_at 距今超过该天数即判「过时」，每日巡检落 meta 表

@@ -45,6 +45,13 @@ class TestNormalizeBody:
         body = {"model": "zai/glm-5.3-flash"}
         assert _normalize_body(body)["model"] == "GLM-5.3-Flash"
 
+    def test_provider_prefix_stripped_without_alias(self):
+        # 2026-11-15：现役型号带前缀 → 无别名命中也必须回写剥离结果；
+        # 此前 body["model"] 保留带前缀原名透传上游 → 400 code 3006
+        # model not allowed（线上实证：bare GLM-5.3-Flash 200，zai/GLM-5.3-Flash 3006）
+        body = {"model": "zai/GLM-5.3-Flash"}
+        assert _normalize_body(body)["model"] == "GLM-5.3-Flash"
+
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
         assert _normalize_body(body)["model"] == "glm-unknown"
@@ -451,6 +458,22 @@ class TestGatewayHTTP:
         res = await client.post("/v1/messages", json={"model": "glm-5.2", "messages": []})
         assert res.status_code == 503
         assert res.json()["error"]["type"] == "no_available_account"
+
+    async def test_count_tokens_uses_normalized_model(self, gateway_client):
+        # 2026-11-17 review：count_tokens 端点先取 model 再 _normalize_body，
+        # 带前缀请求曾把旧值（`zai/GLM-5.3-Flash`）传给估算器做 poweredBy 注入；
+        # 修复后必须以归一后的裸名估算（结果与裸名请求逐字节一致）
+        client, _ = gateway_client
+        prefixed = await client.post("/v1/messages/count_tokens", json={
+            "model": "zai/GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        bare = await client.post("/v1/messages/count_tokens", json={
+            "model": "GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert prefixed.status_code == bare.status_code == 200
+        assert prefixed.json() == bare.json()
 
 
 def fresh_account(secret: str) -> Account:

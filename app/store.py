@@ -19,7 +19,7 @@ import uuid
 from contextlib import closing
 
 from . import egress, logs, settings
-from .models import PROVIDERS, Account, Status, jwt_upstream_uid
+from .models import PROVIDERS, Account, Status, jwt_upstream_uid, window_usable
 
 _TBL = "accounts"
 _META = "meta"
@@ -626,7 +626,22 @@ class Store:
         2. 负载均衡分配（新请求 或 亲和号满载/不可用时溢出）：
            - 过滤掉 is_selectable 为 False、在 skip_ids 中、或已达并发上限（inflight >= max_inflight）的账号；
            - 主排序：当前在飞数 inflight 升序（最小负载优先）；
-           - 次排序：距离当前轮询指针的偏移量（保证在负载相同时均匀轮流分配到不同账号）；
+           - 次排序：最大剩余额度降序（同负载下优先大余额号。凌晨全池 inflight=0
+             全平局时，纯轮询会把「只剩 5M」与「剩 3.05 亿」同权重随机分——
+             2026-11-17 线上实证 use_count 长期失衡 4034 vs 68）。口径与
+             window_usable 对齐：只数「remaining>0 且未过期」的窗口——已过期
+             大窗不排富（快照陈旧期不得把流量导向真实无量的号）；窗口缺
+             remaining 时按 total-used 回填（上游有的窗口只给 total/used）。
+             全部不可用时记 0：未知快照（新号）**劣于**已知正余额号（其流量
+             保障来自 inflight 主排序与全池未知时的轮询退化），全池未知退化为
+             纯轮询；
+           - 模型感知（2.7.55）：指定 model 时只看**该模型**的窗口排富——
+             「GLM-5.3 rem=0 但 Flash 有 2.9 亿」的号在 GLM-5.3 请求眼里记 0，
+             不再凭无关窗口的富余额被优先选中（2026-11-17 线上实证：plan_guard
+             冷却被夜间重启洗掉后，这种号被排富前排、每请求撞一次必然失败的
+             1005）。快照不含该模型窗口 = 额度未知 = 记 0（不歧视新号，行为
+             与全池未知退化轮询一致）；model=None 保持原 max 口径。
+           - 末排序：距离当前轮询指针的偏移量（额度同档时均匀轮换）；
            - 更新轮询指针为选中账号的下一位。
         """
         skip_ids = skip_ids or set()
@@ -699,14 +714,78 @@ class Store:
             cur_rot = self._rotation.get(provider, 0)
             n = len(pool)
 
-            # 负载优先（最小在飞请求数），相同负载下按轮询偏移平局
+            def _max_remaining(a: Account) -> int:
+                """该号额度快照中最大的有效余量（全部不可用 = 0）。
+
+                只做「同负载平局打破」用，非精确配额——max 而非 sum 是因为
+                多模型窗口不可互抵（Flash 池与 Coding 池各自独立账本）。
+                口径与 window_usable 对齐（2.7.51）：
+                  - 已过期窗口不计入：快照陈旧期不得让过期大窗排富，把流量
+                    导向真实无量的号（各处额度判定同一哲学）；
+                  - remaining 缺失按 total-used 回填（上游有的窗口只给
+                    total/used，window_usable 的「未知但有量」同源）；
+                  - 全部窗口不可用/快照未知 → 0（劣于已知正余额号）。
+                模型感知（2.7.55）：model 指定时只数该模型窗口；快照不含该
+                窗口 = 额度未知 = 记 0（等价于「无此模型余量」，冷却丢失时
+                也不被无关窗口排富选中）。
+                """
+                windows = (a.quota or {}).values()
+                if model:
+                    # 窗口名精确匹配（billing 快照窗口名 = entitlement show_name，
+                    # 与请求 model 串同一形态，如 "GLM-5.3" / "GLM-5.3-Flash"）
+                    w = (a.quota or {}).get(model)
+                    windows = [w] if isinstance(w, dict) else []
+                vals: list[int] = []
+                for w in windows:
+                    if not isinstance(w, dict):
+                        continue
+                    if not window_usable(w, now):
+                        continue
+                    rem = w.get("remaining")
+                    if rem is None:
+                        rem = max(
+                            0,
+                            (w.get("total") or 0) - (w.get("used") or 0),
+                        )
+                    vals.append(rem or 0)
+                return max(vals) if vals else 0
+
+            # 负载优先（最小在飞），同负载下大余额优先，再按轮询偏移平局。
+            # 余额平局带：额度只在相对容差内才算「同档」——精确整数比较下
+            # 快照间必然有微小漂移（used 逐请求累加），轮换偏移将永远被第二级
+            # 压过、形同虚设（2026-11-17 tebi 实证：9 号全在 2.83~2.96 亿档，
+            # 差距 <5%，连选 8 次恒中同一号）。容差带内视为同档交还轮换偏移；
+            # 带外（rj > rk*(1+tol)）大余额才优先。单一判定式避免双口径打架
+            # （abs 差值 vs 比例式在边界互相矛盾——1.05亿 vs 1亿曾被判带内）。
+            tol = settings.SELECT_TIE_TOLERANCE
+
+            # 预计算各候选的有效余量（避免 O(n²) 窗口扫描）
+            rems = [_max_remaining(a) for a in pool]
+
             best_idx = 0
-            best_tuple = (inflight_map.get(pool[0].id, 0), (0 - cur_rot) % n)
+            best_tuple = (
+                inflight_map.get(pool[0].id, 0),
+                -rems[0],
+                (0 - cur_rot) % n,
+            )
             for i in range(1, n):
-                cur_tuple = (inflight_map.get(pool[i].id, 0), (i - cur_rot) % n)
-                if cur_tuple < best_tuple:
-                    best_tuple = cur_tuple
+                cur_inflight = inflight_map.get(pool[i].id, 0)
+                if cur_inflight < best_tuple[0]:
+                    # 主排序：负载更低者直接胜出（余额只在同负载时参与）
+                    best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
                     best_idx = i
+                elif cur_inflight > best_tuple[0]:
+                    continue
+                # 同负载：带外显著更富者胜；容差带内按轮换偏移
+                elif rems[i] > rems[best_idx] * (1 + tol):
+                    best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
+                    best_idx = i
+                elif not rems[best_idx] > rems[i] * (1 + tol):
+                    # 带内（含相等）→ 轮换偏移决定
+                    if (i - cur_rot) % n < best_tuple[2]:
+                        best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
+                        best_idx = i
+                # else：best 显著更富（带外），保持 best
 
             account = pool[best_idx]
             self._rotation[provider] = (best_idx + 1) % n
