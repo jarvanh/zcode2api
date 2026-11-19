@@ -455,7 +455,8 @@ def test_get_verify_param_retries_override_reaches_solve(monkeypatch):
     async def _config(tag=None, proxy=None):
         return {"sceneId": "s", "region": "cn", "prefix": "p"}
 
-    async def _solve(config, tag=egress.DIRECT, proxy=None, max_retries=None):
+    async def _solve(config, tag=egress.DIRECT, proxy_url=None, proxy=None,
+                    max_retries=None):
         seen["max_retries"] = max_retries
         return None, "SLIDEX_FAIL=DEADLINE"
 

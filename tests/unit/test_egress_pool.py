@@ -1184,6 +1184,11 @@ async def test_rebalance_debounce_stamped_at_end(tp_mode, monkeypatch):
     monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
     monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
 
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
     async def _empty_snapshot():
         return {}, set()
 

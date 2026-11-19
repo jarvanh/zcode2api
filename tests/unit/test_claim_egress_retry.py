@@ -309,7 +309,7 @@ def test_acceptance_failure_breaks_plan_loop(monkeypatch, tp_mode):
 
     monkeypatch.setattr(claim, "claim", fake_claim)
 
-    async def fake_preview(account):
+    async def fake_preview(account, **_kw):
         return [{"plan_id": "p1", "name": "P1", "priority": 2, "grants": []},
                 {"plan_id": "p2", "name": "P2", "priority": 1, "grants": []}]
 
@@ -334,7 +334,7 @@ def test_403_claim_error_breaks_plan_loop(monkeypatch, tp_mode):
 
     monkeypatch.setattr(claim, "claim", fake_claim)
 
-    async def fake_preview(account):
+    async def fake_preview(account, **_kw):
         return [{"plan_id": "p1", "name": "P1", "priority": 2, "grants": []},
                 {"plan_id": "p2", "name": "P2", "priority": 1, "grants": []}]
 
@@ -356,11 +356,11 @@ def test_claim_passes_claim_retries_budget(monkeypatch, tp_mode):
     acc.mode = "jwt"
     seen: dict = {}
 
-    async def fake_gvp(egress_tag=None, proxy=None, retries=None):
+    async def fake_gvp(egress_tag=None, proxy=None, proxy_url=None, retries=None):
         seen["retries"] = retries
         return "param-x", "cn"
 
-    async def fake_config(egress_tag=None, proxy=None):
+    async def fake_config(egress_tag=None, proxy=None, proxy_url=None):
         return {"region": "cn"}
 
     async def fake_billing(account, method, path, **kwargs):

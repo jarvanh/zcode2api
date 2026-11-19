@@ -334,7 +334,9 @@ class TestConfigFetchProxyFallback:
         monkeypatch.setattr(captcha_module.httpx, "AsyncClient", _Client)
         cfg = await mgr.fetch_config(egress.PROXY, proxy_url="http://127.0.0.1:7891")
 
-        assert cfg["region"] == "sgp"
+        # 上游 2.7.66：sgp 端点 traceless 全败（同出口 cn 一次成功），配置落地
+        # 时统一归一 cn——令牌出口与请求出口一致的口径不受影响。
+        assert cfg["region"] == "cn"
         assert calls[0]["proxy"] == "http://127.0.0.1:7891"
         assert calls[0]["trust_env"] is False
         # 代理失败后的回退：直连、且不碰 env 代理

@@ -16,13 +16,16 @@ from app.models import Account
 
 
 class _StubCaptcha:
-    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None,
+                               proxy_url: str | None = None,
+                               retries: int | None = None) -> tuple[str, str | None]:
         return "mock-verify-param", None
 
     def invalidate(self, tag: str | None = None) -> None:
         pass
 
-    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+    async def fetch_config(self, egress_tag: str | None = None,
+                           proxy_url: str | None = None) -> dict:
         return {"region": "cn"}
 
 

@@ -428,7 +428,9 @@ async def test_round_stagger_delays_between_accounts(monkeypatch):
 
     manager = ClaimRoundManager()
     await manager._round()
-    assert sleeps == [90], "第二个账号前必须等待 0～stagger 的随机延迟"
+    # 2.7.68 轮级预算：每账号先有一次 wait_for(剩余预算)，随后才轮到错峰等待。
+    assert 90 in sleeps, f"第二个账号前必须等待 0～stagger 的随机延迟，实际 {sleeps}"
+    assert any(s > 0 and s != 90 for s in sleeps), "轮级预算等待缺失"
     assert claim_module.ClaimRoundManager() is not manager  # sanity: 实例独立
 
 

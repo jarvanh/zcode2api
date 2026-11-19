@@ -34,11 +34,11 @@ def env(gateway_client, fresh_app, monkeypatch):
         def __init__(self):
             self.solve_count = 0
 
-        async def get_verify_param(self, egress_tag=None):
+        async def get_verify_param(self, egress_tag=None, proxy_url=None, retries=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
-        async def fetch_config(self, egress_tag=None):
+        async def fetch_config(self, egress_tag=None, proxy_url=None):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp"}
 
         def invalidate(self, tag=None):

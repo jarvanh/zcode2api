@@ -68,7 +68,7 @@ class TestWakeOnTake:
         monkeypatch.setattr(settings, "CAPTCHA_IDLE_AFTER", 600)
         assert mgr._idle() is True
 
-        async def raced(config, tag, proxy_url=None):
+        async def raced(config, tag, proxy_url=None, **_kw):
             mgr._put(_token(), tag)
             return mgr._pop_fresh(tag)
 
@@ -105,11 +105,11 @@ class TestRaceLateArrival:
 
         release = asyncio.Event()
 
-        async def slow_solve(config, tag, proxy_url=None):
+        async def slow_solve(config, tag, proxy_url=None, **_kw):
             await asyncio.wait_for(release.wait(), timeout=5)
-            return _token()
+            return _token(), None
 
-        async def solve_one(config, tag, proxy_url=None):
+        async def solve_one(config, tag, proxy_url=None, **_kw):
             return await slow_solve(config, tag, proxy_url)
 
         monkeypatch.setattr(mgr, "_solve_one", solve_one)

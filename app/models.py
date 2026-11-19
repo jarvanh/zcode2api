@@ -821,8 +821,6 @@ class Account:
             # 通道级风控：该模型的服务通道全在冷却中 → 跳过该号（其余模型、其余
             # 账号仍可用；不再因一条 grant 腿被拦而整号退出轮询）
             return False
-        if self.status == Status.EXHAUSTED:
-            return False
         if self.status in (Status.INVALID, Status.DISABLED):
             # 回退通道（api.z.ai + API Key）花的是 Key 自己的额度，与套餐快照无关。
             return self.has_apikey_fallback()

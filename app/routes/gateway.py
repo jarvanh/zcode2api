@@ -3845,7 +3845,6 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             status_code=429, attempt=retries_429,
                             max_attempts=settings.RETRY_429_TIMES):
                         retries_429 += 1
-                        retries_429 += 1
                         reqlog.note_retry(req_id, "429")
                         concurrency_hit = busy_hit
                         wait = retry_policy.retry_delay(

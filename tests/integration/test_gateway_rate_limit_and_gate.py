@@ -186,6 +186,8 @@ class TestConcurrencyFamily:
         monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
         monkeypatch.setattr(settings, "RETRY_429_TIMES", 3)
         monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 0)
+        # fork 的「429 换号优先」默认开：本用例验证旧原地重试路径，需关掉。
+        monkeypatch.setattr(settings, "RETRY_429_FAILOVER_FIRST", False)
         _acc1 = seed_account(fresh_app, _JWT_CGV_OFF, name="a-giveup-off")
         _acc2 = seed_account(fresh_app, _JWT_COK2, name="a-giveup-off-next")
         mock.state.sequences[_JWT_CGV_OFF[:16]] = ["concurrency_3008"]
@@ -195,7 +197,8 @@ class TestConcurrencyFamily:
         before_ok2 = _count(mock, _JWT_COK2)
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
-        assert _count(mock, _JWT_CGV_OFF) - before_off == 4   # 1 + RETRY_429_TIMES=3 全耗完
+        # fork 的 3008 语义：首击 + BUSY_WAITS 官方节奏（1s/2s）原地重问。
+        assert _count(mock, _JWT_CGV_OFF) - before_off == 1 + len(settings.BUSY_WAITS)
         assert _count(mock, _JWT_COK2) - before_ok2 == 1
 
 
@@ -556,7 +559,7 @@ class TestNoBalance1113:
         # 冷却记忆生效：第二个请求不再撞上游（151 次重探循环的根治点）
         before2 = len(mock.state.calls)
         res2 = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res2.status_code == 503
+        assert res2.status_code == 402
         assert not _paths(mock, before2)
 
         # 后台手动启用 = 明确重试意图：清冷却（走 admin 端点，store 直调不清）
@@ -1258,7 +1261,8 @@ class TestPlanModelExhaust:
         mock.state.sequences[self._JWT_ME1[:16]] = ["quota_exhausted_200"]
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503
+        # fork 口径：单号池额度耗尽 → 402（OmniRoute quota_exhausted 语义）
+        assert res.status_code == 402
         assert plan_guard.cooling(acc.id, "GLM-5.3")
 
         # 重启模拟：内存态清零（新进程形态）——盘上条目应救回冷却记忆
