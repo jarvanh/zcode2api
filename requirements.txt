@@ -12,3 +12,10 @@ pytest-asyncio>=0.23.0
 pytest-cov>=5.0.0
 ruff>=0.5.0
 mypy>=1.10.0
+
+# 验证码求解链依赖（2026-11-20 补）：网关 solver 子进程用 venv 自带 python
+# (sys.executable)，venv 缺这两项时 slidex 路线直接 EXC:ModuleNotFoundError，
+# claim 全链 0 成功（11-17~11-20 实锤）。版本按 runner 契约钉 0.13.3（0.14.x
+# 改了 provider 内部行为，未验证过不跟随）。
+playwright>=1.45.0
+slidex @ git+https://github.com/dengyie/slidex@55167be2d2934541443a6499d1261fc073397854
