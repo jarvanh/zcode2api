@@ -863,6 +863,81 @@ def stats() -> dict:
         }
 
 
+def hourly(window_hours: int = 24) -> list[dict]:
+    """逐小时聚合（2.7.71 监控增强，管理端监控页/巡检用）。
+
+    每小时桶：请求数、成败、p95/最大总时长、峰值并发（区间重叠扫描，在飞请求
+    会计入其起始小时的并发窗口）、模型分布 TOP3。覆盖内存环（KEEP 条）——
+    比环更早的小时缺席，不做持久化回扫。按小时升序。"""
+    from collections import Counter
+
+    now = time.time()
+    intervals: list[tuple[float, float]] = []   # (start, end) 成对区间，逐桶裁剪扫描
+    buckets: dict[int, dict] = {}
+
+    def bucket(h: int) -> dict:
+        b = buckets.get(h)
+        if b is None:
+            b = {
+                "hour_start": h * 3600,
+                "hour": time.strftime("%m-%d %H时", time.localtime(h * 3600)),
+                "reqs": 0, "ok": 0, "fail": 0, "inflight_now": 0,
+                "p95_t_total": None, "max_t_total": None,
+                "peak_concurrency": 0, "models": {},
+            }
+            buckets[h] = b
+        return b
+
+    with _lock:
+        for e in _entries:
+            ts = e.get("ts") or 0
+            if ts <= 0:
+                continue
+            ok = e.get("ok")
+            b = bucket(int(ts // 3600))
+            b["reqs"] += 1
+            if ok is True:
+                b["ok"] += 1
+            elif ok is False:
+                b["fail"] += 1
+            m = e.get("model")
+            if m:
+                b["models"][m] = b["models"].get(m, 0) + 1
+            tt = e.get("t_total")
+            if isinstance(tt, (int, float)) and tt >= 0:
+                b.setdefault("_tt", []).append(tt)
+            dur = max(tt or 0, 0.5)
+            if ok is None:
+                # 在飞：并发窗口一直开到当前时刻
+                intervals.append((ts, now))
+                b["inflight_now"] += 1
+            else:
+                intervals.append((ts, ts + dur))
+
+    for b in buckets.values():
+        tts = sorted(b.pop("_tt", []))
+        if tts:
+            b["p95_t_total"] = round(tts[min(len(tts) - 1, int(len(tts) * 0.95))], 2)
+            b["max_t_total"] = round(tts[-1], 2)
+        # 并发扫描：与本小时有交集的区间裁剪到 [h0, h1) 后排序扫描
+        # （2.7.71 修正：原先 delta 事件流混入跨小时区间导致峰值虚高）
+        h0, h1 = b["hour_start"], b["hour_start"] + 3600
+        segs = sorted((max(s, h0), min(e, h1)) for s, e in intervals
+                      if s < h1 and e > h0)
+        ev: list[tuple[float, int]] = []
+        for s, e in segs:
+            ev.append((s, 1))
+            ev.append((e, -1))
+        ev.sort(key=lambda x: (x[0], x[1]))
+        cur = peak = 0
+        for _t, d in ev:
+            cur += d
+            peak = max(peak, cur)
+        b["peak_concurrency"] = peak
+        b["models"] = dict(Counter(b["models"]).most_common(3))
+    return [buckets[h] for h in sorted(buckets)]
+
+
 def clear() -> None:
     """清空内存实时层（磁盘历史不受影响）。
 

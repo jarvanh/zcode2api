@@ -18,7 +18,7 @@ import pytest
 from app import egress, egress_pool, settings
 from app import store as store_mod
 from app.egress_pool import gateway_url_for
-from app.models import Account
+from app.models import Account, Status
 
 # autouse fixture 会把 probe_alicdn 换成恒过假探针；probe_alicdn 本体的
 # 单测需要真实现——在 import 期（fixture 生效前）捕获原函数引用。
@@ -410,7 +410,7 @@ async def test_rebalance_gateway_abort_aligns_binding(tp_mode, monkeypatch):
         seq["probe"] += 1
         return {"node_name": f"node-cand-{seq['probe']}"}
 
-    async def fake_probe(account, proxy_url, jwt):
+    async def fake_probe(self, account, proxy_url, jwt):
         return 0, "ConnectError: dead"  # 全部候选连接级失败（网关死的形态）
 
     async def fake_snapshot():
@@ -420,7 +420,7 @@ async def test_rebalance_gateway_abort_aligns_binding(tp_mode, monkeypatch):
     monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
     monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
     monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
-    monkeypatch.setattr(egress_pool.egress_pool, "_probe_via", fake_probe)
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", fake_probe)
 
     acc = _account(acc_id="acc-r1", name="r1")
     acc.egress_node = "node-old"
@@ -444,14 +444,14 @@ async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
     async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
         return {"node_name": f"node-cand-{seq['probe']}"}
 
-    async def fake_probe(account, proxy_url, jwt):
+    async def fake_probe(self, account, proxy_url, jwt):
         seq["probe"] += 1
         return 0, "ConnectError: dead"  # 前三轮全部探不通
 
     monkeypatch.setattr(settings, "TP_GATEWAY_FAIL_ABORT", 0)
     monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
     monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
-    monkeypatch.setattr(egress_pool.egress_pool, "_probe_via", fake_probe)
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", fake_probe)
 
     acc = _account(acc_id="acc-r1", name="r1")
     acc.egress_node = "node-old"
@@ -1185,7 +1185,7 @@ async def test_rebalance_debounce_stamped_at_end(tp_mode, monkeypatch):
     monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
 
     async def _probe_ok(self, account, proxy_url, jwt):
-        return 405, '{"code":3012}'
+        return 405, '{"code":3012}'  # JSON-APP：候选验收放行
 
     monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
 
@@ -1286,3 +1286,202 @@ async def test_ensure_binding_listeners_supply_no_tp(tp_mode, monkeypatch):
     assert ok is True
     assert acquire_calls == [], "listeners 供给下绑定引导不得打 TP"
 
+
+# ── listeners 供给健康探针（2.7.69）──────────────────────────────────────────
+@pytest.fixture
+def listeners_mode(monkeypatch):
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "listeners")
+    monkeypatch.setattr(settings, "TP_HEALTH_FAIL_THRESHOLD", 2)
+    monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 300)
+    monkeypatch.setattr(settings, "CONNECT_FAIL_COOLDOWN", 60)
+
+
+def _listener_account(acc_id="acc-lis", name="lis1"):
+    acc = _account(acc_id=acc_id, name=name)
+    acc.egress = "http://127.0.0.1:11031"
+    acc.status = Status.ACTIVE
+    return acc
+
+
+@pytest.mark.asyncio
+async def test_listener_health_cooldowns_after_streak(listeners_mode, monkeypatch, tmp_path):
+    """探针连败达阈值 → 冷却一个健康周期（轮询绕开死出口）；连败期不重置
+    streak，下轮探针仍败立即续冷（死出口不再进入可选窗口）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "lis1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+    acc.status = Status.ACTIVE
+
+    async def fail_probe(account):
+        return False
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fail_probe)
+
+    await egress_pool.egress_pool._check_listener(acc)  # 单败：只留痕
+    assert acc.status == Status.ACTIVE
+    await egress_pool.egress_pool._check_listener(acc)  # 连败 2：冷却
+    assert acc.status == Status.COOLING
+    assert acc.cooling_until is not None
+    assert acc.id in egress_pool.egress_pool._listener_cooled
+    cool_at = acc.cooling_until
+
+    await egress_pool.egress_pool._check_listener(acc)  # 第 3 轮仍败：续冷（不重置 streak）
+    assert acc.status == Status.COOLING
+    assert acc.cooling_until >= cool_at
+    assert egress_pool.egress_pool._probe_fail_streak.get(acc.id, 0) >= 2
+
+
+@pytest.mark.asyncio
+async def test_listener_health_recovers_on_green_probe(listeners_mode, monkeypatch, tmp_path):
+    """冷却后探针转好 → streak 清零 + 解除本循环下的冷却复活选号。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "lis1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+    acc.status = Status.ACTIVE
+
+    probe_ok = {"val": False}
+
+    async def flip_probe(account):
+        return probe_ok["val"]
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", flip_probe)
+
+    probe_ok["val"] = False
+    await egress_pool.egress_pool._check_listener(acc)
+    await egress_pool.egress_pool._check_listener(acc)
+    assert acc.status == Status.COOLING
+
+    probe_ok["val"] = True
+    await egress_pool.egress_pool._check_listener(acc)
+    assert acc.status == Status.ACTIVE
+    assert acc.cooling_until is None
+    assert acc.id not in egress_pool.egress_pool._listener_cooled
+    assert egress_pool.egress_pool._probe_fail_streak.get(acc.id) is None
+
+
+@pytest.mark.asyncio
+async def test_listener_recovery_does_not_touch_foreign_states(listeners_mode, monkeypatch, tmp_path):
+    """复活只解除**本循环**的冷却：EXHAUSTED/非本循环冷却等外部状态不被洗掉
+    （额度状态机归 quota.py，健康探针不越权）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "lis1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+
+    async def ok_probe(account):
+        return True
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", ok_probe)
+
+    # 状态 COOLING 但不是本循环冷却的（gateway 侧风控冷却）→ 探针通不越权复活
+    acc.status = Status.COOLING
+    acc.cooling_until = time.time() + 900
+    await egress_pool.egress_pool._check_listener(acc)
+    assert acc.id not in egress_pool.egress_pool._listener_cooled
+    assert acc.status == Status.COOLING
+    assert acc.cooling_until is not None
+
+    # EXHAUSTED 同理不越权
+    acc.status = Status.EXHAUSTED
+    await egress_pool.egress_pool._check_listener(acc)
+    assert acc.status == Status.EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_health_loop_dispatches_by_supply_mode(listeners_mode, monkeypatch, tmp_path):
+    """循环按供给模式分派：listeners 下探 listener 出口账号，TP 网关形态
+    残留的 egress 不探；tetherpool 账号检查路径不被误调。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 0)
+
+    acc = store.add_account("zai", "lis1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+    # ⚠️ token 必须与 lis1 不同：add_account 按 uid 去重，同 token 会返回
+    # 同一账号对象（视为换签回写），stale 就成了 acc 自己
+    stale = store.add_account("zai", "stale1", "h.eyJzdWIiOiJzIn0.sig")
+    stale.enabled = True
+    stale.egress = egress.tetherpool_gateway_url(stale)  # 模式残留：不探
+
+    calls = {"listener": 0, "tp": 0}
+
+    async def fake_listener(account):
+        calls["listener"] += 1
+
+    async def fake_tp(account):
+        calls["tp"] += 1
+
+    monkeypatch.setattr(egress_pool.egress_pool, "_check_listener", fake_listener)
+    monkeypatch.setattr(egress_pool.egress_pool, "_check_account", fake_tp)
+    # 单例 _loop_task 可能挂在前面测试已关闭的事件循环上（done() 恒 False），
+    # 不重置会让 start() 拒绝在当前 loop 上起新任务 → 派发计数恒 0
+    egress_pool.egress_pool._loop_task = None
+
+    egress_pool.egress_pool.start()
+    try:
+        await asyncio.sleep(0.15)
+    finally:
+        await egress_pool.egress_pool.stop()
+    assert calls["listener"] >= 1
+    assert calls["tp"] == 0
+
+
+@pytest.mark.asyncio
+async def test_listener_health_respects_external_states(listeners_mode, monkeypatch, tmp_path):
+    """2.7.70 根修：探针连败不得洗外部状态——
+    ① DISABLED（风控禁用，enabled 仍 True 会被循环纳入）：不覆写、不进 _listener_cooled；
+    ② 外部 COOLING（风控指数退避中）：不得被探针冷却缩短；
+    ③ INVALID（废 JWT）：同 ①。streak 照常累计供观测。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+
+    async def fail_probe(account):
+        return False
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fail_probe)
+
+    for status_val in (Status.DISABLED, Status.INVALID):
+        acc = store.add_account("zai", f"ext-{status_val}", "h.eyJzdWIiOiJ1In0.sig")
+        acc.enabled = True
+        acc.egress = "http://127.0.0.1:11031"
+        acc.status = status_val
+        for _ in range(3):
+            await egress_pool.egress_pool._check_listener(acc)
+        assert acc.status == status_val, f"{status_val} 不得被洗"
+        assert acc.id not in egress_pool.egress_pool._listener_cooled
+        assert egress_pool.egress_pool._probe_fail_streak.get(acc.id, 0) >= 2
+
+    # 外部 COOLING（风控退避 1500s）：探针连败不得缩短其冷却
+    acc = store.add_account("zai", "ext-cool", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+    acc.status = Status.COOLING
+    acc.cooling_until = time.time() + 1500
+    for _ in range(3):
+        await egress_pool.egress_pool._check_listener(acc)
+    assert acc.status == Status.COOLING
+    assert acc.cooling_until > time.time() + 1400, "外部风控冷却不得被缩短"
+    assert acc.id not in egress_pool.egress_pool._listener_cooled
+
+    # 对照：本循环自己冷却的号，探针仍败 → 续冷不受守卫影响
+    mine = store.add_account("zai", "mine-cool", "h.eyJzdWIiOiJ1In0.sig")
+    mine.enabled = True
+    mine.egress = "http://127.0.0.1:11031"
+    mine.status = Status.ACTIVE
+    egress_pool.egress_pool._listener_cooled.add(mine.id)
+    egress_pool.egress_pool._probe_fail_streak[mine.id] = 5
+    await egress_pool.egress_pool._check_listener(mine)
+    assert mine.status == Status.COOLING
+    assert mine.id in egress_pool.egress_pool._listener_cooled
