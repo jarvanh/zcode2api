@@ -51,6 +51,24 @@ def test_version_mismatch_with_gateway_is_stale(_isolated_sections):
     assert any("≠ 网关身份版本" in p for p in st["problems"])
 
 
+def test_local_client_older_than_sidecar_is_not_stale(_isolated_sections, monkeypatch):
+    """网关跟预览新轨、本机官方运行时未更新 → 不是过时（2026-11-20 3.19.0 实例）。"""
+    _isolated_sections["meta"] = _meta()
+    monkeypatch.setattr(freshness.hostinfo, "local_client_version", lambda: "3.18.2")
+    st = freshness.status()
+    assert not st["stale"], st["problems"]
+    assert st["local_client_version"] == "3.18.2"
+
+
+def test_local_client_newer_than_sidecar_is_stale(_isolated_sections, monkeypatch):
+    """本机官方运行时已升版而真源未跟：仍必须告警。"""
+    _isolated_sections["meta"] = _meta(version="3.18.2", captured="2026-11-16")
+    monkeypatch.setattr(freshness.hostinfo, "local_client_version", lambda: "3.19.0")
+    st = freshness.status()
+    assert st["stale"]
+    assert any("新于真源" in p for p in st["problems"])
+
+
 def test_prompt_aligned_mismatch_is_stale(_isolated_sections):
     """正文锁版本与 _meta 不同步（只抬 PROMPT_ALIGNED_VERSION 没移植文本）必须告警。"""
     _isolated_sections["meta"] = _meta()

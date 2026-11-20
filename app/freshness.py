@@ -70,7 +70,13 @@ def status() -> dict:
                     + ("（正文锁与 _meta 必须同升）" if label.startswith("提示词") else "")
                 )
         if local_ver and local_ver != sidecar_ver:
-            problems.append(f"本机官方客户端 {local_ver} ≠ 真源 {sidecar_ver}，官方可能已升版")
+            # 方向敏感：本机运行时「旧于」真源 = 网关已跟到预览通道、本机未更新，属正常
+            # （2026-11-20 3.19.0 预览首发时本机仍 3.18.2）；只有本机「新于」真源
+            # 才说明官方已发新版、真源可能过时。
+            if constants.is_newer_version(local_ver, sidecar_ver):
+                problems.append(
+                    f"本机官方客户端 {local_ver} 新于真源 {sidecar_ver}，官方可能已升版"
+                )
     # billing 侧一致性（claim/billing 全链路用 BILLING_APP_VERSION）：只改一个
     # 常量的「半更新」正是 2026-10-31 那轮「领取失败/措辞过时」的组合病因
     if constants.BILLING_APP_VERSION != constants.CLIENT_APP_VERSION:

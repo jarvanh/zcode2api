@@ -50,11 +50,17 @@ def _warn_version_drift() -> None:
     local = hostinfo.local_client_version()
     if not local:
         return
-    if local != constants.BILLING_APP_VERSION:
+    if constants.is_newer_version(local, constants.BILLING_APP_VERSION):
         logs.warn(
             "version",
-            f"钉定的客户端版本 {constants.BILLING_APP_VERSION} 落后于本机官方 "
-            f"{local}：改 app/constants.py 的 BILLING_APP_VERSION/CLIENT_APP_VERSION",
+            f"本机官方客户端 {local} 新于钉定的客户端版本 {constants.BILLING_APP_VERSION}："
+            "改 app/constants.py 的 BILLING_APP_VERSION/CLIENT_APP_VERSION",
+        )
+    elif local != constants.BILLING_APP_VERSION:
+        logs.info(
+            "version",
+            f"网关已跟进 {constants.BILLING_APP_VERSION}（预览/新轨），本机官方 {local} 未更新，"
+            "不视为落伍",
         )
     else:
         logs.info("version", f"客户端版本对齐官方 {local}")
