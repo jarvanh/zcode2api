@@ -129,11 +129,12 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.18.2"`（官方
-现行版实证：electron 清单 channel=1/3 均报 3.18.2（2026-11-16 实测），本机
-server runtime 3.18.2；其 `runtime/zcode.cjs` 与官方源码 tag v3.18.2 对齐，
-与 3.18.1 逐段比对**正文完全同文**，仅版本号差异；前值 3.18.1 为 2026-11-11、
-3.18.0 为 2026-11-12、3.17.2 为 2026-11-09、3.17.1 为 2026-10-31。
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.19.0"`（官方
+预览清单 channel=3 已发 3.19.0、稳定清单 channel=1 仍报 3.18.2（2026-11-20 实测），
+本机 server runtime 3.18.2；取 3.19.0 官方 Linux AppImage 解包 `resources/glm/zcode.cjs`
+对拍，五段与 3.18.2 **正文完全同文**、Desktop 段仍 `meta_user`+`dynamic`，仅版本号
+差异；前值 3.18.2 为 2026-11-16、3.18.1 为 2026-11-11、3.18.0 为 2026-11-12、
+3.17.2 为 2026-11-09、3.17.1 为 2026-10-31。
 3.18.0 的关键变更：**Desktop 段（# ZCode Desktop Context）随官方移出 system 块2**，
 改由环境公告/meta_user 下发，块2 只剩身份+Harness（由 zcode_system.json _meta 记录）。
 
