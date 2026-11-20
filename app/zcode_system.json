@@ -1,10 +1,10 @@
 {
   "_meta": {
-    "client_version": "3.18.2",
-    "captured_at": "2026-11-16",
-    "source": "ZCode 3.18.2 官方 Linux server runtime（~/.zcode/server/releases/3.18.2-linux-x64-c4ea27fffb92/runtime/zcode.cjs）与官方源码 tag v3.18.2 逐段核对",
-    "verified_by": "3.18.2 bundle 与 3.18.1 文本逐段比对：cliPrefix/身份+Harness/dynamicBehavior/sessionGuidance/contextManagement 全同文；块2 仍只有身份+Harness",
-    "note": "3.18.0 起 Desktop 段移出 system 块2（改由环境公告 meta_user 下发）；3.18.0→3.18.2 无正文变化。升级须同步抬 PROMPT_ALIGNED_VERSION 与 CLIENT_APP_VERSION"
+    "client_version": "3.19.0",
+    "captured_at": "2026-11-20",
+    "source": "ZCode 3.19.0 官方 Linux AppImage（cdn-zcode.z.ai/zcode/electron/releases/3.19.0/linux-x64/ZCode-3.19.0-linux-x64.AppImage，sha512 与预览清单 channel=3 一致）解包 resources/glm/zcode.cjs",
+    "verified_by": "scripts/verify_prompt_text.py 对 3.19.0 构建退出码 0：cliPrefix/stableSections/dynamicBehavior/contextManagement/sessionGuidance 全同文；Desktop 段仍 injectionTarget=meta_user+cacheHint=dynamic（与 3.18.2 相同）",
+    "note": "3.18.0 起 Desktop 段移出 system 块2（改由环境公告 meta_user 下发）；3.18.2→3.19.0 无正文变化、块结构不变。升级须同步抬 PROMPT_ALIGNED_VERSION 与 CLIENT_APP_VERSION"
   },
   "cliPrefix": "You are ZCode, an interactive agent",
   "stableSections": [

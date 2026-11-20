@@ -134,13 +134,13 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
     try:
-        # 模拟「提示词已移植到 3.18.5」：正文锁同步抬高后自动对齐才被允许
-        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "3.18.5")
+        # 模拟「提示词已移植到 3.19.5」：正文锁同步抬高后自动对齐才被允许
+        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "3.19.5")
         mock_info = VersionInfo(
-            version="3.18.5",
-            release_date="2026-11-05",
-            release_name="Release v3.18.5",
-            release_notes="Notes 3.18.5",
+            version="3.19.5",
+            release_date="2026-11-25",
+            release_name="Release v3.19.5",
+            release_notes="Notes 3.19.5",
             checked_at=123456.0,
         )
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
@@ -151,9 +151,9 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
         assert res["has_update"] is True
         assert res["updated"] is True
         assert res["prompt_port_required"] is False
-        assert res["latest_version"] == "3.18.5"
-        assert constants.CLIENT_APP_VERSION == "3.18.5"
-        assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
+        assert res["latest_version"] == "3.19.5"
+        assert constants.CLIENT_APP_VERSION == "3.19.5"
+        assert fresh_app.get_setting("zcode_latest_version") == "3.19.5"
     finally:
         constants.set_active_version(orig)
 
@@ -169,7 +169,7 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
     orig = constants.CLIENT_APP_VERSION
     try:
         mock_info = VersionInfo(
-            version="3.18.5", release_date="2026-11-05", release_name="v3.18.5"
+            version="3.19.5", release_date="2026-11-25", release_name="v3.19.5"
         )
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         fresh_app.set_setting("auto_sync_client_version", "true")
@@ -183,7 +183,7 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
         assert constants.CLIENT_APP_VERSION == orig
         assert constants.BILLING_APP_VERSION == orig
         # 新版本仍落库（后台展示更新日志用）
-        assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
+        assert fresh_app.get_setting("zcode_latest_version") == "3.19.5"
     finally:
         constants.set_active_version(orig)
 
@@ -194,9 +194,9 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
     orig = constants.CLIENT_APP_VERSION
     try:
         mock_info = VersionInfo(
-            version="3.18.9",
-            release_date="2026-11-06",
-            release_name="Release v3.18.9",
+            version="3.19.9",
+            release_date="2026-11-26",
+            release_name="Release v3.19.9",
             release_notes="Notes",
             checked_at=123456.0,
         )
@@ -207,7 +207,7 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
         assert res["ok"] is True
         assert res["has_update"] is True
         assert res["updated"] is False
-        assert res["latest_version"] == "3.18.9"
+        assert res["latest_version"] == "3.19.9"
         # 伪装版本未被自动修改
         assert constants.CLIENT_APP_VERSION == orig
     finally:
@@ -220,16 +220,16 @@ def test_tracker_init_from_store_respects_prompt_lock(fresh_app):
     orig = constants.CLIENT_APP_VERSION
     try:
         fresh_app.set_setting("auto_sync_client_version", "true")
-        fresh_app.set_setting("zcode_latest_version", "3.19.0")
+        fresh_app.set_setting("zcode_latest_version", "3.19.5")
         fresh_app.set_setting(
             "zcode_latest_info",
-            json.dumps({"version": "3.19.0", "release_name": "v3.19.0"}),
+            json.dumps({"version": "3.19.5", "release_name": "v3.19.5"}),
         )
         tracker.init_from_store()
         assert constants.CLIENT_APP_VERSION == orig
         # 最新版本信息仍恢复（后台展示更新日志）
         assert tracker.latest_info is not None
-        assert tracker.latest_info.version == "3.19.0"
+        assert tracker.latest_info.version == "3.19.5"
     finally:
         constants.set_active_version(orig)
 
