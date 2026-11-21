@@ -78,10 +78,12 @@ def status() -> dict:
                     f"本机官方客户端 {local_ver} 新于真源 {sidecar_ver}，官方可能已升版"
                 )
     # billing 侧一致性（claim/billing 全链路用 BILLING_APP_VERSION）：只改一个
-    # 常量的「半更新」正是 2026-10-31 那轮「领取失败/措辞过时」的组合病因
-    if constants.BILLING_APP_VERSION != constants.CLIENT_APP_VERSION:
+    # 常量的「半更新」正是 2026-10-31 那轮「领取失败/措辞过时」的组合病因。
+    # 2026-11-21 双链拆分后 billing 可独立跟随官方 manifest（通常新于 messages），
+    # 只有 billing 旧于身份版本才是「半更新」风险；billing 新于身份属正常。
+    if constants.is_newer_version(constants.CLIENT_APP_VERSION, constants.BILLING_APP_VERSION):
         problems.append(
-            f"billing 版本 {constants.BILLING_APP_VERSION} ≠ 身份版本 "
+            f"billing 版本 {constants.BILLING_APP_VERSION} 旧于身份版本 "
             f"{constants.CLIENT_APP_VERSION}（两个常量须同步升）"
         )
     try:
