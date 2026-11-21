@@ -994,6 +994,7 @@ async def get_settings():
         "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
         "auto_sync_client_version": auto_sync,
         "zcode_client_version": constants.CLIENT_APP_VERSION,
+        "zcode_billing_version": constants.BILLING_APP_VERSION,
         "zcode_latest_version": latest_ver,
         "zcode_latest_channel": getattr(latest, "channel", "") if latest else "",
         # 本机官方运行时版本（~/.zcode/server/current.json appVersion）。桌面端

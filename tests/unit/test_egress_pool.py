@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -902,6 +903,25 @@ async def test_delete_account_handler_releases_tp_allocation(monkeypatch, tp_mod
 
 # ── 2.7.65 review 收尾批次 ──────────────────────────────────────────────────
 @pytest.mark.asyncio
+async def test_tp_acquire_sends_tier_param(monkeypatch, tp_mode):
+    """tier 承诺必须显式上送（2026-11-21）：缺失时 IP-Pool 按 standard_first
+    默认策略把机房 standard 节点粘给 zcode 号——与 gateway URL 的 __tier_
+    username 同源（ZCODE_TP_TIER）。"""
+    calls: list[str] = []
+
+    def _fake_http(method, url, body=None, headers=None, timeout=15):
+        calls.append(url)
+        return 200, '{"node_name": "clash-301-pigeonw-01"}', {}
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+    d = await egress_pool.tp_acquire(_account(acc_id="acc-tier"))
+    assert d and d["node_name"] == "clash-301-pigeonw-01"
+    assert len(calls) == 1
+    # tp_mode 夹具钉 TP_TIER=standard——断言 params 与 env 同源即可
+    assert "tier=standard" in calls[0]
+
+
+@pytest.mark.asyncio
 async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mode):
     """HTTP 200 + body success:false = 无分配可释（幂等成功），必须返回 True
     且不落 warn（2026-11-18 review P3：此前只看状态码）。"""
@@ -909,7 +929,7 @@ async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mo
 
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         calls.append((method, url))
-        return 200, '{"success": false, "error": "no allocation"}'
+        return 200, '{"success": false, "error": "no allocation"}', {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     ok = await egress_pool.tp_release_account("acc-rel")
@@ -923,7 +943,7 @@ async def test_release_account_non_dict_json_is_idempotent_ok(monkeypatch, tp_mo
     按「无法判读」处理为幂等成功（调用方语义：释放尽力而为）。"""
     for raw in ('[1,2]', '"ok"', 'null'):
         def _fake_http(method, url, body=None, headers=None, timeout=15, _raw=raw):
-            return 200, _raw
+            return 200, _raw, {}
         monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
         assert await egress_pool.tp_release_account("acc-nondict") is True, raw
 
@@ -931,7 +951,7 @@ async def test_release_account_non_dict_json_is_idempotent_ok(monkeypatch, tp_mo
 @pytest.mark.asyncio
 async def test_release_account_http_500_returns_false(monkeypatch, tp_mode):
     def _fake_http(method, url, body=None, headers=None, timeout=15):
-        return 500, "boom"
+        return 500, "boom", {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     assert await egress_pool.tp_release_account("acc-rel2") is False
@@ -958,8 +978,8 @@ async def test_snapshot_accepts_aware_and_naive_quarantine(monkeypatch, tp_mode)
 
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         if "/feedback/bans" in url:
-            return 200, json.dumps(payload)
-        return 200, "[]"
+            return 200, json.dumps(payload), {}
+        return 200, "[]", {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _REAL_TP_SNAPSHOT)
@@ -1235,8 +1255,191 @@ async def test_reconcile_orphans_releases_stale_allocations(tp_mode, monkeypatch
                         lambda provider: [_account(acc_id="live-1")])
 
     pool = egress_pool.egress_pool
-    await pool._reconcile_orphans_once(initial_delay=0)
+    await pool._reconcile_once(initial_delay=0)
     assert released == ["stale-old"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_aligns_drifted_record(tp_mode, monkeypatch):
+    """2026-11-21 存量巡检②：hub egress_node ≠ TP 实际绑定（IP-Pool 侧
+    auto_rehome 主动换绑）→ hub 记录对齐地面真值，不做 rebalance。"""
+    updated: list[str] = []
+
+    async def fake_snapshot():
+        return {"zh-live-1": "tp-real-node"}, set()
+
+    acc = _account(acc_id="live-1")
+    acc.egress_node = "hub-stale-node"
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool, "tp_release_account", AsyncMock(return_value=True))
+    monkeypatch.setattr(egress_pool, "PROVIDERS", ("zai",))
+    monkeypatch.setattr("app.store.store.list_accounts", lambda provider: [acc])
+
+    class _SpyStore:
+        @staticmethod
+        def list_accounts(provider):
+            return [acc]
+
+        @staticmethod
+        def update_account(a):
+            updated.append(a.egress_node)
+
+    import app.store as store_mod2
+    monkeypatch.setattr(store_mod2, "store", _SpyStore)
+    # 防御：rebalance 误触发会经这里
+    rb: list = []
+
+    async def _no_rebalance(account, reason, ban=True):
+        rb.append(reason)
+        return True
+
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", _no_rebalance)
+
+    await egress_pool.egress_pool._reconcile_once(initial_delay=0)
+    assert acc.egress_node == "tp-real-node"
+    assert updated == ["tp-real-node"]
+    assert rb == []  # 记录漂移只对齐，不换绑
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rebalances_co_occupied_node(tp_mode, monkeypatch):
+    """2026-11-21 存量巡检③：TP 实际绑定与其它账号分配同节点（软语义降级/
+    auto_rehome 制造的存量共占）→ 强制 rebalance 回收互斥。"""
+    async def fake_snapshot():
+        return {"zh-live-1": "shared-node", "zh-live-2": "shared-node",
+                "zh-live-3": "own-node"}, set()
+
+    a1 = _account(acc_id="live-1", name="a1")
+    a1.egress_node = "shared-node"
+    a2 = _account(acc_id="live-2", name="a2")
+    a2.egress_node = "shared-node"
+    a3 = _account(acc_id="live-3", name="a3")
+    a3.egress_node = "own-node"
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool, "tp_release_account", AsyncMock(return_value=True))
+    monkeypatch.setattr(egress_pool, "PROVIDERS", ("zai",))
+    monkeypatch.setattr("app.store.store.list_accounts",
+                        lambda provider: [a1, a2, a3])
+
+    rebalanced: list[str] = []
+
+    async def _spy_rebalance(account, reason, ban=True):
+        rebalanced.append((account.name, reason))
+        return True
+
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", _spy_rebalance)
+
+    await egress_pool.egress_pool._reconcile_once(initial_delay=0)
+    # 两个共占号都换绑，独占号不动
+    assert sorted(rebalanced) == [("a1", "co_occupancy_reconcile"),
+                                  ("a2", "co_occupancy_reconcile")]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_loop_sweeps_periodically(tp_mode, monkeypatch):
+    """2026-11-21 迭代 review P2：巡检周期化——IP-Pool 数据面 auto_rehome /
+    gateway persist 随时制造新共占，reconcile 不再是启动单次。loop 按
+    TP_RECONCILE_INTERVAL 周期跑 sweep；异常只 warn 不退出。"""
+    sweeps = []
+    booms = []
+
+    async def fake_sweep():
+        sweeps.append(1)
+
+    async def _boom():
+        booms.append(1)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(settings, "TP_RECONCILE_INTERVAL", 0)  # 最短周期
+    monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", fake_sweep)
+
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "tetherpool")
+    loop_task = asyncio.create_task(egress_pool.egress_pool._reconcile_loop())
+    await asyncio.sleep(0.1)
+    assert len(sweeps) >= 2  # interval=0 -> 连跑多轮
+    # 异常不退出：换上抛异常版本后 boom 必须真的发生过（异常路径可达），
+    # 且循环仍在跑到下一轮——boom 计数 > 1 即证明 except 分支后继续 sleep/sweep
+    n0 = len(sweeps)
+    monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", _boom)
+    await asyncio.sleep(0.1)
+    assert booms, "sweep 抛异常路径未被执行"
+    assert len(booms) >= 2, "异常后循环退出——except 分支未兜住（review P3 回归）"
+    assert len(sweeps) == n0, "异常轮不该计入成功 sweep"
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sweep_skips_empty_snapshot_with_warn(tp_mode, monkeypatch, caplog):
+    """review P2：周期 sweep 快照为空（TP 故障 fail-open）→ 跳过整轮但必须
+    打 warn 留痕——静默空转会让 TP 故障期的共占/漂移累积不可观测。"""
+    warned: list = []
+
+    async def fake_snapshot():
+        return {}, set()  # TP 故障/空池
+
+    def _fake_warn(src, msg):
+        warned.append(msg)
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    import app.logs as logs_mod
+    monkeypatch.setattr(logs_mod, "warn", _fake_warn)
+
+    await egress_pool.egress_pool._reconcile_sweep()
+    assert any("快照为空" in m for m in warned)
+
+
+@pytest.mark.asyncio
+async def test_start_idempotent_reconcile_loop(tp_mode, monkeypatch):
+    """review P2：二次 start() 不得覆盖 _reconcile_loop_task 引用——否则
+    旧 while-True 任务泄漏成孤儿（每 30min 空转直到进程退出）。"""
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "tetherpool")
+    monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 300)
+    monkeypatch.setattr(settings, "TP_RECONCILE_INTERVAL", 300)
+
+    pool = egress_pool.egress_pool
+    saved = []
+    real_loop = pool._reconcile_loop
+
+    async def _spy_loop():
+        saved.append(id(asyncio.current_task()))
+        await real_loop()
+
+    monkeypatch.setattr(pool, "_reconcile_loop", _spy_loop)
+    pool.start()
+    try:
+        first = pool._reconcile_loop_task
+        assert first is not None
+        pool.start()  # 二次调用
+        assert pool._reconcile_loop_task is first, \
+            "二次 start 覆盖了巡检循环引用——旧任务泄漏"
+    finally:
+        await pool.stop()
+    assert pool._reconcile_loop_task is None
+
+
+@pytest.mark.asyncio
+async def test_tp_acquire_sends_exclusive_param(tp_mode, monkeypatch):
+    """2026-11-21 硬互斥 opt-in：tp_acquire 必须带 exclusive=true（IP-Pool
+    侧据此剔除本 service 其它账号现占节点），一号一节点从分配源头成立。"""
+    captured: dict = {}
+
+    def _fake_tp_http(method, url, body=None, headers=None, timeout=15):
+        captured["url"] = url
+        return 200, json.dumps({"node_name": "node-x", "exit_ip": "9.9.9.9"}), {}
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_tp_http)
+    acc = _account(acc_id="acc-e")
+    d = await egress_pool.tp_acquire(acc)
+    assert d and d.get("node_name") == "node-x"
+    assert "exclusive=true" in captured["url"]
 
 
 @pytest.mark.asyncio
@@ -1485,3 +1688,103 @@ async def test_listener_health_respects_external_states(listeners_mode, monkeypa
     await egress_pool.egress_pool._check_listener(mine)
     assert mine.status == Status.COOLING
     assert mine.id in egress_pool.egress_pool._listener_cooled
+
+
+# ── tier 泄漏巡检（2026-11-21 P3，tp_acquire tier 固化的守护）────────────────
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_rebalances_leaked_accounts(tp_mode, monkeypatch):
+    """zh- 分配绑定非 TP_TIER 节点 = tier 泄漏 → 自动 rebalance（ban=False）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "leak-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "aws-tokyo-warp-01"  # standard 机房节点（泄漏形态）
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "aws-tokyo-warp-01"}, set()
+
+    async def _tiers():
+        return {"aws-tokyo-warp-01": "standard", "clash-301-pigeonw-01": "premium"}
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+
+    rebalanced = []
+
+    async def _fake_rebalance(self, account, reason, ban=True):
+        rebalanced.append((account.name, reason, ban))
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == [("leak-acc", "tier_leak_audit", False)]
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_passes_when_all_premium(tp_mode, monkeypatch):
+    """全部分配都在承诺 tier 上 = 零动作（不 rebalance、不打扰）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "clean-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "clash-301-pigeonw-01"
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "clash-301-pigeonw-01"}, set()
+
+    async def _tiers():
+        return {"clash-301-pigeonw-01": "premium"}
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+    rebalanced = []
+
+    async def _fake_rebalance(account, reason, ban=True):
+        rebalanced.append(account.name)
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == []
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_fail_open_on_missing_tier_snapshot(tp_mode, monkeypatch):
+    """节点 tier 快照拉取失败（空 dict）= fail-open：巡检跳过，不 rebalance。
+
+    泄漏判定只信地面快照——tier 字段未知（""）的节点同样不算泄漏（防误换）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "failopen-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "aws-tokyo-warp-01"
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "aws-tokyo-warp-01"}, set()
+
+    async def _tiers():
+        return {}  # 快照失败形态
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+
+    rebalanced = []
+
+    async def _fake_rebalance(account, reason, ban=True):
+        rebalanced.append(account.name)
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == []

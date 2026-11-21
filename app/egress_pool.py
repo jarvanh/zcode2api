@@ -52,11 +52,11 @@ def _tp_http(method: str, url: str, body=None, headers=None, timeout: float = 15
                                  headers=headers or {})
     try:
         with _NOPROXY.open(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers or {})
     except Exception as exc:
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, f"{type(exc).__name__}: {exc}", {}
 
 
 def _opener(proxy: str | None):
@@ -164,9 +164,19 @@ async def tp_acquire(account, force_rebalance: bool = False,
         "account_id": "zh-" + str(account.id),
         "region": settings.TP_REGION,
         "type": settings.TP_TYPE,
+        # tier 承诺必须显式上送（2026-11-21）：缺失时 IP-Pool 按 standard_first
+        # 默认策略分配——机房 standard 节点会粘给 zcode 号（claim 风控高危，
+        # IP-Pool 手册实锤「忘带 tier 被弹到全池随机」hub 侧翻版）。与
+        # egress.tetherpool_gateway_url 的 __tier_ username 同源（ZCODE_TP_TIER）。
+        "tier": settings.TP_TIER,
         "region_strict": "true",
         "avoid_banned": "true",
         "avoid_same_isp": "true",
+        # 一号一节点硬互斥（2026-11-21 根修，IP-Pool exclusive=true）：候选与本
+        # service 其它账号现占即剔除，占满回 503 而非共享节点——exclude_node
+        # 软语义在池压下被降级路径绕开（hub 侧 7 组共占实锤），硬互斥从分配
+        # 源头堵住。上游 403/503 → None → 调用方按池枯语义处理。
+        "exclusive": "true",
     }
     if force_rebalance:
         params["force_rebalance"] = "true"
@@ -174,15 +184,23 @@ async def tp_acquire(account, force_rebalance: bool = False,
     if exclude:
         params["exclude_node"] = ",".join(exclude)
     query = urllib.parse.urlencode(params)
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/allocation/acquire?{query}",
         None, _tp_headers(), 20)
     if st != 200:
         from . import logs
         # 归因明细（2.7.68）：此前非 200 一律静默 None，401（token 过期）表现为
         # 「池枯」、与 TP 宕机不可分——状态码透传一条，排障不再盲猜
+        # 互斥占满标记（2026-11-21 迭代）：IP-Pool exclusive 路径占满回 503，
+        # 与真池枯（池容量不足）区分——前者是硬互斥正常工作，等下轮重试即可；
+        # 后者要扩池。识别优先读结构化 header（X-Exhausted-Reason: mutex_exhausted，
+        # iter3 契约），detail 文案匹配保留为旧 IP-Pool 版本兜底。
+        _mutex_full = (_hdrs.get("X-Exhausted-Reason") == "mutex_exhausted"
+                       or "mutex exhausted" in raw or "exclusive exhausted" in raw)
         logs.warn("egress_pool",
-                  f"TP acquire HTTP {st}: {raw.strip()[:120]}（account={account.name}）")
+                  f"TP acquire HTTP {st}: {raw.strip()[:120]}"
+                  f"{'【互斥占满——硬互斥生效，等下轮重试】' if _mutex_full else ''}"
+                  f"（account={account.name}）")
         return None
     try:
         return json.loads(raw)
@@ -199,7 +217,7 @@ async def tp_ban(node_name: str, reason: str, evidence: dict,
     body = {"service": settings.TP_SERVICE, "account": account_name,
             "node_name": node_name, "reason": reason,
             "evidence": {k: str(v)[:120] for k, v in (evidence or {}).items()}}
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/feedback/ban",
         json.dumps(body), _tp_headers(), 15)
     if st in (200, 201, 202):
@@ -218,7 +236,7 @@ async def tp_release_account(account_id: str) -> bool:
     from . import logs
     q = urllib.parse.urlencode({"service": settings.TP_SERVICE,
                                 "account_id": f"zh-{account_id}"})
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/allocation/release?{q}",
         None, _tp_headers(), 15)
     if st == 200:
@@ -253,7 +271,7 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
 
     allocs: dict[str, str] = {}
     banned: set[str] = set()
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "GET",
         f"{settings.TP_API}/v1/allocation/accounts?service={settings.TP_SERVICE}",
         None, _tp_headers(), 15)
@@ -263,7 +281,7 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
                 allocs[a.get("account_id")] = a.get("node_name") or ""
         except ValueError:
             pass
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "GET",
         f"{settings.TP_API}/v1/feedback/bans?service={settings.TP_SERVICE}&limit=300",
         None, _tp_headers(), 15)
@@ -297,11 +315,32 @@ def _edge_kind(raw: str) -> str:
     return "JSON-APP"
 
 
+async def _tp_node_tiers() -> dict[str, str]:
+    """IP-Pool 节点名 → tier 快照（tier 泄漏巡检用，2026-11-21 P3）。
+
+    拉取失败/解析失败返回空 dict（fail-open：巡检跳过，不打扰）。节点清单
+    是全量大响应（900+ 节点 ~650KB），只在巡检节奏调用，不进热路径。"""
+    st, raw, _hdrs = await asyncio.to_thread(
+        _tp_http, "GET", f"{settings.TP_API}/v1/nodes",
+        None, _tp_headers(), 30)
+    if st != 200:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    return {n.get("name") or "": n.get("tier") or ""
+            for n in data if isinstance(n, dict) and n.get("name")}
+
+
 class TetherPoolEgress:
     """per-account TetherPool 出口管理器（单例 egress_pool）。"""
 
     def __init__(self) -> None:
         self._loop_task: asyncio.Task | None = None
+        self._reconcile_loop_task: asyncio.Task | None = None  # 周期巡检常驻循环
         self._rebalance_at: dict[str, float] = {}  # account_id → monotonic 去抖
         self._inflight: set[asyncio.Task] = set()  # 健康检查任务强引用（防 GC）
         self._locks: dict[str, asyncio.Lock] = {}  # account_id → rebalance 互斥
@@ -364,7 +403,11 @@ class TetherPoolEgress:
                       f"无 TP 节点可换——保持绑定 {account.egress_node or ''}")
             return False
         now = time.monotonic()
-        if now - self._rebalance_at.get(account.id, 0) < settings.TP_REBALANCE_DEBOUNCE:
+        last = self._rebalance_at.get(account.id)
+        # last 为 None（本账号从未 rebalance 过）不去抖：0 哨兵会被低 monotonic
+        # 环境误拦——fresh runner / 刚开机进程 monotonic < 120s 时，首次
+        # rebalance（健康探针判败后的自救）恒被「去抖窗内」吞掉。
+        if last is not None and now - last < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
             return False
         # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
@@ -540,7 +583,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，第 4 轮候选 {node} 复核冲突"
                               f"（{'在期隔离' if re_banned_hit else '其它分配占用 ' + re_holders[0]}）"
-                              f"——不烧探针直接判败，TP 绑定停留在此，人工介入")
+                              f"——不烧探针直接判败，TP 绑定停留在此（下轮重试）")
                     account.egress_node = node  # hub 记录对齐 TP 实际绑定
                     store.update_account(account)
                     return False
@@ -568,7 +611,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，第 4 轮仍回原节点 {node} "
                               f"且验收不过（zcode={_edge_kind(raw)} alicdn={cd_detail}）"
-                              f"——判败，人工介入")
+                              f"——判败（下轮重试）")
                     account.egress_node = node
                     store.update_account(account)
                     return False
@@ -576,7 +619,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，回绑候选 {node} 仍不过"
                               f"（zcode={_edge_kind(raw)} alicdn={cd_detail}；"
-                              f"TP 绑定停留在此，人工介入）")
+                              f"TP 绑定停留在此，下轮重试）")
                     account.egress_node = node  # hub 记录对齐 TP 实际绑定
                     store.update_account(account)
                     return False
@@ -592,7 +635,7 @@ class TetherPoolEgress:
                 return True
             logs.warn("egress_pool",
                       f"{account.name} 3 轮均败且回绑 acquire 失败"
-                      f"（TP 绑定停在最后候选，人工介入）")
+                      f"（TP 绑定停在最后候选，下轮重试）")
             await self._align_binding_with_tp(account, own_aid)
             return False
         finally:
@@ -832,16 +875,30 @@ class TetherPoolEgress:
         if self._loop_task is None or self._loop_task.done():
             self._loop_task = asyncio.create_task(self._loop())
             if settings.TP_ORPHAN_RECONCILE:
-                task = asyncio.create_task(self._reconcile_orphans_once())
+                task = asyncio.create_task(self._reconcile_once())
                 self._inflight.add(task)
                 task.add_done_callback(self._inflight.discard)
+                # 防重对齐 _loop_task（review P2：二次 start 会覆盖引用泄漏
+                # 一个 while-True 孤儿任务）
+                if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
+                    self._reconcile_loop_task = asyncio.create_task(
+                        self._reconcile_loop())
+        # tier 泄漏巡检（2026-11-21 P3）：启动期与孤儿对账并跑一次。
+        # 运行期不循环——tp_acquire 已显式上送 tier，运行中新增分配破约
+        # 只可能来自外部改绑（手工/TP 侧），每次 hub 重启巡检一次足够，
+        # 常态循环纯属大响应拉取开销。
+        task = asyncio.create_task(self._audit_tier_once())
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
-    async def _reconcile_orphans_once(self, initial_delay: float = 10) -> None:
-        """启动时 TP 孤儿分配对账（2.7.68）：allocs 里 zh-<id> 不在本库账号集合
-        → 逐个 release。11-17 实查 27 个分配 16 个陈旧（`-b782a0d5` 族即历史
-        删除账号）——删除释放只堵新增不清存量，孤儿永久占节点，池压下把现役
-        账号挤向软排除兜底（ban 节点/共享节点）。只跑一次，与删除路径的实时
-        释放互补；与启动期 ensure_binding 并发安全（只释放不在库的 id）。"""
+    async def _reconcile_once(self, initial_delay: float = 10) -> None:
+        """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
+
+        ①孤儿分配：allocs 里 zh-<id> 不在本库账号集合 → 逐个 release（11-17
+        实查 27 个分配 16 个陈旧——删除释放只堵新增不清存量，孤儿永久占节点）。
+        ②③ 记录漂移对齐 + 节点共占回收委托 _reconcile_sweep（与周期循环同体，
+        幂等；rebalance 自带去抖/账号锁）。与启动期 ensure_binding 并发安全：
+        ①只释放不在库的 id，②③只动本库账号。"""
         from . import logs
         from .store import store
         if initial_delay > 0:
@@ -854,12 +911,123 @@ class TetherPoolEgress:
         known_ids = {a.id for provider in PROVIDERS for a in store.list_accounts(provider)}
         orphans = [aid for aid in allocs
                    if aid.startswith("zh-") and aid[3:] not in known_ids]
-        if not orphans:
-            logs.info("egress_pool", "[reconcile] TP 分配对账通过，无孤儿")
-            return
         for aid in orphans:
             await tp_release_account(aid[3:])  # 内部自带结果日志
-        logs.ok("egress_pool", f"[reconcile] 孤儿分配清理完成: {len(orphans)} 个已释放")
+        if orphans:
+            logs.ok("egress_pool", f"[reconcile] 孤儿分配清理完成: {len(orphans)} 个已释放")
+        else:
+            logs.info("egress_pool", "[reconcile] TP 分配对账通过，无孤儿")
+        # ②③ 存量巡检（周期循环同一实现）
+        await self._reconcile_sweep()
+
+    async def _reconcile_loop(self) -> None:
+        """周期巡检循环（2026-11-21 迭代 review P2）：共占/漂移不止启动期产生
+        ——IP-Pool 数据面 auto_rehome（节点死亡风暴）与 gateway 级 persist 随时
+        改写绑定，单次启动巡检后存量要等下次重启才回收（08:35 实锤：巡检清
+        17 组后 35 分钟内数据面又造出 3 组）。巡检幂等 + rebalance 自带去抖/
+        账号锁，循环安全；异常只 warn 不退出（下轮重试）。"""
+        from . import logs
+        while True:
+            await asyncio.sleep(settings.TP_RECONCILE_INTERVAL)
+            if not settings.PER_ACCOUNT_EGRESS or settings.EGRESS_SUPPLY != "tetherpool":
+                continue
+            try:
+                await self._reconcile_sweep()
+            except Exception as exc:
+                logs.warn("egress_pool", f"[reconcile] 周期巡检异常（下轮重试）: {exc}")
+
+    async def _reconcile_sweep(self) -> None:
+        """单轮对账 sweep：②记录对齐 + ③共占回收（孤儿①只在启动期
+        _reconcile_once 清一次，周期巡检不动不在库 id）。"""
+        from . import logs
+        from .store import store
+        allocs, _banned = await _tp_live_snapshot()
+        if not allocs:
+            # 快照失败（空）= fail-open，不动任何分配。周期化后此守卫不再只是
+            # 「启动期 TP 未就绪」——TP 持续故障时巡检每轮静默空转零痕迹，与
+            # rebalance 主路径的快照失败 warn（本文件 :410）对齐补一条。
+            logs.warn("egress_pool",
+                      "[reconcile] TP 快照为空——本轮巡检跳过（fail-open，下轮重试）")
+            return
+        node_holders: dict[str, list[str]] = {}
+        for aid, node in allocs.items():
+            if aid.startswith("zh-"):
+                node_holders.setdefault(node, []).append(aid)
+        drifted = co_occupied = 0
+        for provider in PROVIDERS:
+            for a in store.list_accounts(provider):
+                tp_node = allocs.get("zh-" + a.id)
+                if not tp_node:
+                    continue  # 无 TP 分配（灰度/listeners 语义），不巡
+                if a.egress_node and a.egress_node != tp_node:
+                    # ② 记录漂移：以地面真值为准对齐（auto_rehome/降级路径换的）
+                    logs.warn("egress_pool",
+                              f"[reconcile] {a.name} hub 记录漂移对齐: "
+                              f"{a.egress_node} → {tp_node}（TP 实际绑定）")
+                    a.egress_node = tp_node
+                    store.update_account(a)
+                    drifted += 1
+                others = [x for x in node_holders.get(tp_node, [])
+                          if x != "zh-" + a.id]
+                if others:
+                    # ③ 共占存量：强制换绑本账号（持有者少的让位语义不重要——
+                    # 双方都会被巡检各自 rebalance，互斥收敛）
+                    co_occupied += 1
+                    logs.warn("egress_pool",
+                              f"[reconcile] {a.name} 节点 {tp_node} 与其它分配共占"
+                              f"（{others[0]}）→ 强制换绑")
+                    await self.rebalance(a, reason="co_occupancy_reconcile",
+                                         ban=False)
+        if drifted or co_occupied:
+            logs.ok("egress_pool",
+                    f"[reconcile] 存量巡检完成: 记录漂移对齐 {drifted}，"
+                    f"共占换绑 {co_occupied}")
+        else:
+            logs.info("egress_pool", "[reconcile] 绑定巡检通过: 无漂移无共占")
+
+    async def _audit_tier_once(self, initial_delay: float = 30) -> None:
+        """启动时 tier 泄漏巡检（2026-11-21 P3，tp_acquire tier 参数固化的守护）：
+        本 service 的 zh- 分配凡绑定非 TP_TIER（premium）节点 = tier 承诺破约
+        （acquire 忘带 tier / IP-Pool standard_first 兜底 / 手工改绑），机房
+        standard 节点打 claim 是风控高危——泄漏号自动 rebalance 换回 premium
+        （rebalance 全链自带探针验收 + 互斥 exclude + 每轮 tier 显式上送）。
+
+        巡检 fail-open：节点 tier 快照拉取失败 = 跳过本轮（不 rebalance）。
+        rebalance 去抖窗内的号跳过（防与健康循环/触发器同时 churn）。"""
+        from . import logs
+        from .store import store
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        if not (settings.PER_ACCOUNT_EGRESS and settings.EGRESS_SUPPLY == "tetherpool"):
+            return
+        allocs, _banned = await _tp_live_snapshot()
+        if not allocs:
+            return
+        tiers = await _tp_node_tiers()
+        if not tiers:
+            logs.info("egress_pool", "[tier-audit] 节点 tier 快照不可用，跳过本轮")
+            return
+        leaked: list[tuple[str, str, str]] = []  # (aid, node, tier)
+        for aid, node in allocs.items():
+            if not aid.startswith("zh-"):
+                continue
+            node_tier = tiers.get(node, "")
+            if node_tier and node_tier != settings.TP_TIER:
+                leaked.append((aid, node, node_tier))
+        if not leaked:
+            logs.info("egress_pool",
+                      f"[tier-audit] tier 巡检通过（{sum(1 for a in allocs if a.startswith('zh-'))}"
+                      f" 个分配全部 {settings.TP_TIER}）")
+            return
+        for aid, node, node_tier in leaked:
+            account = store.find("zai", aid[3:])
+            if account is None:
+                continue  # 孤儿分配由 _reconcile_orphans_once 负责，不重复处理
+            logs.warn("egress_pool",
+                      f"[tier-audit] {account.name} 绑定 {node}（tier={node_tier}，"
+                      f"承诺 {settings.TP_TIER}）——tier 泄漏，rebalance 换回")
+            await self.rebalance(account, reason="tier_leak_audit", ban=False)
+        logs.ok("egress_pool", f"[tier-audit] 泄漏巡检完成：{len(leaked)} 个触发 rebalance")
 
     async def stop(self) -> None:
         if self._loop_task and not self._loop_task.done():
@@ -869,8 +1037,20 @@ class TetherPoolEgress:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        # 周期巡检循环是 while-True 常驻任务，必须显式 cancel——只 gather
+        # 会永远等它退出（test_health_loop_bootstraps 挂死实锤）
+        loop = self._reconcile_loop_task
+        if loop and not loop.done():
+            loop.cancel()
+            try:
+                await loop
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_loop_task = None
         if self._inflight:
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+            await asyncio.gather(
+                *(t for t in self._inflight if not t.done()),
+                return_exceptions=True)
 
 
 egress_pool = TetherPoolEgress()

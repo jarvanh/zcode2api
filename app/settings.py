@@ -463,6 +463,9 @@ TP_GATEWAY_FAIL_ABORT = max(_int("ZCODE_TP_GATEWAY_FAIL_ABORT", 2), 0)
 # release。11-17 实查 27 个分配 16 个陈旧（历史删除账号），删除释放只堵新增
 # 不清存量；对账从源头回收占位。默认开。
 TP_ORPHAN_RECONCILE = _bool("ZCODE_TP_ORPHAN_RECONCILE", True)
+# 周期巡检间隔（2026-11-21 迭代 review P2）：IP-Pool 数据面 auto_rehome / gateway
+# persist 随时改写绑定，reconcile 不再是启动单次——共占/漂移存量按此间隔回收。
+TP_RECONCILE_INTERVAL = max(_int("ZCODE_TP_RECONCILE_INTERVAL", 1800), 300)
 TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防 0 自旋
 # 健康探针连续失败多少轮才 rebalance（2026-11-15 生产数据：03:48/04:13 探针
 # 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
@@ -574,11 +577,8 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-# 上游读空闲超时（秒，2.7.35 review 整改）：httpx read 超时是「相邻 chunk 之间」
-# 的空闲上限。原为 read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 +
-# 客户端连接。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.67"  # fork：并入上游 2.7.69–2.7.71（出口供给双根修/探针状态所有权守卫/高可用迭代）
+APP_VERSION = "2.9.68"  # fork：并入上游 2.7.69–2.7.72.3（出口供给双根修/版本双链/claim 重试韧性/守护层）
 
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：

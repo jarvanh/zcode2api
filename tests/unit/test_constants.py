@@ -25,10 +25,13 @@ def test_billing_base():
 
 def test_set_active_version():
     orig = constants.CLIENT_APP_VERSION
+    billing_orig = constants.BILLING_APP_VERSION
     try:
         constants.set_active_version("3.17.0")
         assert constants.CLIENT_APP_VERSION == "3.17.0"
-        assert constants.BILLING_APP_VERSION == "3.17.0"
+        # 2026-11-21 双链拆分：set_active_version 只管 messages 链，
+        # billing 版本由 version_tracker 独立跟随，不再被此函数钳回丢投放
+        assert constants.BILLING_APP_VERSION == billing_orig
         assert constants.USER_AGENT == "ZCode/3.17.0"
         assert constants.X_ZCODE_APP_VERSION == "3.17.0"
         assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.0"
@@ -45,6 +48,18 @@ def test_set_active_version():
         assert constants.CLIENT_APP_VERSION == cur
     finally:
         constants.set_active_version(orig)
+
+
+def test_billing_version_and_activation():
+    # fork 口径：billing 基线钉 3.19.0（与 messages 对拍同版；运行时由
+    # version_tracker 独立跟随官方 manifest，env ZCODE_BILLING_APP_VERSION 可钉死）
+    assert constants.BILLING_APP_VERSION == "3.19.0"
+    assert constants.DEFAULT_BILLING_APP_VERSION == "3.19.0"
+    assert constants.BILLING_TITLE == "Z Code@electron"
+    assert constants.BILLING_RELEASE_CHANNEL == "production"
+    assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
+    assert constants.ACTIVATION_ELEMENTS == ("app_launch", "app_daily_active")
+    assert constants.ACTIVATION_SCREEN_RESOLUTION == "2560x1440"
 
 
 def test_set_active_version_clamped_to_prompt_alignment():
@@ -82,17 +97,6 @@ def test_client_version_single_source():
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
-
-
-def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.19.0）；zcode-switch 的
-    # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.19.0"
-    assert constants.BILLING_TITLE == "Z Code@electron"
-    assert constants.BILLING_RELEASE_CHANNEL == "production"
-    assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
-    assert constants.ACTIVATION_ELEMENTS == ("app_launch", "app_daily_active")
-    assert constants.ACTIVATION_SCREEN_RESOLUTION == "2560x1440"
 
 
 def test_captcha_defaults_match_zcode2api():

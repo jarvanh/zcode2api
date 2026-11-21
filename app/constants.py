@@ -102,7 +102,11 @@ MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = DEFAULT_CLIENT_APP_VERSION  # 须与 CLIENT_APP_VERSION 同步升（半更新=2026-10-31 组合病因，freshness 告警项；version_tracker.set_active_version 已联动双写）
+# DEFAULT_BILLING_APP_VERSION 是测试夹具与 init 恢复的基线锚点。
+# fork 口径：messages 已对拍到 3.19.0（PROMPT_ALIGNED_VERSION），billing 同步
+# 钉 3.19.0；运行时仍由 version_tracker 独立跟随官方 manifest（无正文锁）。
+DEFAULT_BILLING_APP_VERSION = "3.19.0"
+BILLING_APP_VERSION = os.getenv("ZCODE_BILLING_APP_VERSION", "").strip().lstrip("vV").strip() or DEFAULT_BILLING_APP_VERSION
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
                                          # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时
@@ -245,7 +249,7 @@ def is_newer_version(candidate: str, baseline: str) -> bool:
 
 
 def set_active_version(new_version: str) -> str:
-    """动态更新客户端与 billing 伪装版本号（当自动探测发现新版本时）。
+    """动态更新客户端伪装版本号（当自动探测发现新版本时）。
 
     规范化：剥离首尾空白与前导 v/V——官方 CFBundleShortVersionString 与
     X-ZCode-App-Version 头均为纯数字形态，"v3.17.2" 会使 UA 变成
@@ -255,15 +259,18 @@ def set_active_version(new_version: str) -> str:
     所属版本）。上游按「版本头 + system 正文」同版校验，头新于正文即
     405/3012，故越过时钳制到锁版本，返回实际生效版本。升级客户端必须先移植
     prompt.mjs 文本并抬高 PROMPT_ALIGNED_VERSION，本函数不提供绕过。
+
+    2026-11-20：BILLING_APP_VERSION 拆出本函数（模块常量钉 3.18.2）——
+    billing 族无正文锁、且上游按版本分流活动投放（<3.18.2 零投放），
+    跟随 messages 钳制会把 billing 版本打回 3.17.2 丢投放。
     """
-    global CLIENT_APP_VERSION, BILLING_APP_VERSION, USER_AGENT, X_ZCODE_APP_VERSION, CLIENT_CONFIGS_QUERY
+    global CLIENT_APP_VERSION, USER_AGENT, X_ZCODE_APP_VERSION, CLIENT_CONFIGS_QUERY
     v = str(new_version or "").strip().lstrip("vV").strip()
     if not v:
         return CLIENT_APP_VERSION
     if is_newer_version(v, PROMPT_ALIGNED_VERSION):
         v = PROMPT_ALIGNED_VERSION
     CLIENT_APP_VERSION = v
-    BILLING_APP_VERSION = v
     USER_AGENT = f"ZCode/{v}"
     X_ZCODE_APP_VERSION = v
     CLIENT_CONFIGS_QUERY = f"app_version={v}"

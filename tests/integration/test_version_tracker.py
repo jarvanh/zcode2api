@@ -38,18 +38,24 @@ async def test_check_zcode_version_refuses_unported(gateway_client):
     client, mock = gateway_client
     mock.state.mock_manifest_version = "3.19.5"
     orig = constants.CLIENT_APP_VERSION
+    billing_orig = constants.BILLING_APP_VERSION
     try:
         res = await client.post("/admin/api/version/zcode/check", headers={"Authorization": "Bearer zcode"})
         assert res.status_code == 200
         data = res.json()
         assert data["ok"] is True
         assert data["latest_version"] == "3.19.5"
-        assert data["updated"] is False
+        # messages 链拒绝越锁；billing 链独立跟随（2026-11-21 双链定案）
+        assert data["messages_updated"] is False
+        assert data["billing_updated"] is True
+        assert data["updated"] is True
         assert data["prompt_port_required"] is True
         assert data["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
         assert constants.CLIENT_APP_VERSION == orig
+        assert constants.BILLING_APP_VERSION == "3.19.5"
     finally:
         constants.set_active_version(orig)
+        constants.BILLING_APP_VERSION = billing_orig
 
 
 @pytest.mark.asyncio
