@@ -320,6 +320,10 @@ async def test_latest_across_channels_falls_back_to_local(monkeypatch):
 @pytest.mark.asyncio
 async def test_billing_follow_skipped_when_pinned_by_env(fresh_app, monkeypatch):
     """kill-switch：ZCODE_BILLING_APP_VERSION env 钉值时 billing 不自动跟随。"""
+    from app import version_tracker as vt
+
+    # 钉住本机官方运行时版本：宿主已自更新到 3.19.1，不钉会压过 mock 清单
+    monkeypatch.setattr(vt.hostinfo, "local_client_version", lambda: "3.19.0")
     tracker = VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
@@ -346,6 +350,10 @@ async def test_billing_follow_skips_prerelease(fresh_app, monkeypatch):
     """预发布版（beta/rc）不得穿透：parse_semver 纯数字提取会把
     '3.19.0-beta.1' 解析成 (3,19,0,1) > (3,19,0)，billing 是唯一无正文锁
     链路，manifest 推 beta 时必须挡住。"""
+    from app import version_tracker as vt
+
+    # 同上：钉住本机运行时版本，避免宿主 3.19.1 压过 beta 用例
+    monkeypatch.setattr(vt.hostinfo, "local_client_version", lambda: "3.19.0")
     tracker = VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
@@ -391,11 +399,11 @@ async def test_probe_passes_when_preview_ok(fresh_app, monkeypatch):
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.1", release_name="v3.19.1")
+        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is True
-        assert constants.BILLING_APP_VERSION == "3.19.1"
+        assert constants.BILLING_APP_VERSION == "3.19.2"
     finally:
         constants.BILLING_APP_VERSION = billing_orig
 
@@ -415,7 +423,7 @@ async def test_probe_rollback_on_upstream_reject(fresh_app, monkeypatch):
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.0", release_name="v3.19.0")
+        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is False
@@ -436,13 +444,13 @@ async def test_probe_transient_network_error_does_not_rollback(fresh_app, monkey
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.1", release_name="v3.19.1")
+        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         monkeypatch.setattr("app.claim.preview_plans",
                             AsyncMock(side_effect=ClaimError("ConnectError 32")))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is True
-        assert constants.BILLING_APP_VERSION == "3.19.1"
+        assert constants.BILLING_APP_VERSION == "3.19.2"
     finally:
         constants.BILLING_APP_VERSION = billing_orig
 

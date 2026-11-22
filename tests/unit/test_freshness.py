@@ -35,8 +35,9 @@ def _isolated_sections(monkeypatch):
     yield holder
 
 
-def _meta(version="3.19.0", captured="2026-11-20"):
-    return {"client_version": version, "captured_at": captured}
+def _meta(version=None, captured="2026-11-20"):
+    # 默认跟随网关身份版本：抬 PROMPT_ALIGNED_VERSION 时夹具自动同升，避免字面量漂移
+    return {"client_version": version or constants.CLIENT_APP_VERSION, "captured_at": captured}
 
 
 def test_missing_meta_is_stale(_isolated_sections):

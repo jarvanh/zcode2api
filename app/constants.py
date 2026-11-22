@@ -53,10 +53,12 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ——uid 与真实账号用户名的对应关系只在授权瞬间可取，错过即不可补查）
 OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 
-# ── 客户端版本（单一真相源；3.19.0 对齐 ZCode 官方构建当前版）──
+# ── 客户端版本（单一真相源；3.19.1 对齐 ZCode 官方构建当前版）──
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001。
-# 出处：ZCode 3.19.0 官方 Linux AppImage（2026-11-20 下载，sha512 与预览清单一致）
-# 解包 resources/glm/zcode.cjs，对拍五段全同文；Desktop 段注入结构未变。
+# 出处：ZCode 3.19.1 本机 server runtime 构建（2026-11-22 自动更新落地，
+# ~/.zcode/server/releases/3.19.1-linux-x64-165b30398559/runtime/zcode.cjs），
+# 对拍五段全同文；Desktop 段仍 meta_user+dynamic，注入结构未变。
+# 3.19.0 出处为官方 Linux AppImage（2026-11-20 下载，sha512 与预览清单一致）。
 # 前值 3.18.2（2026-11-16）、3.18.1（2026-11-11）、3.18.0（2026-11-12）、
 # 3.17.2（2026-11-09）、3.17.1（11-03）。
 # 注：桌面端 electron 稳定清单曾滞后（2026-11-11 channel=1 仍报 3.17.2），
@@ -78,7 +80,9 @@ OAUTH_USERINFO_URL = "https://chat.z.ai/api/oauth/userinfo"
 # 仅版本号差异。
 # 3.19.0：官方 Linux AppImage 构建（sha512 已核对）对拍五段全同文，块结构未变
 # （Desktop 段仍 meta_user+dynamic）→ 仅版本号抬升。
-PROMPT_ALIGNED_VERSION = "3.19.0"
+# 3.19.1：本机 server runtime 3.19.1-linux-x64-165b30398559 对拍五段全同文，
+# 块结构未变（Desktop 段仍 meta_user+dynamic）→ 仅版本号抬升（2026-11-22）。
+PROMPT_ALIGNED_VERSION = "3.19.1"
 DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
@@ -103,9 +107,9 @@ MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
 # DEFAULT_BILLING_APP_VERSION 是测试夹具与 init 恢复的基线锚点。
-# fork 口径：messages 已对拍到 3.19.0（PROMPT_ALIGNED_VERSION），billing 同步
-# 钉 3.19.0；运行时仍由 version_tracker 独立跟随官方 manifest（无正文锁）。
-DEFAULT_BILLING_APP_VERSION = "3.19.0"
+# fork 口径：messages 已对拍到 3.19.1（PROMPT_ALIGNED_VERSION），billing 同步
+# 钉 3.19.1；运行时仍由 version_tracker 独立跟随官方 manifest（无正文锁）。
+DEFAULT_BILLING_APP_VERSION = "3.19.1"
 BILLING_APP_VERSION = os.getenv("ZCODE_BILLING_APP_VERSION", "").strip().lstrip("vV").strip() or DEFAULT_BILLING_APP_VERSION
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
