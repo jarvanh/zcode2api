@@ -134,13 +134,13 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
     try:
-        # 模拟「提示词已移植到 3.19.5」：正文锁同步抬高后自动对齐才被允许
-        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "3.19.5")
+        # 模拟「提示词已移植到 4.0.5」：正文锁同步抬高后自动对齐才被允许
+        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "4.0.5")
         mock_info = VersionInfo(
-            version="3.19.5",
+            version="4.0.5",
             release_date="2026-11-25",
-            release_name="Release v3.19.5",
-            release_notes="Notes 3.19.5",
+            release_name="Release v4.0.5",
+            release_notes="Notes 4.0.5",
             checked_at=123456.0,
         )
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
@@ -152,9 +152,9 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
         assert res["updated"] is True
         assert res["messages_updated"] is True
         assert res["prompt_port_required"] is False
-        assert res["latest_version"] == "3.19.5"
-        assert constants.CLIENT_APP_VERSION == "3.19.5"
-        assert fresh_app.get_setting("zcode_latest_version") == "3.19.5"
+        assert res["latest_version"] == "4.0.5"
+        assert constants.CLIENT_APP_VERSION == "4.0.5"
+        assert fresh_app.get_setting("zcode_latest_version") == "4.0.5"
     finally:
         constants.set_active_version(orig)
 
@@ -172,7 +172,7 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
     billing_orig = constants.BILLING_APP_VERSION
     try:
         mock_info = VersionInfo(
-            version="3.19.5", release_date="2026-11-25", release_name="v3.19.5"
+            version="4.0.5", release_date="2026-11-25", release_name="v4.0.5"
         )
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         fresh_app.set_setting("auto_sync_client_version", "true")
@@ -186,9 +186,9 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
         assert res["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
         assert constants.CLIENT_APP_VERSION == orig
         # billing 版本被顶上去（无正文锁，claim 有效性优先）
-        assert constants.BILLING_APP_VERSION == "3.19.5"
+        assert constants.BILLING_APP_VERSION == "4.0.5"
         # 新版本仍落库（后台展示更新日志用）
-        assert fresh_app.get_setting("zcode_latest_version") == "3.19.5"
+        assert fresh_app.get_setting("zcode_latest_version") == "4.0.5"
     finally:
         constants.set_active_version(orig)
         constants.BILLING_APP_VERSION = billing_orig
@@ -200,9 +200,9 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
     orig = constants.CLIENT_APP_VERSION
     try:
         mock_info = VersionInfo(
-            version="3.19.9",
+            version="4.0.9",
             release_date="2026-11-26",
-            release_name="Release v3.19.9",
+            release_name="Release v4.0.9",
             release_notes="Notes",
             checked_at=123456.0,
         )
@@ -215,10 +215,10 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
         # auto_sync=false 只挡 messages 链；billing 链无条件跟随（2026-11-21 定案）
         assert res["updated"] is True
         assert res["billing_updated"] is True
-        assert res["latest_version"] == "3.19.9"
+        assert res["latest_version"] == "4.0.9"
         # messages 伪装版本未被自动修改，billing 已跟随
         assert constants.CLIENT_APP_VERSION == orig
-        assert constants.BILLING_APP_VERSION == "3.19.9"
+        assert constants.BILLING_APP_VERSION == "4.0.9"
     finally:
         constants.set_active_version(orig)
 
@@ -233,18 +233,18 @@ def test_tracker_init_from_store_respects_prompt_lock(fresh_app):
     billing_orig = constants.BILLING_APP_VERSION
     try:
         fresh_app.set_setting("auto_sync_client_version", "true")
-        fresh_app.set_setting("zcode_latest_version", "3.19.5")
+        fresh_app.set_setting("zcode_latest_version", "4.0.5")
         fresh_app.set_setting(
             "zcode_latest_info",
-            json.dumps({"version": "3.19.5", "release_name": "v3.19.5"}),
+            json.dumps({"version": "4.0.5", "release_name": "v4.0.5"}),
         )
         tracker.init_from_store()
         assert constants.CLIENT_APP_VERSION == orig
         # billing 无正文锁：重启即跟随缓存最新版，不等下一轮 manifest 轮询
-        assert constants.BILLING_APP_VERSION == "3.19.5"
+        assert constants.BILLING_APP_VERSION == "4.0.5"
         # 最新版本信息仍恢复（后台展示更新日志）
         assert tracker.latest_info is not None
-        assert tracker.latest_info.version == "3.19.5"
+        assert tracker.latest_info.version == "4.0.5"
     finally:
         constants.set_active_version(orig)
         constants.BILLING_APP_VERSION = billing_orig
@@ -399,11 +399,11 @@ async def test_probe_passes_when_preview_ok(fresh_app, monkeypatch):
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
+        mock_info = VersionInfo(version="4.0.1", release_name="v4.0.1")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is True
-        assert constants.BILLING_APP_VERSION == "3.19.2"
+        assert constants.BILLING_APP_VERSION == "4.0.1"
     finally:
         constants.BILLING_APP_VERSION = billing_orig
 
@@ -423,7 +423,7 @@ async def test_probe_rollback_on_upstream_reject(fresh_app, monkeypatch):
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
+        mock_info = VersionInfo(version="4.0.1", release_name="v4.0.1")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is False
@@ -444,13 +444,13 @@ async def test_probe_transient_network_error_does_not_rollback(fresh_app, monkey
     tracker = vt.VersionTracker()
     billing_orig = constants.BILLING_APP_VERSION
     try:
-        mock_info = VersionInfo(version="3.19.2", release_name="v3.19.2")
+        mock_info = VersionInfo(version="4.0.1", release_name="v4.0.1")
         monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
         monkeypatch.setattr("app.claim.preview_plans",
                             AsyncMock(side_effect=ClaimError("ConnectError 32")))
         res = await tracker.check_and_sync()
         assert res["billing_updated"] is True
-        assert constants.BILLING_APP_VERSION == "3.19.2"
+        assert constants.BILLING_APP_VERSION == "4.0.1"
     finally:
         constants.BILLING_APP_VERSION = billing_orig
 
