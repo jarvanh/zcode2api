@@ -578,7 +578,7 @@ ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGI
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.69"  # fork：并入上游 2.7.69–2.7.72.3（出口供给双根修/版本双链/claim 重试韧性/守护层）
+APP_VERSION = "2.9.70"  # fork：并入上游 2.7.69–2.7.72.3（出口供给双根修/版本双链/claim 重试韧性/守护层）；ZCode 4.0.0 对齐
 
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
