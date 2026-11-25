@@ -99,7 +99,6 @@ class TestAdminAuthHardening:
         伪造 cf-connecting-ip/x-real-ip 不能让每个请求拿到独立的失败计数器
         —— 锁定按 socket 对端地址（测试客户端同一对端）计数。"""
         from app import auth_admin
-
         from app import settings as _settings
         monkeypatch.setattr(_settings, "HOST", "0.0.0.0")
         monkeypatch.setattr(auth_admin, "ADMIN_FAIL_LIMIT", 3)

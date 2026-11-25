@@ -101,7 +101,7 @@ else:
     import secrets as _secrets
 
     DEFAULT_ADMIN_KEY = _secrets.token_urlsafe(18)
-    print(f"[zcode-hub] ZCODE_ADMIN_KEY 强度不足或未设置，随机初始后台密钥已生成", flush=True)
+    print("[zcode-hub] ZCODE_ADMIN_KEY 强度不足或未设置，随机初始后台密钥已生成", flush=True)
 # 网关访问密钥默认值（README 的 ZCODE_GATEWAY_KEY）：数据库 meta 表未设置时生效。
 GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
 # bigmodel Key 回退通道（bigmodel/ 前缀 / x-provider: bigmodel 头）默认关闭。

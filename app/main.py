@@ -267,6 +267,7 @@ async def lifespan(app: FastAPI):
             conc_task.cancel()
         # fire-and-forget 后台任务集收口（上游 2026-11-21 review P2）。
         import asyncio as _aio
+
         from . import install
         pending: set = set()
         pending.update(admin_api._auto_claim_tasks)
