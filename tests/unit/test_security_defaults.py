@@ -90,7 +90,10 @@ def test_umask_keeps_new_sensitive_files_private(tmp_path, monkeypatch):
 
 
 def test_forged_forwarded_header_ignored_when_trust_disabled(monkeypatch):
+    # 直连部署（0.0.0.0）不享回环豁免
     monkeypatch.setattr(auth_admin, "TRUST_PROXY_IP", False)
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", False)
+    monkeypatch.setattr(settings, "HOST", "0.0.0.0")
     req = _request("127.0.0.1", (("cf-connecting-ip", "203.0.113.7"),))
     assert auth_admin._client_ip(req) == "127.0.0.1"
 

@@ -834,7 +834,17 @@ class Account:
                 return False
         if self.status == Status.COOLING:
             now = now or time.time()
-            return bool(self.cooling_until and now >= self.cooling_until)
+            if self.cooling_until is None:
+                # 防御兜底（2026-11-21 review 待确认项）：全部现行写入方都成对
+                # 设置 cooling_until，但若未来路径漏配，COOLING+None 原先恒
+                # False = 该号永久不可选且无自愈。按「冷却未知 → 立即视为到期」
+                # 处理：宁可放进池子被上游教育，也不要永久蒸发一个号。
+                # 触发留痕（2026-11-22 review P3）：防御被触发 = 存在漏配写入方
+                # （该形态会同步绕过风控退避：is_cooling 也判 False → 请求成功
+                # 即清 strikes 洗回 ACTIVE），一次性 warn 让漏配可见。
+                self._warn_cooling_until_none()
+                return True
+            return bool(now >= self.cooling_until)
         return True
 
     def is_cooling(self, now: float | None = None) -> bool:
@@ -842,7 +852,25 @@ class Account:
         if self.status != Status.COOLING:
             return False
         now = now or time.time()
-        return bool(self.cooling_until and now < self.cooling_until)
+        if self.cooling_until is None:
+            # 与 is_selectable 同款防御：COOLING+None 视为冷却已到期（留痕见上）
+            self._warn_cooling_until_none()
+            return False
+        return bool(now < self.cooling_until)
+
+    _COOLING_NONE_WARNED: bool = False
+
+    @classmethod
+    def _warn_cooling_until_none(cls) -> None:
+        """COOLING+cooling_until=None 防御分支被触发的进程级一次性告警
+        （对齐 logs._HOURS_WARNED 去重模式）：现行写入方全部成对设置（2026-11-22
+        复核），触发即意味着出现了新的漏配写入方。"""
+        if not cls._COOLING_NONE_WARNED:
+            cls._COOLING_NONE_WARNED = True
+            from . import logs
+            logs.warn("models",
+                      "检测到 COOLING 状态且 cooling_until=None（防御兜底触发，"
+                      "视为已到期放行/未冷却）——存在漏配冷却写入方，请排查")
 
     def plan_kind(self) -> str:
         """当前套餐类型：start-plan（体验/免费档）/ coding-plan / ""（未知）。
@@ -883,7 +911,23 @@ class Account:
     @staticmethod
     def from_dict(data: dict) -> Account:
         known = {f for f in Account.__dataclass_fields__}  # type: ignore[attr-defined]
-        return Account(**{k: v for k, v in data.items() if k in known})
+        extra = {k: v for k, v in data.items() if k not in known}
+        acc = Account(**{k: v for k, v in data.items() if k in known})
+        if extra:
+            # 未知字段保留（2026-11-21 review P3）：新版写入的新字段在降级
+            # 加载时原先被静默丢弃，任何一次 update_account 落库即把新字段从
+            # blob 里永久抹掉。挂到 _extra 上，to_dict 落库时原样回写。
+            object.__setattr__(acc, "_extra", extra)
+        return acc
+
+    def to_persist_dict(self) -> dict:
+        """落库形态：to_dict + 降级保留的未知字段（_extra）回写。"""
+        d = self.to_dict()
+        extra = getattr(self, "_extra", None)
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                d.setdefault(k, v)
+        return d
 
     @staticmethod
     def normalize_proxy(url: str | None) -> str | None:
@@ -954,9 +998,18 @@ class Account:
         return url
 
     def public_view(self) -> dict:
-        """返回给前端的视图（脱敏 token）。"""
+        """返回给前端的视图（脱敏 token）。
+
+        短 secret 全掩码（2026-11-21 review P3）：≤16 字符原先整段明文回显，
+        与「脱敏 token」语义相悖——apiKey 类短凭证会整串进前端。
+        """
         secret = self.secret or ""
-        masked = secret if len(secret) <= 16 else f"{secret[:8]}…{secret[-6:]}"
+        if len(secret) < 12:
+            masked = "••••••"
+        elif len(secret) <= 16:
+            masked = f"{secret[:4]}…{secret[-4:]}"
+        else:
+            masked = f"{secret[:8]}…{secret[-6:]}"
         return {
             "id": self.id,
             "name": self.name,

@@ -332,7 +332,10 @@ class CaptchaManager:
         self._pool_sizes: dict[str, int] = {}
         self._refill_task: asyncio.Task | None = None
         self._refilling = False
-        self._config_lock = asyncio.Lock()
+        # 配置拉取锁按出口分键（2026-11-21 review P3）：全局单锁下，A 出口的
+        # 15s 网络拉取会阻塞 B 出口的缓存命中路径（锁内含 httpx I/O）；分键后
+        # 各出口互不牵连。锁随 TTL 失效自动淘汰，防历史 tag 累积。
+        self._config_locks: dict[str, asyncio.Lock] = {}
         # 求解并发上限（进程级）：池空突发时不按请求数拉起 N 个 Chromium
         self._solve_sem = asyncio.Semaphore(settings.CAPTCHA_MAX_CONCURRENT_SOLVES)
         # 配置按出口缓存：上游按出口 IP 给不同的 captcha 配置（实测直连 region=cn、
@@ -405,7 +408,8 @@ class CaptchaManager:
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self, egress_tag: str | None = None,
-                           proxy_url: str | None = None) -> dict:
+                           proxy_url: str | None = None,
+                           proxy: str | None = None) -> dict:
         """取 captcha 配置（按出口缓存）。
 
         `proxy_url` 是账号自己的出口代理；传入后配置拉取走同一出口，
@@ -413,11 +417,15 @@ class CaptchaManager:
         把整条 captcha 链路拖死）。
         """
         tag = egress_tag or self.hot_egress()
+        proxy_url = proxy_url or proxy  # upstream 调用口径别名
         cache_key = self._egress_key(tag, proxy_url)
         ttl = settings.CAPTCHA_CONFIG_CACHE_TTL
         if self._config_cache.get(cache_key) and _now_ms() - self._config_cache_at.get(cache_key, 0) < ttl:
             return self._config_cache[cache_key]
-        async with self._config_lock:
+        if len(self._config_locks) > 64 and cache_key not in self._config_locks:
+            self._config_locks.clear()
+        config_lock = self._config_locks.setdefault(cache_key, asyncio.Lock())
+        async with config_lock:
             # 双检：等锁期间可能已被其他请求填充
             if self._config_cache.get(cache_key) and _now_ms() - self._config_cache_at.get(cache_key, 0) < ttl:
                 return self._config_cache[cache_key]
@@ -431,7 +439,16 @@ class CaptchaManager:
                         kwargs["proxy"] = proxy
                     async with httpx.AsyncClient(**kwargs) as client:
                         res = await client.get(
-                            f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
+                            # billing 链版本锚定（内联 f-string 读当前值，
+                            # constants.py 注释：模块级快照会随 version_tracker
+                            # 运行期重赋而过期）
+                            f"{constants.CLIENT_CONFIGS_URL}"
+                            f"?app_version={constants.BILLING_APP_VERSION}",
+                            # 官方桌面端形态 UA：缺省时 httpx 默认 UA 自报
+                            # python-httpx 身份，与 install 同端点路径（带
+                            # ZCode/<ver> UA）形状分裂（2026-11-21 claim 链
+                            # 一致性迭代）。
+                            headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}"},
                         )
                     res.raise_for_status()
                     return ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
@@ -515,6 +532,15 @@ class CaptchaManager:
             except Exception:  # noqa: BLE001
                 pass
         self._refill_task = None
+        # 热路径触发的补货任务一并收口（2026-11-21 review P3）：原先只收
+        # _refill_task，池空触发的 _refill_batch 在停机后仍持引用逃逸
+        bg = list(self._bg_tasks)
+        self._bg_tasks.clear()
+        for t in bg:
+            if not t.done():
+                t.cancel()
+        if bg:
+            await asyncio.gather(*bg, return_exceptions=True)
 
     def _gate_open(self) -> bool:
         """是否允许**预热**：存在可走 Plan 对话的 jwt 账号才预热。
@@ -893,7 +919,10 @@ class CaptchaManager:
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
-        retries = max(1, int(max_retries or settings.CAPTCHA_SOLVE_RETRIES))
+        # 显式 0 = 「本轮禁用重试」（调用方契约），不能被 `or` 吞成默认值——
+        # claim 链传小值防长尾，0 意为 1 次尝试即止（2026-11-21 review P3）
+        retries = settings.CAPTCHA_SOLVE_RETRIES if max_retries is None \
+            else max(1, int(max_retries))
 
         attribution: str | None = None
         last_err: str | None = None

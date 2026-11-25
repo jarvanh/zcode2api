@@ -93,6 +93,11 @@ CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务�
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
+# ⚠️ captcha.fetch_config 走同一 client/configs 端点但归属 billing/claim 链：
+# 查询串/UA 必须锚 BILLING_APP_VERSION（用内联 f-string 读当前值，禁止模块级
+# 常量——version_tracker 运行期直接重赋 BILLING_APP_VERSION，模块级快照会静默
+# 过期）。install._fetch_client_configs 同端点已用 billing 版，双版本矛盾即指纹面。
+# 2026-11-21 claim 链一致性迭代。
 
 # ── 官方更新清单端点（2026-11-03 官方桌面端逆向实证）────────────────────────────
 # 官方客户端检查更新直连端点，返回 YAML 格式的最新版本、发布时间与原生 Markdown 更新日志
@@ -155,36 +160,46 @@ CAPTCHA_DEFAULTS = {
 # 老客户端（Claude Code 配置、第三方 SDK 默认 GLM-5.2）会固定带这些名字，若原样
 # 透传，客户端拿到的是上游 3006 而网关没有任何可用模型，等于「用一个合规请求换一个
 # 必然失败的响应」。因此退役名统一改写到当前主力型号（GLM-5.3），保留大小写别名。
+#
+# 2026-11-24 上游再改名：旗舰窗口 GLM-5.3 → GLM-5.4。线上实证（19:38 同一批
+# quota 刷新）：26 个号窗口名已是 GLM-5.4、6 个号仍是 GLM-5.3（rem=0）、5 个号
+# 只剩 Flash；5.3 与 5.4 **互斥**出现 = 同一窗口改名而非新增型号；Flash 未改名
+# （37/37 号仍是 GLM-5.3-Flash）。客户端仍在发 GLM-5.3（线上历史 122 次），
+# 原样透传有两重坏处：①上游只认新名；②账号选择按**请求模型名**精确对齐额度
+# 窗口（store 模型感知排富），5.3 请求在 26 个 5.4 号眼里等于「额度未知 = 0」，
+# 可用池被凭空削掉七成。故把 GLM-5.3 并入退役名改写链 → GLM-5.4（临时兼容，
+# 旧客户端配置零改动）。客户端全量切到 5.4 后，把 "GLM-5.3" 从两张别名表与
+# 目录里删掉即回滚本兼容。
+LIVE_FLAGSHIP_MODEL = "GLM-5.4"
 RETIRED_MODEL_ALIASES = {
-    "GLM-5.2": "GLM-5.3",
-    "GLM-5-Turbo": "GLM-5.3",
-    "GLM-5.1": "GLM-5.3",
-    "GLM-4.7": "GLM-5.3",
+    "GLM-5.3": LIVE_FLAGSHIP_MODEL,
+    "GLM-5.2": LIVE_FLAGSHIP_MODEL,
+    "GLM-5-Turbo": LIVE_FLAGSHIP_MODEL,
+    "GLM-5.1": LIVE_FLAGSHIP_MODEL,
+    "GLM-4.7": LIVE_FLAGSHIP_MODEL,
 }
 MODEL_NAME_MAP = {
+    "glm-5.4": LIVE_FLAGSHIP_MODEL,
     "glm-5.3-flash": "GLM-5.3-Flash",
-    "glm-5.3": "GLM-5.3",
-    "glm-5.2": "GLM-5.3",
-    "glm-5-turbo": "GLM-5.3",
-    "glm-turbo": "GLM-5.3",
-    "glm-5.1": "GLM-5.3",
-    "glm-4.7": "GLM-5.3",
+    "glm-5.3": LIVE_FLAGSHIP_MODEL,
+    "glm-5.2": LIVE_FLAGSHIP_MODEL,
+    "glm-5-turbo": LIVE_FLAGSHIP_MODEL,
+    "glm-turbo": LIVE_FLAGSHIP_MODEL,
+    "glm-5.1": LIVE_FLAGSHIP_MODEL,
+    "glm-4.7": LIVE_FLAGSHIP_MODEL,
 }
-# bigmodel 资源包模型：仅 OpenAI 兼容端点（/api/paas/v4/chat/completions）可用；
-# Anthropic 兼容端点受 Coding Plan 门禁（1309），不能走 _dispatch 的 Anthropic 通道。
+# bigmodel 资源包模型：仅 OpenAI 兼容端点可用（Anthropic 受 1309 门禁）。
 BIGMODEL_OPENAI_MODELS = ("glm-4.5-air", "glm-4.6v", "glm-4.7")
-# /v1/models 回退名单（capabilities 并集取不到时使用）
-AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
-# provider 命名空间模型目录（Magpie 模式：`zai/GLM-5.3` 前缀供外部 Agent 选 provider；
-# 裸名仍向后兼容，默认路由 zai）
-# provider 命名空间模型目录（Magpie 模式，上游 e038650）：`zai/GLM-5.3` 前缀
-# 供外部 Agent 选 provider；裸名仍向后兼容，默认路由 zai。仅作 /v1/models
-# 池空时的展示回退；实际允许的模型由账号 entitlements 动态判定。
+# /v1/models 对外公布（2026-11-24 实测旗舰窗口 = GLM-5.4）
+AVAILABLE_MODELS = ["GLM-5.3-Flash", LIVE_FLAGSHIP_MODEL]
+# provider 命名空间目录（GLM-5.3 条目改名兼容期临时保留）
 MODEL_CATALOG_NAMESPACED = [
-    "zai/GLM-5.3-Flash",
+    "zai/GLM-5.4",
     "zai/GLM-5.3",
-    "bigmodel/GLM-5.3-Flash",
+    "zai/GLM-5.3-Flash",
+    "bigmodel/GLM-5.4",
     "bigmodel/GLM-5.3",
+    "bigmodel/GLM-5.3-Flash",
 ]
 
 # 展示规格目录（context/max_output 同步自 zcode-api src/provider/models.ts，
@@ -196,7 +211,7 @@ MODEL_CATALOG_NAMESPACED = [
 # 只有确定为视觉模型的条目才带 vision=True；未列出的保持缺省（= 不支持），
 # 避免把纯文本模型标成视觉导致带图请求被路由到不支持的腿、错误溢出客户端。
 _VISION_MODEL_FAMILIES = (
-    "glm-5.3", "glm-5.2", "glm-4.6v", "glm-4.5v", "glm-5v",
+    "glm-5.4", "glm-5.3", "glm-5.2", "glm-4.6v", "glm-4.5v", "glm-5v",
     "deepseek-v4", "kimi-k3", "minimax-m3", "mimo-v2.6",
     "qwen3.8", "qwen4", "hy4flash",
 )
@@ -221,6 +236,7 @@ MODEL_CATALOG = [
     {"id": "glm-5.1", "context_window": 200_000, "max_output_tokens": 64_000},
     {"id": "glm-5.2", "context_window": 1_000_000, "max_output_tokens": 128_000},
     {"id": "glm-5.3", "context_window": 1_000_000, "max_output_tokens": 128_000},
+    {"id": "glm-5.4", "context_window": 1_000_000, "max_output_tokens": 128_000},
     {"id": "glm-5.3-flash", "context_window": 1_000_000, "max_output_tokens": 128_000},
 ]
 

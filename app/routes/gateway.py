@@ -313,6 +313,10 @@ def record_usage(model: str, tin=None, tout=None, credit=None) -> None:
             pass
 
 MAX_CAPTCHA_RETRIES = 3
+# 单请求全局求解预算（2026-11-22 review P2）：跨账号不重置。池空现解 10-40s/
+# 枚，无全局上界时 5 账号 × 3 次 = 15 次求解可拖 5-20 分钟；取 6 = 每账号
+# 3 次的 2 倍，正常单账号内可完成，跨号滥用被砍。
+MAX_CAPTCHA_SOLVES_PER_REQUEST = 6
 MAX_ACCOUNT_ATTEMPTS = 5
 
 # 常量收口：模型表与被拒信号关键字统一在 app/constants.py
@@ -1762,7 +1766,12 @@ async def count_tokens(request: Request):
     # 2026-11-17 review：_normalize_body 会原地剥离 provider 前缀/改写别名，
     # 必须改写后再取——否则 poweredBy 注入的是带前缀旧值（差一个模型名的估算偏差）
     model = str(body.get("model") or model)
-    return {"input_tokens": estimate_input_tokens_after_transform(body, model)}
+    # CPU 卸载（2026-11-22 迭代二 F2-4）：deepcopy + 全量 transform + 逐字符
+    # 计数对晚期会话 1-5MB body 是 0.3-1.5s 纯 CPU——此前同步跑在事件循环里
+    # 阻塞全部在飞 SSE 转发。Claude Code 每轮对话前都调本端点，高峰期并发
+    # count_tokens 会串行放大卡顿。
+    return {"input_tokens": await asyncio.to_thread(
+        estimate_input_tokens_after_transform, body, model)}
 
 
 def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
@@ -1810,7 +1819,13 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
     fail_frames：UpstreamStreamError（上游在流内下发 error 事件）时产出客户端
     可识别的失败帧——转译层各自形态；None = 无转译层的透传路径，该异常与普通
     异常同走「流传输中断」记账（与原 to_streaming 行为一致）。
-    """
+
+    传输层中断也产出失败帧（2026-11-22 迭代二 P1 根修）：此前只有流内 error
+    事件给帧，传输层异常（Server disconnected / ReadTimeout）走 else 分支吞掉
+    后生成器正常结束 = 客户端看到「干净 EOF」，宽容解析的 SDK 把半截回答当
+    完整成功——2026-11-16 事故（15 条 Server disconnected）正是此形态。现
+    fail_frames 存在时（流已开帧且属转译层）传输中断同样产出错误帧；透传路径
+    无协议错误帧可用，维持记账现状（reqlog 已记错误）。"""
     def decorate(gen_fn):
         async def guarded():
             try:
@@ -1820,7 +1835,7 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
                 reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
                 raise
             except Exception as err:  # noqa: BLE001
-                if isinstance(err, UpstreamStreamError) and fail_frames is not None:
+                if fail_frames is not None and isinstance(err, UpstreamStreamError):
                     # 上游在流内下发 error 事件：必须以客户端可识别的错误帧收尾，
                     # 不能让半截回答静默变成「成功」（2.7.33）
                     logs.req_err(req_id, f"上游流式错误: {err}")
@@ -1832,6 +1847,11 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
                     logs.req_err(req_id, f"流传输中断: {err}")
                     reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
                     _note_stream_abort(up, err, req_id)
+                    if fail_frames is not None:
+                        # 传输层中断（非流内 error）：同样产出失败帧，防半截
+                        # 回答以干净 EOF 呈现成功（2026-11-22 迭代二 P1）
+                        for frame in fail_frames(err):
+                            yield frame
             finally:
                 await up.close()
         return guarded
@@ -1843,7 +1863,7 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
     conv = StreamConverter(model)
 
     @_sse_guard(req_id, up, fail_frames=lambda err: (
-        error_sse(str(err), err.code), conv.done()))
+        error_sse(str(err), getattr(err, "code", None)), conv.done()))
     async def _iter():
         try:
             yield conv.start()
@@ -1961,7 +1981,9 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
     chat_conv = StreamConverter(model)
     resp_conv = ResponsesStreamConverter(model)
 
-    @_sse_guard(req_id, up, fail_frames=lambda err: resp_conv.fail(str(err), err.code))
+    @_sse_guard(req_id, up,
+                fail_frames=lambda err: resp_conv.fail(
+                    str(err), getattr(err, "code", None)))
     async def _iter():
         for out in resp_conv.start():
             yield out
@@ -2154,9 +2176,19 @@ async def _dispatch(req_id, body, incoming_headers, port, req_provider):
                         reqlog.finish_error(req_id, "出口 IP 被 WAF 拦截，静默中",
                                             status=405, kind="edge")
                         return _edge_response(key)
-                # 本 provider 池选不到号：限界排队等一等，吃掉「额度分钟级
-                # 滚动恢复」型故障。返回 None 表示不排队（关闭 / 预算耗尽 /
-                # 空池 / 无可恢复账号 / 波次暂停）→ 按上游语义下沉下一 provider。
+                # fork 口径：池级额度耗尽立即 402（OmniRoute quota_exhausted），
+                # 不排队——排队探测会把刚判死的号按旧账本翻活再撞 1005。
+                _k, _w = _recovery(provider, model_key)
+                if _k == "quota" and _w:
+                    _ra = max(1, int(_w - time.time() + 0.999))
+                    reqlog.finish_error(req_id, "池级额度耗尽", status=402, kind="quota")
+                    return JSONResponse(
+                        {"error": {
+                            "message": "所有账号套餐额度已用尽，等待窗口重置或自动领取新套餐",
+                            "type": "model_no_quota", "code": "no_quota_for_model",
+                            "model": model_key, "next_available_at": round(_w),
+                        }, "retry_after": _ra},
+                        status_code=402, headers={"Retry-After": str(_ra)})
                 waited = await _wait_for_account(req_id, provider, t0, deadline, queued, budget)
                 if waited is not None:
                     queued += waited
@@ -2790,9 +2822,24 @@ _bg_tasks: set[asyncio.Task] = set()
 
 
 def _spawn_bg(coro) -> None:
-    task = asyncio.create_task(coro)
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # 无运行中的事件循环：不 spawn，关掉协程防告警
+        coro.close()
+        return
     _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    # 异常留痕（2026-11-22 review P3 根修）：discard 回调不查异常，rebalance/
+    # verify_then_rebalance 内层逃逸的异常（历史 AttributeError 事故同形态）
+    # 会静默消失零归因。CancelledError 属正常停机不告警。
+    def _done(t: asyncio.Task) -> None:
+        _bg_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logs.err("gateway", f"后台任务异常退出: {exc!r}")
+    task.add_done_callback(_done)
 
 
 # 账号并发限制：account_id → 在飞请求数。asyncio 单线程事件循环下
@@ -2898,6 +2945,20 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
         return  # 不可判定 → 放行，让真实请求去定生死
     if any(v == 0.0 for v in verdicts):
         return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
+    # EXHAUSTED 号的恢复探查补链（2026-11-22 review P2 根修）：EXHAUSTED 号有
+    # 枯竭证据（verdict 非 None）不进上面的 stale 列表，恢复唯一来源 = quota
+    # monitor 定时刷新。monitor 被后台关闭（quota_refresh_interval=0）时刷新
+    # 链断 → EXHAUSTED 号被 select 滤掉永远等不到真实请求触发 exhaust 分支
+    # → 恢复死锁。到达本行 = 全池确认枯竭，对 EXHAUSTED 号做同款节流 spawn
+    # （与 stale 共用 _pool_probe_last 限频），任何配置下恢复链都有兜底来源。
+    now = time.time()
+    for a in accounts:
+        if a.status == Status.EXHAUSTED and a.mode == "jwt" and a.allows_billing():
+            last_probe = _pool_probe_last.get(a.id, 0.0)
+            if now - last_probe < settings.GATE_POOL_PROBE_MIN_SECONDS:
+                continue
+            _pool_probe_last[a.id] = now
+            _spawn_bg(_safe_refresh(a))
     future = [v for v in verdicts if v > 0]
     next_start = min(future) if future else -1.0
     now = time.time()
@@ -3167,6 +3228,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     channel_idx = 0
     channel = ladder[0]
     captcha_retries = 0
+    # 单请求全局补码预算（2026-11-22 review P2 根修）：MAX_CAPTCHA_RETRIES 是
+    # 每账号上限，换号后从 0 起算——5 账号 × 3 次 = 单请求最多 15 次求解，
+    # 池空现解 10-40s/枚，极端形态（出口被持续要求验证码）单请求拖 5-20 分钟
+    # 白烧求解预算。进程级计数换号不重置：吃满即拒（对齐 CaptchaSolveError
+    # 的 500 兜底回执），请求侧止损优先。
+    captcha_solves_total = 0
     retries_429 = 0
     retries_busy = 0  # 3008/3009/3010 并发槽原地重问次数（BUSY_WAITS 节奏）
     retries_5xx = 0
@@ -3251,6 +3318,19 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 _park_slot(slot_box)
                 cap_t0 = time.time()
                 try:
+                    # 全局求解预算闸（2026-11-22 review P2）：换号不重置，吃满
+                    # 即止——单请求对求解链的消耗有进程级上界。
+                    if captcha_solves_total >= MAX_CAPTCHA_SOLVES_PER_REQUEST:
+                        logs.warn(req_id,
+                                  f"单请求求解预算耗尽（{captcha_solves_total} 次），"
+                                  f"不再白烧——返回验证码错误")
+                        reqlog.finish_error(req_id, "人机校验求解预算耗尽", status=500)
+                        return JSONResponse(
+                            {"error": {"message": "无法完成人机校验（求解预算耗尽）",
+                                       "type": "captcha_error"}},
+                            status_code=500,
+                        )
+                    captcha_solves_total += 1
                     # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                     # 换出口使用会被上游判 unusual activity（3012）。per-account
                     # 模式下 = 账号绑定代理（token 出口 = 请求出口）。

@@ -86,6 +86,7 @@ class TestChannelLadderExhaust1310:
 
         # zcode-plan 用 JWT Bearer → bind=JWT 前 16 chars
         mock.state.sequences[_JWT_OAUTH[:16]] = ["quota_exhausted_1310"]
+        mock.state.billing_balance_windows = []  # 账单与 1005 一致，避免刷新翻活
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
 

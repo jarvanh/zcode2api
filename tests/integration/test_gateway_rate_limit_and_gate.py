@@ -16,7 +16,7 @@ import time
 import httpx
 import pytest
 
-from app import egress, settings
+from app import constants, egress, settings
 from app.models import Status
 
 # mock 的 sequences/counters 按凭证前 16 位累计（session 级），每个用例必须用
@@ -45,6 +45,10 @@ _JWT_1113_PLAN = "hY9p.eyJzdWIiOiJ4In0.sig"
 _JWT_1113_KEY = "hZ0q.eyJzdWIiOiJ4In0.sig"
 
 _MSG_BODY = {"model": "GLM-5.3", "messages": [{"role": "user", "content": "hi"}]}
+# 2026-11-24 上游把旗舰窗口改名 GLM-5.3 → GLM-5.4：请求体**故意**仍发 GLM-5.3
+# （等价于线上旧客户端，走 _normalize_body 的兼容改写链），但 plan_guard 冷却键与
+# 额度窗口按**改写后**的名字记账，凡断言「请求打出来的冷却」的用例必须对齐改写结果。
+_FLAGSHIP = constants.LIVE_FLAGSHIP_MODEL
 _PLAN_PATH = "/api/v1/zcode-plan/anthropic/v1/messages"
 _KEY_PATH = "/api/anthropic/v1/messages"
 ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
@@ -520,7 +524,7 @@ class TestNoBalance1113:
 
         after = fresh_app.find("zai", acc.id)
         assert after.status != Status.EXHAUSTED  # fork：模型级冷却，不整号标死
-        assert after.is_model_cooling("GLM-5.3")
+        assert after.is_model_cooling(_FLAGSHIP)
         assert "1113" in (after.last_error or "")
 
         # 第二个请求不再打上游（模型冷却不可选）
@@ -1105,7 +1109,7 @@ class TestPlanModelExhaust:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         # fork：单号池额度耗尽 → 402（OmniRoute quota_exhausted 语义）
         assert res.status_code == 402
-        assert plan_guard.cooling(acc.id, "GLM-5.3")  # 模型级记忆已打点
+        assert plan_guard.cooling(acc.id, _FLAGSHIP)  # 模型级记忆已打点
 
         # billing 刷新把号救回 ACTIVE（窗口恢复的号），但旗舰 1005 冷却仍在 TTL 内
         acc.status = Status.ACTIVE
@@ -1141,7 +1145,7 @@ class TestPlanModelExhaust:
 
         res1 = await client.post("/v1/messages", json=_MSG_BODY)  # 旗舰撞 1005
         assert res1.status_code == 402  # fork：单号池额度耗尽 → 402
-        assert plan_guard.cooling(acc.id, "GLM-5.3")
+        assert plan_guard.cooling(acc.id, _FLAGSHIP)
 
         # billing 刷新救回 ACTIVE（Flash 窗口在账），旗舰冷却仍在
         acc.status = Status.ACTIVE
@@ -1209,7 +1213,7 @@ class TestPlanModelExhaust:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         # fork：Plan 1113 → 模型级冷却，单模型池空 → 429 model_no_quota
         assert res.status_code == 429
-        assert plan_guard.cooling(acc.id, "GLM-5.3")  # Plan 分支同步打点
+        assert plan_guard.cooling(acc.id, _FLAGSHIP)  # Plan 分支同步打点
 
         # 账号被救活（ACTIVE）后同模型请求不再撞 1113
         acc.status = Status.ACTIVE
@@ -1265,7 +1269,7 @@ class TestPlanModelExhaust:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         # fork 口径：单号池额度耗尽 → 402（OmniRoute quota_exhausted 语义）
         assert res.status_code == 402
-        assert plan_guard.cooling(acc.id, "GLM-5.3")
+        assert plan_guard.cooling(acc.id, _FLAGSHIP)
 
         # 重启模拟：内存态清零（新进程形态）——盘上条目应救回冷却记忆
         plan_guard._plan_model_exhausted.clear()

@@ -289,3 +289,75 @@ class TestConcurrencySetting:
                                    headers={"Authorization": "Bearer zcode"})
             assert res.status_code == 200
             assert res.json()["account_concurrency"] == 4
+
+
+async def test_schedule_install_dedupes_inflight(fresh_app, monkeypatch):
+    """按账号在途去重（2026-11-21 review P3）：同账号连击调度只跑一个任务，
+    防止多个安装任务并发重复打 configs/激活事件。"""
+    import asyncio
+
+    from app import install
+
+    acc = fresh_app.add_account("zai", "t", "h1.eyJzdWIiOiJhIn0.sig")
+
+    calls = []
+    started = asyncio.Event()
+
+    async def fake_seq(account):
+        calls.append(account.id)
+        started.set()
+        await asyncio.sleep(0.05)  # 保持任务在途窗口
+        return {"errors": [], "configs_fetched": True,
+                "events_reported": [], "installed": True, "skipped": False}
+
+    monkeypatch.setattr(install, "run_install_sequence_for_account", fake_seq)
+
+    install.schedule_install(acc)
+    install.schedule_install(acc)  # 连击第二次：在途应被跳过
+    await started.wait()
+    # 第二次调度发生在首任务在途期间 → 只有一个任务
+    await asyncio.sleep(0.1)
+    assert calls == [acc.id]
+    # 任务完成后再调度：允许新一轮
+    install.schedule_install(acc)
+    await asyncio.sleep(0.15)
+    assert len(calls) == 2
+
+
+async def test_add_accounts_count_counts_only_new(fresh_app, monkeypatch):
+    """count 只计真新增（2026-11-21 review P3）：重复 token 返回旧账号，
+    count 原先把它也计入导致高估。"""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import create_app
+    from app.store import store
+
+    fresh_app.add_account("zai", "old", "h1.eyJzdWIiOiJhIn0.sig")
+    app = create_app()
+    monkeypatch.setattr("app.routes.admin_api.store", store)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        res = await client.post("/admin/api/accounts",
+                                json={"tokens": "h1.eyJzdWIiOiJhIn0.sig\nh2.eyJzdWIiOiJiIn0.sig"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["count"] == 1  # 只有第二个 token 是真新增
+        assert len(data["ids"]) == 2  # ids 回全量受理清单
+
+
+async def test_refresh_all_string_false_does_not_refresh_pool(fresh_app, monkeypatch):
+    """payload["all"]="false" 字符串判真修复（2026-11-21 review P3）：
+    字符串 "false" 不再误刷全池，只有真布尔/明确 true 字面量才触发。"""
+    from unittest.mock import patch
+
+    from app.routes import admin_api
+
+    fresh_app.add_account("zai", "t", "h1.eyJzdWIiOiJhIn0.sig")
+    with patch.object(admin_api, "refresh_accounts", return_value={"ok": 1}) as mock_rf:
+        await admin_api.refresh({"all": "false"})
+        # "false" 字符串不再触发全池刷新（走 ids 分支且 ids 为空 → 空池调用）
+        assert mock_rf.call_args[0][0] == []
+        mock_rf.reset_mock()
+        await admin_api.refresh({"all": True})
+        # 真 true 才刷全池（jwt 号入参）
+        assert len(mock_rf.call_args[0][0]) == 1

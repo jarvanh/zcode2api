@@ -19,12 +19,8 @@ ADMIN_LOCK_SECONDS = 300
 _MAX_FAIL_TRACKED = 4096
 
 # 是否信任反代注入的客户端 IP 头（cf-connecting-ip / x-real-ip）。
-# 默认关闭：直连场景该头可被客户端伪造，每伪造一个 IP 即获得一个全新的
-# 失败计数桶，等效绕过登录锁定。仅显式设为 1 且 TCP 来源属于受信代理时
-# 才读取转发头；无反代直连部署必须保持 0。
+# fork：ZCODE_TRUST_PROXY_IP=1 + 受信网段；上游：TRUST_PROXY_HEADERS=1 显式开关。
 TRUST_PROXY_IP = (os.getenv("ZCODE_TRUST_PROXY_IP") or "0").strip() == "1"
-# 受信代理来源（逗号分隔 IP/CIDR）；默认只信任本机回环（cloudflared/nginx
-# 与网关同机）。反代在其它地址时用 ZCODE_TRUSTED_PROXIES 显式追加。
 DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,::1"
 
 
@@ -45,8 +41,9 @@ TRUSTED_PROXY_NETWORKS = _parse_trusted_proxies(
     os.getenv("ZCODE_TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES)
 )
 
-# ip -> {count, locked_until, last}
+# ip -> {count, locked_until, last}；容量封顶（上游 2026-11-21 P1）。
 _failures: dict[str, dict] = {}
+_FAILURES_MAX = 1024
 
 
 def reset_failures() -> None:
@@ -65,8 +62,14 @@ def _is_trusted_proxy(host: str) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    peer = request.client.host if request.client and request.client.host else ""
-    if TRUST_PROXY_IP and peer and _is_trusted_proxy(peer):
+    """客户端身份（锁定键）。三条采信路径，其余用 socket 对端地址：
+    1) fork：TRUST_PROXY_IP=1 且来源属于受信网段；
+    2) upstream：settings.TRUST_PROXY_HEADERS=1；
+    3) upstream 回环豁免：HOST=127.0.0.1 且来源 127.0.0.1（本机隧道）。
+    头值必须为合法 IP，畸形忽略退回真实来源。"""
+    peer = request.client.host if (request.client and request.client.host) else ""
+
+    def _from_headers() -> str | None:
         for header in ("cf-connecting-ip", "x-real-ip"):
             val = (request.headers.get(header) or "").strip()
             if not val:
@@ -75,17 +78,27 @@ def _client_ip(request: Request) -> str:
             try:
                 ipaddress.ip_address(candidate)
             except ValueError:
-                continue  # 伪造/畸形头：忽略，退回真实来源
+                continue
             return candidate
+        return None
+
+    if TRUST_PROXY_IP and peer and _is_trusted_proxy(peer):
+        got = _from_headers()
+        if got:
+            return got
+    if settings.TRUST_PROXY_HEADERS:
+        got = _from_headers()
+        if got:
+            return got
+    if peer == "127.0.0.1" and settings.HOST == "127.0.0.1":
+        got = _from_headers()
+        if got:
+            return got
     return peer or "unknown"
 
 
 def _gc_failures(now: float) -> None:
-    """清理过期失败记录，防无界增长。
-
-    锁定窗口已过且超过一个锁定周期未再失败的记录直接淘汰；仍超容量
-    时按 last 淘汰最旧的一半（锁定中的记录保留，避免 GC 放走爆破者）。
-    """
+    """过期清扫（fork 2026-09-29 配套）：超容量按 last 淘汰一半。"""
     stale = [
         ip for ip, rec in _failures.items()
         if float(rec.get("locked_until") or 0) < now
@@ -112,21 +125,23 @@ def _is_locked(ip: str) -> bool:
 
 
 def _record_failure(ip: str, probed: bool = False) -> None:
-    """记录一次失败。
-
-    probed=True 表示会话探测（页面轮询 /admin/api/verify 检查本地密钥是否
-    仍然有效：密钥过期、后台改密后旧标签页都会打出 401）。这类请求不是人
-    在猜密码，却按旧逻辑每次都计数——监控页 5 秒一轮，40 秒即可把 IP 锁满
-    300 秒，锁定期内正确密码也被拒（2026-09-29 连续两次实际锁死）。
-    探测只计数不锁：锁只保留给真正的登录提交。
-    """
+    """probed=True 只计数不锁（fork 2026-09-29 修复）；容量封顶（上游 P1）。"""
     now = time.time()
     _gc_failures(now)
+    cap = min(_MAX_FAIL_TRACKED, _FAILURES_MAX)
+    if len(_failures) >= cap and ip not in _failures:
+        for _ in range(len(_failures) - cap + 1):
+            try:
+                _failures.pop(next(iter(_failures)))
+            except StopIteration:
+                break
     rec = _failures.setdefault(ip, {"count": 0, "locked_until": 0.0, "last": now})
     rec["last"] = now
+    rec["count"] = int(rec.get("count") or 0) + 1
     if probed:
-        rec["count"] = int(rec.get("count") or 0) + 1
         return
+    if rec["count"] >= ADMIN_FAIL_LIMIT:
+        rec["locked_until"] = now + ADMIN_LOCK_SECONDS
     rec["count"] = int(rec.get("count") or 0) + 1
     if rec["count"] >= ADMIN_FAIL_LIMIT:
         rec["locked_until"] = now + ADMIN_LOCK_SECONDS
@@ -188,9 +203,14 @@ async def verify_gateway_key(
     """校验 /v1/messages 网关访问密钥（未配置则拒绝：fail-closed）。
 
     未配置密钥时放行等于把上游账号池暴露成公开代理——只要部署后忘了设置
-    gateway key，任何人都能用你的额度（2.7.33）。唯一逃生口是显式设置
-    `ZCODE_GATEWAY_ALLOW_NO_KEY=1`（本地开发/测试）。
+    gateway key，任何人都能用你的额度。唯一逃生口是显式设置
+    `ZCODE_GATEWAY_ALLOW_NO_KEY=1`（本地开发/测试）。失败锁定复用 admin
+    的 _failures 表按客户端身份分键（上游 2026-11-21 review P3）。
     """
+    ip = _client_ip(request)
+    if _is_locked(ip):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "失败次数过多，请稍后再试")
+
     key = store.gateway_key()
     if not key:
         if settings.GATEWAY_ALLOW_NO_KEY:
@@ -201,6 +221,9 @@ async def verify_gateway_key(
         )
     token = _extract_bearer(authorization) or x_api_key
     if token is None:
+        _record_failure(ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少 API Key")
     if not _key_equal(token, key):
+        _record_failure(ip)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "API Key 无效")
+    _failures.pop(ip, None)

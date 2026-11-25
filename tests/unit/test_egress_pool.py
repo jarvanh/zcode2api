@@ -162,9 +162,12 @@ async def test_rebalance_bans_dead_probes_then_succeeds(tp_mode, monkeypatch):
 async def test_rebalance_pool_exhausted_keeps_binding(tp_mode, monkeypatch):
     acc = _account(acc_id="acc-z")
     acc.egress_node = "old-node"
-    stub = _StubPool([("fail", 503)], [])
+    # 池枯 = 每轮 acquire 都 fail（2026-11-22 P1 恢复轮：失败终态后会再跑一次
+    # 恢复轮，stub 须覆盖两轮 acquire + 各轮第 4 轮兜底 acquire = 4 次）
+    stub = _StubPool([("fail", 503)] * 4, [])
     monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
     monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+    monkeypatch.setattr(egress_pool.settings, "TP_REBALANCE_RETRY_DELAY", 0)
 
     async def _probe_200(self, account, proxy_url, jwt):
         return 200, "{}"
@@ -434,9 +437,10 @@ async def test_rebalance_gateway_abort_aligns_binding(tp_mode, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
-    """熔断关闭（TP_GATEWAY_FAIL_ABORT=0）时的既有行为回归：rebalance 3 轮
-    全败——服务端绑定已随 force_rebalance 移走——第 4 轮 acquire+探针验收，
-    hub 记录必须对齐 TP 实际绑定（不留在旧节点）。"""
+    """熔断关闭（TP_GATEWAY_FAIL_ABORT=0）时的既有行为回归：rebalance 主轮
+    3 轮全败——服务端绑定已随 force_rebalance 移走——第 4 轮 acquire+探针验收，
+    hub 记录必须对齐 TP 实际绑定（不留在旧节点）。恢复轮（2026-11-22 P1）
+    会再跑一轮 3+1，probe 序号继续递增，终态同样对齐 TP 实际绑定。"""
     seq = {"probe": 0}
 
     async def fake_tp_ban(node, reason, evidence, account_name):
@@ -447,9 +451,10 @@ async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
 
     async def fake_probe(self, account, proxy_url, jwt):
         seq["probe"] += 1
-        return 0, "ConnectError: dead"  # 前三轮全部探不通
+        return 0, "ConnectError: dead"  # 探针恒连不通（模拟全链故障）
 
     monkeypatch.setattr(settings, "TP_GATEWAY_FAIL_ABORT", 0)
+    monkeypatch.setattr(settings, "TP_REBALANCE_RETRY_DELAY", 0)
     monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
     monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
     monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", fake_probe)
@@ -461,7 +466,8 @@ async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
     assert ok is False  # 未达成健康换绑
     assert acc.egress_node != "node-old", \
         "hub 记录不得停留在已被 force_rebalance 移走的旧节点（分叉=互斥集合被污染）"
-    assert acc.egress_node == "node-cand-3"  # TP 实际绑定（第 3 候选）
+    # 恢复轮终态：TP 实际绑定（恢复轮第 3 候选 = 全局第 8 次 probe，0..7）
+    assert acc.egress_node == "node-cand-7"
 
 
 def tmp_db_factory(monkeypatch):
@@ -1051,6 +1057,7 @@ async def test_round4_conflict_short_circuits_before_probes(tp_mode, monkeypatch
     # 本测试探针桩返回 st=0（连接级失败）——2.7.68 起这会触发网关级熔断；
     # 此处关注第 4 轮短路语义，显式关闭熔断（熔断另有专测）
     monkeypatch.setattr(settings, "TP_GATEWAY_FAIL_ABORT", 0)
+    monkeypatch.setattr(settings, "TP_REBALANCE_RETRY_DELAY", 0)
 
     # 复核快照恒返回 cand-* 全部被 zh-other 占用
     async def _conflict_snapshot():
@@ -1060,8 +1067,10 @@ async def test_round4_conflict_short_circuits_before_probes(tp_mode, monkeypatch
 
     ok = await egress_pool.egress_pool.rebalance(acc, reason="test", ban=False)
     assert ok is False
-    assert len(probe_calls) == 3, \
-        "主循环 3 轮探针合法；第 4 轮复核冲突候选不得烧探针"
+    # 主轮 + 恢复轮（2026-11-22 P1）各 3 轮探针 = 6；两轮的第 4 轮复核冲突
+    # 候选均不烧探针
+    assert len(probe_calls) == 6, \
+        "主/恢复轮各 3 轮探针合法；第 4 轮复核冲突候选不得烧探针"
 
 
 @pytest.mark.asyncio
@@ -1788,3 +1797,34 @@ async def test_tier_audit_fail_open_on_missing_tier_snapshot(tp_mode, monkeypatc
     pool = egress_pool.TetherPoolEgress()
     await pool._audit_tier_once(initial_delay=0)
     assert rebalanced == []
+
+
+@pytest.mark.asyncio
+async def test_rebalance_debounce_gate_blocks_recovery_round(tp_mode, monkeypatch):
+    """迭代二 F1 回归防线（2026-11-22 迭代三收口）：去抖窗内的 rebalance 必须在
+    预检层被拦（0 次 _rebalance_locked 调用）——若预检被删、去抖退回
+    _rebalance_locked 入口，本函数返回值同为 False，但恢复轮会 pop 戳重跑一轮
+    acquire = 去抖被架空（当日 review 实证的 P1 修复失效形态）。
+
+    断言 _rebalance_locked 调用次数 == 0 是唯一能防住该回归的观测点。"""
+    calls: list[str] = []
+
+    async def fake_locked(self, account, reason=None, ban=True):
+        calls.append(reason)
+        pool._rebalance_at[account.id] = time.monotonic()  # 收尾盖戳
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_rebalance_locked",
+                        fake_locked)
+    monkeypatch.setattr(egress_pool.settings, "TP_REBALANCE_RETRY_DELAY", 0)
+    acc = _account(acc_id="acc-d")
+    acc.egress_node = "old-node"
+
+    pool = egress_pool.TetherPoolEgress()
+    monkeypatch.setattr(settings, "TP_REBALANCE_DEBOUNCE", 120)
+    assert await pool.rebalance(acc, reason="first", ban=False) is True
+    assert calls == ["first"]
+    # 去抖窗内再触发：预检直接 False，锁内方法零调用（恢复轮不进）
+    assert await pool.rebalance(acc, reason="second", ban=False) is False
+    assert calls == ["first"], \
+        f"去抖窗内预检未拦（锁内方法被调 {calls}）——恢复轮将架空去抖语义"

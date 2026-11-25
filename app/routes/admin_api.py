@@ -338,7 +338,9 @@ async def add_accounts(payload: dict = Body(...)):
         _schedule_install(acc)  # 按账号安装序（含 apiKey 账号，幂等）
         if acc.mode == "jwt":
             _schedule_auto_claim(acc)  # 授权完成即激活+自动领取，入池即吃满活动
-    return {"count": len(added), "ids": added}
+    # count 只计真新增（2026-11-21 review P3）：原 len(added) 把去重命中的旧
+    # 账号也计入，响应高估新增数诱导误判；added/ids 仍回全量受理清单
+    return {"count": len(new_accounts), "ids": added}
 
 
 # ── 删除账号 ─────────────────────────────────────────────────────────────────
@@ -352,6 +354,24 @@ async def delete_accounts(ids: list[str] = Body(...)):
         acc = store.find_any(aid)
         if acc and store.remove_account(acc.provider, aid):
             clear_key_no_balance(aid)  # 删除即无残留（Key-1113 冷却记忆）
+            # 网关在飞槽位残键清理（2026-11-22 迭代二 F3-1）：释放路径只减
+            # 计数不摘键，删除账号的键以 0 值永驻（随账号 churn 线性增长）。
+            # 在飞请求的 close 回调 pop 时 KeyError 面由 pop 默认值兜住。
+            from .gateway import _inflight
+            _inflight.pop(aid, None)
+            # per-tag 运行态清理（2026-11-21 review P3）：gate 断路器/连接失败
+            # 聚类/captcha 池按出口 tag 分键，删号不清理 = 死 tag 永久残留，
+            # edge_hits 还会持续计进监控口径。仅 per-account 代理 tag 需要清
+            # （proxy/direct 共享 tag 语义保留）。claim 互斥锁随任务结束自灭，
+            # 在途领取由上面的后台任务收口兜底，无需在此清。
+            acc_proxy = egress.account_proxy(acc)
+            if acc_proxy:
+                from ..captcha import captcha_manager
+                from ..gate import gate
+
+                gate.reset_tag(acc_proxy)
+                egress.clear_conn_fails(acc_proxy)
+                captcha_manager.invalidate(acc_proxy)
             # TP 分配随账号删除一并释放（2026-11-18 review P2 根修）：不释放
             # 会孤儿化占节点——2026-11-17 实查 27 个分配里 16 个陈旧即历史
             # 删除账号的残留，池压下把现役账号挤向软排除兜底（ban 节点/共享
@@ -367,6 +387,10 @@ async def delete_accounts(ids: list[str] = Body(...)):
                 except Exception as err:  # noqa: BLE001 - 释放失败不阻断删除
                     logs.warn("egress_pool", f"TP 分配释放异常 zh-{aid}: {err!r}")
             deleted += 1
+    if deleted:
+        # 审计留痕（2026-11-21 review P2）：删号是高危操作，只落数量与 id，
+        # 不落任何凭证内容
+        logs.warn("admin", f"删除账号 ×{deleted}: {', '.join(ids)}")
     return {"deleted": deleted}
 
 
@@ -474,7 +498,12 @@ async def rotate_fingerprint(account_id: str):
 @router.post("/accounts/refresh")
 async def refresh(payload: dict = Body(default=None)):
     payload = payload or {}
-    if payload.get("all"):
+    # 布尔归一（2026-11-21 review P3）：payload["all"] 可能是字符串 "false"——
+    # 原 get("all") 直接判真，字符串 "false" 会误刷全池
+    all_flag = payload.get("all")
+    all_flag = all_flag is True or (
+        isinstance(all_flag, str) and all_flag.strip().lower() in ("true", "1", "yes"))
+    if all_flag:
         pool = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
     else:
         ids = set(payload.get("ids") or [])
@@ -814,7 +843,7 @@ async def claim(payload: dict = Body(default=None)):
     while len(_claim_jobs) > _CLAIM_JOB_KEEP:  # 最老挤出，防无界增长
         _claim_jobs.pop(next(iter(_claim_jobs)))
 
-    task = asyncio.create_task(_run_claim_job(runnable, plan_id, rec))
+    task = asyncio.create_task(_run_claim_job_guarded(runnable, plan_id, rec))
     _claim_job_tasks.add(task)
     task.add_done_callback(_claim_job_tasks.discard)
 
@@ -891,7 +920,14 @@ async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None
                 result = await do_claim(acc, plan_id, allow_disabled=True)
             rec["outcomes"].append(
                 {"account_id": acc.id, "account_name": acc.name, "ok": True, **result})
-            await refresh_accounts([acc])
+            # refresh 移出主 try（2026-11-21 review P2）：它在成功 outcome 之后，
+            # 原本与 append 同 try——refresh 抛异常会落兜底 except 再 append 一条
+            # ok:False，同号双 outcome 自相矛盾，摘要把已领成功的号计成 fail。
+            # 刷新失败只降级留痕，不影响领取结果。
+            try:
+                await refresh_accounts([acc])
+            except Exception as refresh_err:  # noqa: BLE001 - 额度刷新失败不掩盖领取成功
+                logs.warn("claim", f"账号 {acc.name} 领取成功但额度刷新失败: {refresh_err!r}")
         except ClaimError as err:
             logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
             outcome = {"account_id": acc.id, "account_name": acc.name,
@@ -916,6 +952,16 @@ async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None
             rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
                                     "ok": False, "message": str(err)})
     rec["done"] = True
+
+
+async def _run_claim_job_guarded(runnable: list, plan_id: str | None, rec: dict) -> None:
+    """_run_claim_job 外壳（2026-11-22 迭代二 F3-2）：CancelledError（停机收割）
+    是 BaseException 不被内层 except Exception 捕获，原实现 rec["done"] 永不
+    置位 = GET /claim/{job_id} 永远 running。finally 收口防僵尸状态。"""
+    try:
+        await _run_claim_job(runnable, plan_id, rec)
+    finally:
+        rec["done"] = True
 
 @router.post("/claim/manual")
 async def claim_manual(payload: dict = Body(...)):
@@ -1030,12 +1076,16 @@ async def update_settings(payload: dict = Body(...)):
             pass  # 前端回填的掩码，不改密
         else:
             store.set_setting("admin_key", _check_key(key, "后台密钥"))
+            # 审计留痕：key 被换掉的时机必须可取证（key 被盗后攻击者轮换 key
+            # 的动作不可见 = 安全事件盲区）。掩码尾 4 位，不落明文。
+            logs.warn("admin", f"后台密钥已变更 …{key[-4:]}")
     if "gateway_key" in payload:
         key = str(payload["gateway_key"] or "").strip()
         if "…" in key or key == "••••":
             pass
         else:
             store.set_setting("gateway_key", _check_key(key, "网关密钥"))
+            logs.warn("admin", f"网关密钥已变更 …{key[-4:]}")
     if "bigmodel_channel_enabled" in payload:
         store.set_setting("bigmodel_channel_enabled",
                           "1" if payload["bigmodel_channel_enabled"] else "0")
@@ -1113,13 +1163,23 @@ async def check_zcode_version_now():
 # Referer），并显式禁止缓存（2.7.33）。
 @router.post("/export")
 async def export_accounts():
-    return JSONResponse(store.export(), headers={"Cache-Control": "no-store"})
+    data = store.export()
+    # 审计留痕：明文凭证导出是最高危动作，何时导了、导了多少必须可查
+    n = sum(len(v) for v in (data.get("providers") or {}).values() if isinstance(v, list))
+    logs.warn("admin", f"导出账号池（含明文凭证）: {n} 个账号")
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/import")
 async def import_accounts(payload: dict = Body(...)):
     existing = {a.id for a in store.list_accounts()}
-    count = store.import_accounts(payload)
+    count = -1  # -1 = 形状闸前炸出（审计可辨识）
+    try:
+        count = store.import_accounts(payload)
+    finally:
+        # 审计先于回执/异常（2026-11-22 迭代二）：导入是高危动作（凭证批量
+        # 落库），中途炸出也必须留痕——对齐导出留痕纪律
+        logs.warn("admin", f"导入账号池: {count} 条（含凭证）")
     # 导入的新账号：安装序（幂等）+ JWT 账号激活+自动领取（幂等：重复 token 不新增）
     imported = [a for a in store.list_accounts("zai") if a.id not in existing]
     for acc in imported:

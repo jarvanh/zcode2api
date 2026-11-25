@@ -369,6 +369,8 @@ async def test_new_account_without_quota_fails_once_then_exhausted(gateway_clien
     client, mock = gateway_client
     seed_account(fresh_app, _JWT_TRIAL_DEAD, name="a-trial-dead")
     mock.state.sequences[_JWT_TRIAL_DEAD[:16]] = ["quota_exhausted_200"]
+    # 账单与 messages 一致报无额度：否则后台刷新用 mock 默认余额把刚判死的号翻回 ACTIVE
+    mock.state.billing_balance_windows = []
     # billing 走同一凭证前缀，同样落到 quota_exhausted_200 之外的分支即可
     # （billing_* 场景只认 balance_expired/billing_*，quota_exhausted_200 → 默认成功）
 

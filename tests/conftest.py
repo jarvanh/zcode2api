@@ -133,10 +133,11 @@ def fresh_app(tmp_path, monkeypatch):
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()
-    # 风暴去重是进程级单例（app/dedup.py），失败缓存跨用例泄漏会让后续同指纹
-    # 用例直接吃到上一个用例的重放响应——随 app 生命周期一并重置。
+    # 风暴去重单例复位（fork）+ admin key 固定（上游强度闸适配）
     from app import dedup as dedup_module
     dedup_module._reset_for_tests()
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_KEY", "zcode")
+    fresh.set_setting("admin_key", "zcode")
     return fresh
 
 
@@ -192,6 +193,7 @@ def stub_captcha() -> _StubCaptcha:
 async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     """挂好 Mock 上游的网关 ASGI 客户端。返回 (client, mock_app)。"""
     mock_app, port = mock_server
+    mock_app.state.billing_balance_windows = None
     base = f"http://127.0.0.1:{port}"
     # 网关默认 fail-closed（2.7.33）：测试用例不逐一配 key，显式打开放行开关，
     # 鉴权行为本身由 test_gateway_auth 用显式 key / 默认开关关闭来覆盖。
@@ -276,4 +278,5 @@ def _reset_risk_wave_state(monkeypatch):
     monkeypatch.setattr(app_settings, "PROXY_ROTATE_ENABLED", False)
     gw._risk_wave_reset_for_tests()
     yield
+    mock_app.state.billing_balance_windows = None
     gw._risk_wave_reset_for_tests()

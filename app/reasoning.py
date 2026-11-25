@@ -38,6 +38,7 @@ GLM53_MIN_THINKING_BUDGET = 1_024
 
 # ZCode 目录 maxOutputTokens（截顶用；未收录模型不截顶）
 MODEL_MAX_OUTPUT_TOKENS = {
+    "glm-5.4": 128_000,  # 2026-11-24 旗舰改名（兼容期保留 5.3）
     "glm-5.3": 128_000,
     "glm-5.3-flash": 128_000,
     "glm-5.2": 128_000,
@@ -49,7 +50,7 @@ MODEL_MAX_OUTPUT_TOKENS = {
 }
 
 # glm-5.3 家族（含 flash），排除 glm-5.30 之类未来编号；大小写不敏感
-_GLM53_PATTERN = re.compile(r"glm-5\.3(?![0-9])", re.IGNORECASE)
+_GLM53_PATTERN = re.compile(r"glm-5\.(?:3|4)(?![0-9])", re.IGNORECASE)
 
 
 def is_glm53_model(model: str | None) -> bool:

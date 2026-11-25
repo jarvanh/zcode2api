@@ -326,7 +326,7 @@ class TestConfigFetchProxyFallback:
             async def __aexit__(self, *args):
                 return False
 
-            async def get(self, url):
+            async def get(self, url, **kwargs):
                 if self.kwargs.get("proxy"):
                     raise httpx.ConnectError("proxy down")
                 return _Resp()

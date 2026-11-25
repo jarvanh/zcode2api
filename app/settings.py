@@ -65,6 +65,10 @@ REQLOG_PATH = DATA_DIR / "reqlog.jsonl"
 # 干扰（2.7.58-61 领取失败潮跨日排查实战提炼）；关闭 = ZCODE_OPSLOG_PERSIST=0。
 OPSLOG_PERSIST = _bool("ZCODE_OPSLOG_PERSIST", True)
 OPSLOG_PATH = DATA_DIR / "opslog.jsonl"
+# 请求日志 prompt 片段开关（2026-11-21 review P2 隐私面）：req() 缺省不在
+# stdout/opslog 落用户对话内容（只落 <N chars> 占位）；本地排障显式置 1 才
+# 保留 40 字符片段。
+LOG_PROMPT_PREVIEW = _bool("ZCODE_LOG_PROMPT_PREVIEW", False)
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
@@ -78,14 +82,29 @@ PORT = _int("ZCODE_PORT", 3000)
 HOST = (os.getenv("ZCODE_HOST") or "").strip() or "127.0.0.1"
 
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
-# 后台管理密码初始值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
-# 不提供硬编码默认口令：未配置环境变量时由 Store 首启随机生成并落库。
-DEFAULT_ADMIN_KEY = (os.getenv("ZCODE_ADMIN_KEY") or "").strip()
+# 管理面失败锁定是否采信 cf-connecting-ip/x-real-ip 代理头（2026-11-21 review
+# P1 信任边界）：true 仅当部署处于可信反向代理之后；缺省 false = socket 对端。
+TRUST_PROXY_HEADERS = _bool("ZCODE_TRUST_PROXY_HEADERS", False)
+
+# 后台管理密码默认值（强度闸，上游 2026-11-21 review P1）：缺省 "zcode" 弱口令
+# 永不落库；不达标时生成随机 key 打印一次。
+_DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+
+
+def _admin_key_ok(key: str) -> bool:
+    return len(key.strip()) >= 12
+
+
+if _admin_key_ok(_DEFAULT_ADMIN_KEY):
+    DEFAULT_ADMIN_KEY = _DEFAULT_ADMIN_KEY.strip()
+else:
+    import secrets as _secrets
+
+    DEFAULT_ADMIN_KEY = _secrets.token_urlsafe(18)
+    print(f"[zcode-hub] ZCODE_ADMIN_KEY 强度不足或未设置，随机初始后台密钥已生成", flush=True)
 # 网关访问密钥默认值（README 的 ZCODE_GATEWAY_KEY）：数据库 meta 表未设置时生效。
 GATEWAY_KEY = os.getenv("ZCODE_GATEWAY_KEY", "")
-# bigmodel Key 回退通道（bigmodel/ 前缀 / x-provider: bigmodel 头）默认关闭：
-# 该通道欠费时上游 429 且网关原地重试，请求会挂起约 2 分钟才报错，默认不暴露。
-# 可用环境变量 ZCODE_BIGMODEL_CHANNEL=1 或管理后台「设置」开启。
+# bigmodel Key 回退通道（bigmodel/ 前缀 / x-provider: bigmodel 头）默认关闭。
 BIGMODEL_CHANNEL_ENABLED = os.getenv("ZCODE_BIGMODEL_CHANNEL", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
@@ -410,19 +429,10 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 1)
 # 3008/WAF 计数抬升时回调。
 ACCOUNT_MIN_INTERVAL_MS = _int("ZCODE_ACCOUNT_MIN_INTERVAL_MS", 100)
 
-# ── per-account 出口隔离开关（上游 2.7.36 引入；fork 语义 = 账号 proxy_url）──
-# fork 已有更完整的 per-account 出口实现（Account.proxy_url + assign_egress
-# 脚本 + mihomo pinned listeners + 405 节点轮换），真源是 proxy_url；上游的
-# egress listener 池分配逻辑经 Account.egress 别名同样落到 proxy_url。此开关
-# 控制 egress.account_proxy/egress_tag_for 是否返回账号绑定代理（关 = 全链路
-# 维持 fork 现状：账号 proxy_url 仅作用于 chat 网关上游，billing 直连）。
-# 注：ACCOUNT_CONCURRENCY 由 fork 的动态计算维护（代理数 / 直连 2），此处不取
-# 上游写死的 3。
-# 选号余额平局带（2.7.53，上游）：相对容差——候选 j 比 k 富出超过此比例才算「显著
-# 更富」（带外直接胜出），带内视为同档交还轮换偏移。快照间必有微小漂移，
-# 精确比较下轮换会被余额排序压过（tebi 实证：9 号差距 <5%，连选 8 次同一号）。
-# env 可覆盖：档位分层过细时运维可放宽。
-SELECT_TIE_TOLERANCE = float(os.getenv("ZCODE_SELECT_TIE_TOLERANCE", "0.05"))
+# ── per-account 出口隔离开关（上游 2.7.36；fork 语义 = 账号 proxy_url）──────
+# fork 已有更完整的 per-account 出口实现，真源是 proxy_url；单账号并发保留
+# fork 可调口径（默认 1，env/meta 覆盖）；平局容差带上游 P3 容错化。
+SELECT_TIE_TOLERANCE = max(0.0, _float("ZCODE_SELECT_TIE_TOLERANCE", 0.05))
 # ── per-account 出口隔离（2.7.36，需求 = 每账号一个独立 IP 互相隔离）──────────
 # 依据：①上游按出口 IP 风控（magpie 实证：同 IP 同时用 3 个账号即触发边缘
 # 405 封地址，2 个不封——共享出口下 7 号远超红线）；②3008 风暴全池均匀爆发
@@ -453,6 +463,11 @@ TP_TYPE = os.getenv("ZCODE_TP_TYPE", "clash_proxy").strip()
 TP_TIER = os.getenv("ZCODE_TP_TIER", "standard").strip()
 TP_GRAY_ACCOUNTS = [g.strip() for g in os.getenv("ZCODE_TP_GRAY_ACCOUNTS", "").split(",") if g.strip()]
 TP_REBALANCE_DEBOUNCE = _int("ZCODE_TP_REBALANCE_DEBOUNCE", 120)
+# 失败终态恢复轮的短退避（2026-11-22 review P1）：rebalance 3+1 轮全败后 TP
+# 绑定遗留在死候选上，下一健康轮（300s）前是确认服务空窗——首轮失败立即
+# 退避该秒数后绕过去抖做一次恢复轮（就地自愈窗口），仍失败才交还健康循环。
+# 短退避避免对 TP 分配器背靠背连打；0/负 = 无退避立即重试。
+TP_REBALANCE_RETRY_DELAY = _int("ZCODE_TP_REBALANCE_RETRY_DELAY", 5)
 # 网关级故障熔断（2.7.68）：一次 rebalance 内连续 N 个候选都「探针连接级失败
 # （st=0）」= 本地网关（EasyTier→TP 9101）故障而非节点问题——继续 acquire/
 # 探针只会全池 churn 并把 egress_node 改写到从未探通的候选（11-18 晚 EasyTier
@@ -578,7 +593,7 @@ ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGI
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.70"  # fork：并入上游 2.7.69–2.7.72.3（出口供给双根修/版本双链/claim 重试韧性/守护层）；ZCode 4.0.0 对齐
+APP_VERSION = "2.9.71"  # fork：并入上游 2.7.73–2.7.79（GLM-5.4 改名兼容 / 高可用 review 四轮根修 / claim 链指纹一致性）；ZCode 4.0.0 对齐
 
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：

@@ -167,6 +167,10 @@ async def run_install_sequence() -> dict:
 
 # 后台安装任务集合：持有强引用防 GC，完成即自行移除
 _install_tasks: set = set()
+# 在途任务按账号 id 去重（2026-11-21 review P3）：同一账号在同一事件循环批内
+# 被多入口调度（入池 + 补配 + 换发连击）时会叠加多个并发安装任务——幂等跳过
+# 只省去重复上游调用，多个任务同时跑仍会重复打 configs/激活事件。在途即跳过。
+_install_pending: set[str] = set()
 
 
 def schedule_install(account) -> None:
@@ -176,6 +180,9 @@ def schedule_install(account) -> None:
     都跑；重复调用安全（installed_at 幂等跳过）；异常全部兜住不冒泡。
     """
     import asyncio
+
+    if account.id in _install_pending:
+        return
 
     async def _job():
         from .store import store
@@ -187,7 +194,15 @@ def schedule_install(account) -> None:
             await run_install_sequence_for_account(live)
         except Exception as err:  # noqa: BLE001 - 兜底：绝不冒泡
             logs.warn("install", f"账号 {account.name} 安装序任务异常: {err}")
+        finally:
+            # 去重窗口覆盖整个任务生命周期（2026-11-22 迭代二 F3 根修）：此前
+            # discard 在任务开头——去重窗只有首个调度 tick，真正的在途安装期
+            # （configs+激活事件 ~30s）第二个 schedule 照常并发双跑，同一
+            # device_mid 双份 configs+激活上报与官方「每号一天一次激活」节奏
+            # 矛盾，且发生在风控处置（rotate/admin 手动换发）最敏感时刻。
+            _install_pending.discard(account.id)
 
+    _install_pending.add(account.id)
     task = asyncio.create_task(_job())
     _install_tasks.add(task)
     task.add_done_callback(_install_tasks.discard)
