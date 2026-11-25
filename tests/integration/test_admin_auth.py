@@ -278,6 +278,7 @@ async def test_direct_bind_listener_ignores_proxy_headers(gateway_client, monkey
     for i in range(3):
         res = await client.get(
             "/admin/api/verify",
+            params={"login": "1"},  # fork 语义：探测失败只计数不锁，登录提交才锁
             headers={"Authorization": "Bearer wrong",
                      "cf-connecting-ip": f"10.9.9.{i}"})
         assert res.status_code == 401

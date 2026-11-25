@@ -142,9 +142,6 @@ def _record_failure(ip: str, probed: bool = False) -> None:
         return
     if rec["count"] >= ADMIN_FAIL_LIMIT:
         rec["locked_until"] = now + ADMIN_LOCK_SECONDS
-    rec["count"] = int(rec.get("count") or 0) + 1
-    if rec["count"] >= ADMIN_FAIL_LIMIT:
-        rec["locked_until"] = now + ADMIN_LOCK_SECONDS
 
 
 def _extract_bearer(authorization: str | None) -> str | None:

@@ -278,5 +278,4 @@ def _reset_risk_wave_state(monkeypatch):
     monkeypatch.setattr(app_settings, "PROXY_ROTATE_ENABLED", False)
     gw._risk_wave_reset_for_tests()
     yield
-    mock_app.state.billing_balance_windows = None
     gw._risk_wave_reset_for_tests()
