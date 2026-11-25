@@ -583,7 +583,7 @@ class TestNoBalance1113:
         assert _paths(mock, before3)[0] == _PLAN_PATH
         after3 = fresh_app.find("zai", acc.id)
         assert after3.status != Status.EXHAUSTED
-        assert after3.is_model_cooling("GLM-5.3")
+        assert after3.is_model_cooling(_FLAGSHIP)
 
     async def test_rate_limit_1302_with_1113_logid_is_not_no_balance(
         self, gateway_client, fresh_app, monkeypatch
