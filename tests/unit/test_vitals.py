@@ -230,7 +230,15 @@ class TestLoopLagNoDrift:
             try:
                 task = vitals.start()
                 assert task is not None
-                await asyncio.sleep(0.25)
+                # 采样到足够轮数再停：固定 wall-clock 在负载高时会不足 10 个样本
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 2.0
+                while loop.time() < deadline:
+                    series = [s for s in vitals.snapshot(minutes=1)["series"]
+                              if isinstance(s.get("loop_ms"), (int, float))]
+                    if len(series) >= 12:
+                        break
+                    await asyncio.sleep(0.05)
                 await vitals.stop()
                 vals = [s["loop_ms"] for s in vitals.snapshot(minutes=1)["series"]
                         if isinstance(s.get("loop_ms"), (int, float))]

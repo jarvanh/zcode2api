@@ -67,7 +67,7 @@ def test_set_active_version_clamped_to_prompt_alignment():
     try:
         # 正文锁：活跃版本永不越过 prompt.mjs 文本所属版本，否则「版本头 +
         # system 正文」错版 → 上游 405/3012。钳制并返回实际生效版本。
-        assert constants.set_active_version("4.0.0") == constants.PROMPT_ALIGNED_VERSION
+        assert constants.set_active_version("4.1.0") == constants.PROMPT_ALIGNED_VERSION
         assert constants.CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
         assert constants.USER_AGENT == f"ZCode/{constants.PROMPT_ALIGNED_VERSION}"
         assert constants.set_active_version("9.9.9") == constants.PROMPT_ALIGNED_VERSION
@@ -88,8 +88,7 @@ def test_client_configs():
 
 
 def test_client_version_single_source():
-    # 官方客户端 4.0.0（官方 Linux AppImage bundle 实证；文本与 3.19.1/3.19.0/3.18.2 同源；
-    # 前值 3.19.1 / 3.19.0 / 3.18.2 / 3.18.1 / 3.18.0 / 3.17.2 / 3.17.1）
+    # 官方客户端 4.0.0（zcode.cjs 同源；前值 3.17.2 / 3.17.1 / 3.16.3）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
     assert constants.CLIENT_APP_VERSION == "4.0.0"
     # 版本头初始值必须等于提示词正文所属版本（否则一启动就错版）

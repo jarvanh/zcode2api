@@ -68,6 +68,74 @@ def test_non_reputation_claim_errors_not_retried():
         assert not claim._is_egress_reputation_failure(ClaimError("x", code=code))
 
 
+# ── 2.7.80 出口网络故障（ProxyError 503）换绑 ────────────────────────────────
+def test_network_failure_marked_egress_failure_eligible():
+    err = ClaimError("上游网络错误: 503 Service Unavailable", egress_failure=True)
+    assert claim._is_egress_network_failure(err)
+    assert claim._is_egress_reputation_failure(err)  # 走同一换绑链
+    # 业务码 -1（无投放/参数错）即便文案相似也不该换绑
+    assert not claim._is_egress_network_failure(ClaimError("上游网络错误: 503 Service Unavailable"))
+
+
+def test_network_failure_uses_billing_acceptance_and_no_ban(monkeypatch, tp_mode):
+    """网络型失败：验收走 billing 探针（不烧验证码），且不 ban 旧节点。"""
+    acc = _account()
+    pool = _FakeEgressPool()
+    from app import egress_pool as ep_mod
+    monkeypatch.setattr(ep_mod, "egress_pool", pool)
+    monkeypatch.setattr(claim.captcha_manager, "invalidate", lambda tag: None)
+
+    solve_calls: list = []
+    async def boom_solve(**kwargs):
+        solve_calls.append(kwargs)
+        raise AssertionError("网络型失败不应烧验证码求解")
+    monkeypatch.setattr(claim.captcha_manager, "get_verify_param", boom_solve)
+
+    preview_calls: list = []
+    async def fake_preview(account, **_kw):
+        preview_calls.append(account.name)
+        return []
+    monkeypatch.setattr(claim, "preview_plans", fake_preview)
+
+    err = ClaimError("上游网络错误: ProxyError 503", egress_failure=True)
+    assert asyncio.run(claim._rebalance_for_claim(
+        acc, str(err), acceptance="billing", ban=False,
+    )) is True
+    assert preview_calls == ["retry1"]
+    assert not solve_calls  # 不烧验证码
+    # reason 是 TP ban 枚举（网络型 ban=False 实际不触发，仅签名占位）
+    assert pool.calls == [("retry1", "edge_405_html", False)]  # 不 ban
+
+
+def test_network_failure_retry_via_wrapper(monkeypatch, tp_mode):
+    """wrapper 网络型失败 → 换绑（billing 验收）→ 重打成功。"""
+    acc = _account()
+    calls = {"claim": 0, "rebalance": 0, "acceptance": []}
+
+    async def fake_claim(account, plan_id=None, **kwargs):
+        calls["claim"] += 1
+        if calls["claim"] == 1:
+            raise ClaimError("上游网络错误: ProxyError 503", egress_failure=True)
+        return {"ok": True}
+
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
+        calls["rebalance"] += 1
+        calls["acceptance"].append(acceptance)
+        account.egress_node = "node-new"
+        return True
+
+    monkeypatch.setattr(claim, "claim", fake_claim)
+    monkeypatch.setattr(claim, "_rebalance_for_claim", fake_rebalance)
+    async def fake_sleep(s):
+        pass
+    monkeypatch.setattr(claim.asyncio, "sleep", fake_sleep)
+
+    out = asyncio.run(claim_with_egress_retry(acc, "plan-x"))
+    assert out == {"ok": True}
+    assert calls["claim"] == 2 and calls["rebalance"] == 1
+    assert calls["acceptance"] == ["billing"]
+
+
 def test_captcha_solve_error_is_reputation_failure_by_name():
     # 延迟导入避免 app.claim 顶层依赖 captcha.CaptchaSolveError 的循环
     assert claim._is_egress_reputation_failure(CaptchaSolveError("F001"))
@@ -147,13 +215,13 @@ def test_retry_success_after_rebalance(monkeypatch, tp_mode):
     calls = {"claim": 0, "rebalance": 0}
     sleeps: list[float] = []
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         calls["claim"] += 1
         if calls["claim"] == 1:
             raise ClaimError("HTTP 403 unusual activity", code=403)
         return {"ok": True, "plan": plan_id}
 
-    async def fake_rebalance(account, reason):
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
         calls["rebalance"] += 1
         account.egress_node = "node-new"
         return True
@@ -162,7 +230,10 @@ def test_retry_success_after_rebalance(monkeypatch, tp_mode):
     monkeypatch.setattr(claim, "_rebalance_for_claim", fake_rebalance)
 
     async def fake_sleep(s):
-        sleeps.append(s)
+        # 只记录换绑重试的阶梯等待：同一事件循环里可能残留其它后台任务的
+        # sleep（如 0.1s 轮询），全局 patch 会一并截获，不能据此断言。
+        if s == claim._EGRESS_RETRY_DELAY_S:
+            sleeps.append(s)
     monkeypatch.setattr(claim.asyncio, "sleep", fake_sleep)
 
     out = asyncio.run(claim_with_egress_retry(acc, "plan-1116"))
@@ -175,11 +246,11 @@ def test_non_reputation_error_raises_immediately(monkeypatch, tp_mode):
     acc = _account()
     calls = {"claim": 0, "rebalance": 0}
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         calls["claim"] += 1
         raise ClaimError("套餐不存在", code=1001)
 
-    async def fake_rebalance(account, reason):
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
         calls["rebalance"] += 1
         return True
 
@@ -197,11 +268,11 @@ def test_retry_budget_exhausted_raises_last_error(monkeypatch, tp_mode):
     monkeypatch.setattr(claim, "CLAIM_EGRESS_RETRIES", 1)
     attempts: list[int] = []
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         attempts.append(1)
         raise ClaimError("风控 unusual activity", code=403)
 
-    async def fake_rebalance(account, reason):
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
         account.egress_node = "n2"
         return True
 
@@ -221,10 +292,10 @@ def test_rebalance_failure_reraises_original_error(monkeypatch, tp_mode):
     acc = _account()
     original = ClaimError("风控", code=3007)
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         raise original
 
-    async def fake_rebalance(account, reason):
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
         return False  # 换绑未生效
 
     monkeypatch.setattr(claim, "claim", fake_claim)
@@ -261,10 +332,10 @@ def test_rebalance_internal_error_swallowed_original_reraised(monkeypatch, tp_mo
     acc = _account()
     original = ClaimError("上游风控拒绝 HTTP 403: unusual activity", code=403)
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         raise original
 
-    async def boom_rebalance(account, reason):
+    async def boom_rebalance(account, reason, *, acceptance="captcha", ban=True):
         raise RuntimeError("sqlite disk I/O error")
 
     monkeypatch.setattr(claim, "claim", fake_claim)
@@ -303,7 +374,7 @@ def test_acceptance_failure_breaks_plan_loop(monkeypatch, tp_mode):
     acc = _account()
     attempts: list[str] = []
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         attempts.append(plan_id)
         raise CaptchaSolveError("验证码求解失败: slidex 求解未果（F001）")
 
@@ -328,7 +399,7 @@ def test_403_claim_error_breaks_plan_loop(monkeypatch, tp_mode):
     acc = _account()
     attempts: list[str] = []
 
-    async def fake_claim(account, plan_id=None):
+    async def fake_claim(account, plan_id=None, **kwargs):
         attempts.append(plan_id)
         raise ClaimError("上游风控拒绝 HTTP 403（非凭证失效）: unusual activity", code=403)
 
@@ -372,3 +443,45 @@ def test_claim_passes_claim_retries_budget(monkeypatch, tp_mode):
 
     asyncio.run(claim_module.claim(acc, "p1"))
     assert seen["retries"] == _settings.CAPTCHA_CLAIM_SOLVE_RETRIES
+
+
+# ── 2.7.80 preview 阶段 503 换绑重探（14 个 503 号的实际路径）────────────────
+def test_preview_network_failure_triggers_rebalance_and_reprobe(monkeypatch, tp_mode):
+    """preview 网络故障 → 换绑 → 重探成功拿到套餐 → 继续领取（不再整轮报废）。"""
+    from app.claim import auto_claim_all_plans
+
+    acc = _account()
+    calls = {"preview": 0, "rebalance": 0, "claim": 0}
+
+    async def fake_preview(account, **_kw):
+        calls["preview"] += 1
+        if calls["preview"] == 1:
+            raise ClaimError("上游网络错误: ProxyError 503", egress_failure=True)
+        return [{"plan_id": "p1", "name": "P1", "priority": 2, "grants": []}]
+
+    async def fake_rebalance(account, reason, *, acceptance="captcha", ban=True):
+        calls["rebalance"] += 1
+        assert acceptance == "billing" and ban is False
+        account.egress_node = "node-new"
+        return True
+
+    async def fake_claim(account, plan_id=None, **kwargs):
+        calls["claim"] += 1
+        return {"plan_name": "P1"}
+
+    # 激活上报绕过（本测试只验 preview→换绑→重探链）
+    async def fake_activation(account):
+        return None
+
+    monkeypatch.setattr(claim, "preview_plans", fake_preview)
+    monkeypatch.setattr(claim, "_rebalance_for_claim", fake_rebalance)
+    monkeypatch.setattr(claim, "claim", fake_claim)
+    monkeypatch.setattr(claim, "report_activation_events", fake_activation)
+    monkeypatch.setattr(claim, "_ACTIVATION_REPORTED", {acc.id: claim._today_key()}, raising=False)
+    async def fake_sleep(s):
+        pass
+    monkeypatch.setattr(claim.asyncio, "sleep", fake_sleep)
+
+    outcomes = asyncio.run(auto_claim_all_plans(acc))
+    assert calls == {"preview": 2, "rebalance": 1, "claim": 1}
+    assert any(o["ok"] for o in outcomes)

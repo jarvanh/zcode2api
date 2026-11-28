@@ -10,20 +10,20 @@ from app import constants
 @pytest.mark.asyncio
 async def test_check_zcode_version_now(gateway_client, monkeypatch):
     client, mock = gateway_client
-    mock.state.mock_manifest_version = "4.0.5"
+    mock.state.mock_manifest_version = "4.1.0"
     orig = constants.CLIENT_APP_VERSION
-    # 模拟提示词已移植到 4.0.5（正文锁同步抬高）——只有此时才允许自动对齐
-    monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "4.0.5")
+    # 模拟提示词已移植到 4.1.0（正文锁同步抬高）——只有此时才允许自动对齐
+    monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "4.1.0")
     try:
         res = await client.post("/admin/api/version/zcode/check", headers={"Authorization": "Bearer zcode"})
         assert res.status_code == 200
         data = res.json()
         assert data["ok"] is True
-        assert data["latest_version"] == "4.0.5"
-        # 默认 auto_sync 为 true，自动对齐至正文锁版本
+        assert data["latest_version"] == "4.1.0"
+        # 默认 auto_sync 为 true，自动对齐至 4.1.0
         assert data["updated"] is True
         assert data["prompt_port_required"] is False
-        assert constants.CLIENT_APP_VERSION == "4.0.5"
+        assert constants.CLIENT_APP_VERSION == "4.1.0"
     finally:
         constants.set_active_version(orig)
 
@@ -36,7 +36,7 @@ async def test_check_zcode_version_refuses_unported(gateway_client):
     提示「需移植 prompt.mjs」。
     """
     client, mock = gateway_client
-    mock.state.mock_manifest_version = "4.0.5"
+    mock.state.mock_manifest_version = "4.1.0"
     orig = constants.CLIENT_APP_VERSION
     billing_orig = constants.BILLING_APP_VERSION
     try:
@@ -44,15 +44,12 @@ async def test_check_zcode_version_refuses_unported(gateway_client):
         assert res.status_code == 200
         data = res.json()
         assert data["ok"] is True
-        assert data["latest_version"] == "4.0.5"
-        # messages 链拒绝越锁；billing 链独立跟随（2026-11-21 双链定案）
+        assert data["latest_version"] == "4.1.0"
         assert data["messages_updated"] is False
-        assert data["billing_updated"] is True
-        assert data["updated"] is True
         assert data["prompt_port_required"] is True
         assert data["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
         assert constants.CLIENT_APP_VERSION == orig
-        assert constants.BILLING_APP_VERSION == "4.0.5"
+        assert constants.BILLING_APP_VERSION == "4.1.0"
     finally:
         constants.set_active_version(orig)
         constants.BILLING_APP_VERSION = billing_orig

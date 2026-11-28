@@ -507,8 +507,12 @@ CLAIM_EGRESS_RETRY_DELAY = _float("ZCODE_CLAIM_EGRESS_RETRY_DELAY", 20.0)
 CLAIM_ROUND_BUDGET = _float("ZCODE_CLAIM_ROUND_BUDGET", 2700.0)
 # 领取轮账号并发数（2.7.68）：轮内逐号串行是三天 0 成功的吞吐瓶颈；求解进程级
 # 上限（CAPTCHA_MAX_CONCURRENT_SOLVES）与 TP rebalance 互斥（per-account lock）
-# 都有自己的全局闸，这里 2 并发只是调度并行度，不会放大浏览器/上游压力。
-CLAIM_ROUND_CONCURRENCY = max(_int("ZCODE_CLAIM_ROUND_CONCURRENCY", 2), 1)
+# 都有自己的全局闸，这里的并发只是调度并行度，不会放大浏览器/上游压力。
+# 2.7.83 起缺省 10：激活上报/billing preview/claim POST 都是纯 HTTP（每号独立
+# 出口），多数号止步于「无投放套餐」根本不走验证码；验证码求解仍受
+# CAPTCHA_MAX_CONCURRENT_SOLVES（缺省 2，tebi 2C/4G 无 swap）全局闸排队，
+# 不会因此同时拉起 10 个 Chromium。手动 POST /admin/api/claim job 同口径。
+CLAIM_ROUND_CONCURRENCY = max(_int("ZCODE_CLAIM_ROUND_CONCURRENCY", 10), 1)
 # 手动 POST /admin/api/claim 的响应预算（秒，2.7.68）：预算内跑完多少号就返回
 # 多少号的结果，剩余账号转后台 job 继续执行（GET /admin/api/claim/{job_id} 续查）。
 # 缺省 90s——CF Tunnel 100s 硬超时之内，客户端永不 524。
@@ -593,7 +597,7 @@ ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGI
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
-APP_VERSION = "2.9.71"  # fork：并入上游 2.7.73–2.7.79（GLM-5.4 改名兼容 / 高可用 review 四轮根修 / claim 链指纹一致性）；ZCode 4.0.0 对齐
+APP_VERSION = "2.9.72"  # fork：并入上游 2.7.80–2.7.83（billing 出口网络故障自动换绑 / egress_preference 根修 / gateway 空响应与断流防线 / ZCode 4.0.0 正文对齐 finishingWork+memoryNotes / claim 并发缺省 10）
 
 
 # system 提示词真源新鲜度（2026-10-31 WAF 文本校验波次防复发，app/freshness.py）：
